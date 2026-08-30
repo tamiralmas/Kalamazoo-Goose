@@ -35,9 +35,9 @@ import {
 } from '@/app/game-engine';
 
 const INITIAL_TELEMETRY: GameTelemetry = {
-  speed: 15.2,
-  agl: 32,
-  sink: 0.45,
+  speed: 16.2,
+  agl: 64,
+  sink: 0.4,
   glideRatio: 12,
   stamina: 1,
   stall: 0,
@@ -120,6 +120,60 @@ export function GooseGame() {
           setMapError(false);
           try {
             const layers = map.getStyle().layers ?? [];
+            const firstMapLayer = layers.find((layer) => layer.type !== 'background')?.id;
+            map.addSource('wmug-aerial-imagery', {
+              type: 'raster',
+              tiles: [
+                'https://imagery.michigan.gov/server/rest/services/Michigan_imagery_public/MapServer/tile/{z}/{y}/{x}',
+              ],
+              tileSize: 256,
+              minzoom: 1,
+              maxzoom: 19,
+              bounds: [-90.52734, 41.64008, -82.26563, 48.34165],
+              attribution: 'Imagery © State of Michigan (MiSAIL)',
+            });
+            map.addLayer(
+              {
+                id: 'wmug-aerial-imagery',
+                type: 'raster',
+                source: 'wmug-aerial-imagery',
+                paint: {
+                  'raster-opacity': 1,
+                  'raster-saturation': -0.06,
+                  'raster-contrast': 0.08,
+                  'raster-brightness-min': 0.04,
+                  'raster-brightness-max': 0.98,
+                  'raster-fade-duration': 0,
+                },
+              },
+              firstMapLayer,
+            );
+
+            // Let the aerial photography supply the ground detail while preserving
+            // OSM water hit-testing, road guidance, labels, and real 3D geometry.
+            layers.forEach((layer) => {
+              const sourceLayer = 'source-layer' in layer ? layer['source-layer'] : undefined;
+              if (layer.id === 'natural_earth') {
+                map.setLayoutProperty(layer.id, 'visibility', 'none');
+              }
+              if (
+                layer.type === 'fill' &&
+                (sourceLayer === 'park' || sourceLayer === 'landuse' || sourceLayer === 'landcover')
+              ) {
+                map.setLayoutProperty(layer.id, 'visibility', 'none');
+              }
+              if (layer.type === 'fill' && sourceLayer === 'water') {
+                map.setPaintProperty(layer.id, 'fill-color', '#4b9eb0');
+                map.setPaintProperty(layer.id, 'fill-opacity', 0.24);
+              }
+              if (layer.type === 'fill' && (sourceLayer === 'building' || layer.id === 'road_area_pattern')) {
+                map.setLayoutProperty(layer.id, 'visibility', 'none');
+              }
+              if (layer.type === 'line' && sourceLayer === 'transportation') {
+                map.setPaintProperty(layer.id, 'line-opacity', layer.id.includes('casing') ? 0.26 : 0.48);
+              }
+            });
+
             let buildingLayer = layers.find(
               (layer) => layer.type === 'fill-extrusion' && layer['source-layer'] === 'building',
             );
@@ -172,6 +226,21 @@ export function GooseGame() {
               ? ['all', buildingLayer.filter, hideBuildingOutlines]
               : hideBuildingOutlines) as FilterSpecification;
             map.setFilter(buildingLayer.id, buildingFilter);
+            map.setPaintProperty(
+              buildingLayer.id,
+              'fill-extrusion-color',
+              [
+                'interpolate',
+                ['linear'],
+                ['coalesce', ['get', 'render_height'], 5],
+                0,
+                '#aaa79f',
+                18,
+                '#cbc7bd',
+                52,
+                '#e7e2d7',
+              ],
+            );
             map.setPaintProperty(
               buildingLayer.id,
               'fill-extrusion-height',
@@ -316,8 +385,14 @@ export function GooseGame() {
     pressed: boolean,
   ) => {
     event.preventDefault();
-    if (pressed) event.currentTarget.setPointerCapture(event.pointerId);
     engineRef.current?.setKey(code, pressed);
+    if (pressed) {
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        // The input was already recorded; capture only helps guarantee release cleanup.
+      }
+    }
   };
 
   const mode = modeCopy[telemetry.mode];
@@ -358,10 +433,10 @@ export function GooseGame() {
 
       {!playing && (
         <section className="launch-card game-launch-card" aria-labelledby="launch-title">
-          <div className="eyebrow"><span /> ACTUAL MAP DATA · REAL GLIDING</div>
+          <div className="eyebrow"><span /> REAL AERIAL IMAGERY · OSM 3D · REAL GLIDING</div>
           <h1 id="launch-title">Take wing<br />over WMU.</h1>
           <p>
-            Fly a Canada goose through real OpenStreetMap buildings and roads, weave through mapped campus trees, then flare into a lake with a splash.
+            Fly a Canada goose over real aerial imagery, OpenStreetMap buildings and roads, and mapped campus trees—then flare into a lake with a splash.
           </p>
           <Button className="launch-button" size="lg" onClick={startGame} disabled={!mapReady}>
             <Feather /> {mapReady ? 'Fly from WMU' : mapError ? 'Map is reconnecting…' : 'Loading 3D campus…'}
@@ -372,7 +447,7 @@ export function GooseGame() {
             <span><Trees /><strong>Mapped trees</strong></span>
           </div>
           <p className="launch-note">
-            {mapError ? 'A map service failed to respond. It will retry when the page reloads.' : 'Best glide: about 15 m/s · Hold Space for repeated wingbeats'}
+            {mapError ? 'A map service failed to respond. It will retry when the page reloads.' : 'Tap Space for one wingbeat · Hold it for continuous flapping'}
           </p>
         </section>
       )}
@@ -427,7 +502,7 @@ export function GooseGame() {
             <span><kbd>S</kbd> pull up</span>
             <span><kbd>A</kbd><kbd>D</kbd> bank</span>
             <i />
-            <span><kbd>SPACE</kbd> flap</span>
+            <span><kbd>SPACE</kbd> tap / hold to flap</span>
             <span><kbd>SHIFT</kbd> flare / brake</span>
           </div>
 
@@ -449,9 +524,9 @@ export function GooseGame() {
       {toast && <output className="game-toast">{toast}</output>}
 
       <footer className="game-footer">
-        <span>OSM VECTOR WORLD</span><i /><span>{terrainReady ? 'REAL TERRAIN' : '3D BUILDINGS'} · WMU</span>
+        <span>MICHIGAN AERIAL + OSM 3D</span><i /><span>{terrainReady ? 'REAL TERRAIN' : '3D BUILDINGS'} · WMU</span>
         <span className="map-credit">
-          © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> · <a href="https://openfreemap.org" target="_blank" rel="noreferrer">OpenFreeMap</a>{terrainReady && <> · <a href="https://mapterhorn.com/attribution/" target="_blank" rel="noreferrer">Mapterhorn</a></>}
+          © <a href="https://www.michigan.gov/dtmb/services/maps/misail" target="_blank" rel="noreferrer">State of Michigan MiSAIL</a> · <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> · <a href="https://openfreemap.org" target="_blank" rel="noreferrer">OpenFreeMap</a>{terrainReady && <> · <a href="https://mapterhorn.com/attribution/" target="_blank" rel="noreferrer">Mapterhorn</a></>}
         </span>
       </footer>
     </main>

@@ -88,6 +88,8 @@ const DEG = Math.PI / 180;
 const FALLBACK_GROUND_MSL = 0;
 const FLAP_PERIOD = 0.36;
 const DOWNSTROKE = 0.2;
+const FLAP_STAMINA_COST = 0.014;
+const SPAWN_ALTITUDE = 64;
 
 const FLIGHT = {
   mass: 4.5,
@@ -325,8 +327,8 @@ export function createGooseEngine(
   const customLayerBeforeId = styleLayers[buildingLayerIndex + 1]?.id;
 
   const state: SimState = {
-    position: new THREE.Vector3(0, FALLBACK_GROUND_MSL + 32, 0),
-    velocity: new THREE.Vector3(0, -0.45, 15.2),
+    position: new THREE.Vector3(0, FALLBACK_GROUND_MSL + SPAWN_ALTITUDE, 0),
+    velocity: new THREE.Vector3(0, -0.4, 16.2),
     forward: new THREE.Vector3(0, 0, 1),
     heading: 0,
     bank: 0,
@@ -406,7 +408,7 @@ export function createGooseEngine(
   let treeRefreshClock = 0;
   let lastYieldToast = -10;
   let elapsedTime = 0;
-  let previousSpacePressed = false;
+  let queuedFlaps = 0;
   const traffic: TrafficCar[] = [];
   const splashes: Splash[] = [];
   const cameraPosition = new THREE.Vector3(0, state.position.y + 15, -18);
@@ -672,20 +674,20 @@ export function createGooseEngine(
     });
   };
 
-  const beginFlapIfNeeded = (spaceRising: boolean) => {
-    if (
-      !keys.has('Space') ||
-      state.flapRemaining > 0 ||
-      state.stamina < 0.018 ||
-      (state.mode !== 'flying' && !spaceRising)
-    ) return;
+  const beginFlapIfNeeded = () => {
+    const spaceHeld = keys.has('Space');
+    const wantsWingbeat = queuedFlaps > 0 || (spaceHeld && state.mode === 'flying');
+    if (!wantsWingbeat || state.flapRemaining > 0) return;
+    if (state.mode !== 'flying' && queuedFlaps === 0) return;
+
+    queuedFlaps = Math.max(0, queuedFlaps - 1);
     state.flapRemaining = FLAP_PERIOD;
-    state.stamina = Math.max(0, state.stamina - 0.018);
+    state.stamina = Math.max(0, state.stamina - FLAP_STAMINA_COST);
     if (state.mode !== 'flying') {
       const forward = new THREE.Vector3(Math.sin(state.heading), 0, Math.cos(state.heading));
       state.mode = 'flying';
       state.position.y = state.ground + 0.45;
-      state.velocity.copy(forward).multiplyScalar(8.5).addScaledVector(UP, 4.2);
+      state.velocity.copy(forward).multiplyScalar(10.5).addScaledVector(UP, 5.8);
       state.forward.copy(forward);
       hooks.onToast('Wingbeat — you are airborne');
     }
@@ -706,7 +708,7 @@ export function createGooseEngine(
     state.bank = moveToward(state.bank, 0, 3 * dt);
     state.alpha = FLIGHT.trimAlpha;
     state.stall = 0;
-    state.stamina = Math.min(1, state.stamina + 0.08 * dt);
+    state.stamina = Math.min(1, state.stamina + 0.18 * dt);
   };
 
   const simulateFlight = (dt: number) => {
@@ -755,13 +757,14 @@ export function createGooseEngine(
     if (state.flapRemaining > 0) {
       const elapsed = FLAP_PERIOD - state.flapRemaining;
       const pulse = elapsed < DOWNSTROKE ? Math.sin((Math.PI * elapsed) / DOWNSTROKE) : 0;
-      const staminaScale = smoothstep(0.015, 0.22, state.stamina);
-      const lowSpeedLift = lerp(125, 42, smoothstep(2, 9, speed));
+      // Tired wings lose climb performance, but never silently discard an accepted input.
+      const staminaScale = lerp(0.48, 1, smoothstep(0, 0.28, state.stamina));
+      const lowSpeedLift = lerp(155, 58, smoothstep(2, 10, speed));
       const highSpeedThrustScale = clamp((26 - speed) / 10, 0.2, 1);
-      force.addScaledVector(forward, 24 * pulse * staminaScale * highSpeedThrustScale);
+      force.addScaledVector(forward, 36 * pulse * staminaScale * highSpeedThrustScale);
       force.addScaledVector(liftDirection, lowSpeedLift * pulse * staminaScale);
     } else {
-      state.stamina = Math.min(1, state.stamina + 0.008 * dt);
+      state.stamina = Math.min(1, state.stamina + 0.055 * dt);
     }
 
     state.velocity.addScaledVector(force, dt / FLIGHT.mass);
@@ -780,6 +783,7 @@ export function createGooseEngine(
         state.velocity.z * retainedMomentum,
       );
       state.bank = 0;
+      queuedFlaps = 0;
       if (state.onWater) {
         spawnSplash(clamp((impact - 0.3) / 5, 0.15, 1));
         hooks.onToast(impact < 2.4 ? 'Clean water landing — splash!' : 'Big splash — hold Shift to flare');
@@ -790,9 +794,7 @@ export function createGooseEngine(
   };
 
   const simulate = (dt: number) => {
-    const spacePressed = keys.has('Space');
-    const spaceRising = spacePressed && !previousSpacePressed;
-    beginFlapIfNeeded(spaceRising);
+    beginFlapIfNeeded();
     surfaceClock -= dt;
     if (surfaceClock <= 0) {
       surfaceClock = 0.12;
@@ -803,7 +805,6 @@ export function createGooseEngine(
     if (state.flapRemaining > 0) {
       state.flapRemaining = Math.max(0, state.flapRemaining - dt);
     }
-    previousSpacePressed = spacePressed;
   };
 
   const updateGoosePose = (pose: SimState) => {
@@ -900,8 +901,8 @@ export function createGooseEngine(
   const resetState = () => {
     const spawnGround = terrainAt(0, 0, state.ground);
     state.ground = spawnGround;
-    state.position.set(0, spawnGround + 32, 0);
-    state.velocity.set(0, -0.45, 15.2);
+    state.position.set(0, spawnGround + SPAWN_ALTITUDE, 0);
+    state.velocity.set(0, -0.4, 16.2);
     state.forward.set(0, 0, 1);
     state.heading = 0;
     state.bank = 0;
@@ -911,7 +912,7 @@ export function createGooseEngine(
     state.mode = 'flying';
     state.onWater = false;
     state.flapRemaining = 0;
-    previousSpacePressed = false;
+    queuedFlaps = 0;
     cameraPosition.set(0, state.position.y + 15, -18);
     cameraTarget.set(0, state.position.y + 1, 8);
     sampleSurface();
@@ -1009,8 +1010,12 @@ export function createGooseEngine(
       hooks.onToast('Respawned above Western Michigan University');
     },
     setKey(code, pressed) {
-      if (pressed) keys.add(code);
-      else keys.delete(code);
+      if (pressed) {
+        if (code === 'Space' && !keys.has(code)) queuedFlaps = Math.min(2, queuedFlaps + 1);
+        keys.add(code);
+      } else {
+        keys.delete(code);
+      }
     },
     destroy() {
       destroyed = true;
