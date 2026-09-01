@@ -1,6 +1,11 @@
 'use client';
 
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react';
+import {
+  useEffect,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from 'react';
 import {
   Activity,
   Bird,
@@ -16,12 +21,15 @@ import {
   MapPin,
   Mountain,
   Navigation,
-  Trees,
+  RotateCcw,
   TriangleAlert,
   Trophy,
+  Users,
   Volume2,
   Waves,
   Wind,
+  ZoomIn,
+  ZoomOut,
 } from 'lucide-react';
 import type { Map as MapLibreMap } from 'maplibre-gl';
 import type { FillExtrusionLayerSpecification, FilterSpecification } from '@maplibre/maplibre-gl-style-spec';
@@ -47,7 +55,7 @@ const INITIAL_TELEMETRY: GameTelemetry = {
   score: 0,
   combo: 1,
   secretsFound: 0,
-  secretsTotal: 5,
+  secretsTotal: 25,
 };
 
 const CONTROL_CODES = [
@@ -75,6 +83,7 @@ export function GooseGame() {
   const engineRef = useRef<GooseEngine | null>(null);
   const playingRef = useRef(false);
   const toastTimerRef = useRef<number | null>(null);
+  const cameraPointersRef = useRef(new Map<number, { x: number; y: number }>());
   const [mapReady, setMapReady] = useState(false);
   const [terrainReady, setTerrainReady] = useState(false);
   const [mapError, setMapError] = useState(false);
@@ -85,6 +94,7 @@ export function GooseGame() {
   useEffect(() => {
     const container = mapContainerRef.current;
     if (!container) return;
+    const cameraPointers = cameraPointersRef.current;
 
     let cancelled = false;
     let loaded = false;
@@ -353,16 +363,31 @@ export function GooseGame() {
     };
     const clearControls = () => {
       CONTROL_CODES.forEach((code) => engineRef.current?.setKey(code, false));
+      cameraPointers.clear();
+    };
+    const onCameraWheel = (event: WheelEvent) => {
+      if (!playingRef.current || !(event.target instanceof HTMLCanvasElement)) return;
+      event.preventDefault();
+      const normalized = event.deltaMode === 1
+        ? event.deltaY * 16
+        : event.deltaMode === 2
+          ? event.deltaY * container.clientHeight
+          : event.deltaY;
+      const bounded = Math.min(180, Math.max(-180, normalized));
+      engineRef.current?.scaleCameraZoom(Math.exp(bounded * 0.0015));
     };
     window.addEventListener('keydown', onKeyDown, { passive: false });
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('blur', clearControls);
+    container.addEventListener('wheel', onCameraWheel, { passive: false });
 
     return () => {
       cancelled = true;
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('blur', clearControls);
+      container.removeEventListener('wheel', onCameraWheel);
+      cameraPointers.clear();
       if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
       if (terrainTimer !== null) window.clearTimeout(terrainTimer);
       engineRef.current?.destroy();
@@ -374,6 +399,7 @@ export function GooseGame() {
 
   const startGame = () => {
     if (!engineRef.current) return;
+    cameraPointersRef.current.clear();
     playingRef.current = true;
     setPlaying(true);
     engineRef.current.start();
@@ -382,6 +408,7 @@ export function GooseGame() {
 
   const resetGame = () => {
     if (!engineRef.current) return;
+    cameraPointersRef.current.clear();
     playingRef.current = true;
     setPlaying(true);
     engineRef.current.reset();
@@ -404,6 +431,55 @@ export function GooseGame() {
     }
   };
 
+  const setCameraPointer = (event: ReactPointerEvent<HTMLDivElement>, pressed: boolean) => {
+    if (pressed) {
+      if (!playingRef.current || !(event.target instanceof HTMLCanvasElement)) return;
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+      if (cameraPointersRef.current.size >= 2) return;
+      event.preventDefault();
+      cameraPointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      try {
+        event.currentTarget.setPointerCapture(event.pointerId);
+      } catch {
+        // Pointer capture is a convenience; the camera still works without it.
+      }
+      return;
+    }
+    if (!cameraPointersRef.current.has(event.pointerId)) return;
+    event.preventDefault();
+    cameraPointersRef.current.delete(event.pointerId);
+  };
+
+  const moveCameraPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const previous = cameraPointersRef.current.get(event.pointerId);
+    if (!previous) return;
+    event.preventDefault();
+    if (cameraPointersRef.current.size === 1) {
+      cameraPointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      engineRef.current?.orbitCamera(
+        -(event.clientX - previous.x) * 0.0045,
+        -(event.clientY - previous.y) * 0.0035,
+      );
+      return;
+    }
+    const before = [...cameraPointersRef.current.values()];
+    const oldCenterX = (before[0].x + before[1].x) * 0.5;
+    const oldCenterY = (before[0].y + before[1].y) * 0.5;
+    const oldDistance = Math.hypot(before[1].x - before[0].x, before[1].y - before[0].y);
+    cameraPointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    const after = [...cameraPointersRef.current.values()];
+    const newCenterX = (after[0].x + after[1].x) * 0.5;
+    const newCenterY = (after[0].y + after[1].y) * 0.5;
+    const newDistance = Math.hypot(after[1].x - after[0].x, after[1].y - after[0].y);
+    engineRef.current?.orbitCamera(
+      -(newCenterX - oldCenterX) * 0.0045,
+      -(newCenterY - oldCenterY) * 0.0035,
+    );
+    if (oldDistance > 1 && newDistance > 1) {
+      engineRef.current?.scaleCameraZoom(oldDistance / newDistance);
+    }
+  };
+
   const mode = modeCopy[telemetry.mode];
   const glideRatio = telemetry.glideRatio === null ? '—' : `${telemetry.glideRatio.toFixed(1)}:1`;
   const sinkLabel = telemetry.sink > 0.05
@@ -417,6 +493,12 @@ export function GooseGame() {
         className="real-map-canvas"
         aria-label="Interactive real-scale goose flight over aerial imagery and OpenStreetMap 3D data at Western Michigan University"
         tabIndex={-1}
+        onPointerDown={(event) => setCameraPointer(event, true)}
+        onPointerMove={moveCameraPointer}
+        onPointerUp={(event) => setCameraPointer(event, false)}
+        onPointerCancel={(event) => setCameraPointer(event, false)}
+        onLostPointerCapture={(event) => setCameraPointer(event, false)}
+        onDoubleClick={() => engineRef.current?.resetCamera()}
       />
       <div className="sky-vignette" aria-hidden="true" />
 
@@ -429,15 +511,22 @@ export function GooseGame() {
           <MapPin />
           <span><strong>Western Michigan University</strong><small>42.284996° N · 85.617710° W</small></span>
         </div>
-        <Button
-          variant="secondary"
-          size="sm"
-          className="map-reset-button"
-          onClick={resetGame}
-          disabled={!mapReady}
-        >
-          <Navigation /> Respawn
-        </Button>
+        <div className="top-actions">
+          <div className="camera-toolbar" aria-label="Camera controls">
+            <button type="button" title="Zoom in" aria-label="Zoom camera in" onClick={() => engineRef.current?.scaleCameraZoom(0.82)}><ZoomIn /></button>
+            <button type="button" title="Zoom out" aria-label="Zoom camera out" onClick={() => engineRef.current?.scaleCameraZoom(1.22)}><ZoomOut /></button>
+            <button type="button" title="Reset camera" aria-label="Reset camera" onClick={() => engineRef.current?.resetCamera()}><RotateCcw /></button>
+          </div>
+          <Button
+            variant="secondary"
+            size="sm"
+            className="map-reset-button"
+            onClick={resetGame}
+            disabled={!mapReady}
+          >
+            <Navigation /> Respawn
+          </Button>
+        </div>
       </header>
 
       {!playing && (
@@ -445,7 +534,7 @@ export function GooseGame() {
           <div className="eyebrow"><span /> REAL-SCALE CAMPUS · AERIAL ROOFS · CHAOS SANDBOX</div>
           <h1 id="launch-title">Take wing<br />over WMU.</h1>
           <p>
-            Fly, honk, bonk traffic, skim across ponds, and uncover five absurd campus secrets in a real-scale aerial WMU.
+            Fly, honk, scatter students, skim across ponds, and uncover twenty-five absurd campus secrets across a real-scale aerial WMU.
           </p>
           <Button className="launch-button" size="lg" onClick={startGame} disabled={!mapReady}>
             <Feather /> {mapReady ? 'Fly from WMU' : mapError ? 'Map is reconnecting…' : 'Loading 3D campus…'}
@@ -453,7 +542,7 @@ export function GooseGame() {
           <div className="launch-features" aria-label="World data">
             <span><Building2 /><strong>Aerial roofs</strong></span>
             <span><CarFront /><strong>Dense traffic</strong></span>
-            <span><Trees /><strong>Campus chaos</strong></span>
+            <span><Users /><strong>Walking crowds</strong></span>
           </div>
           <p className="launch-note">
             {mapError ? 'A map service failed to respond. It will retry when the page reloads.' : 'Tap Space for one wingbeat · Hold it for continuous flapping'}
@@ -482,7 +571,7 @@ export function GooseGame() {
             <span className="objective-icon"><Trophy /></span>
             <span>
               <small>Campus chaos</small>
-              <strong>Honk, bonk cars, stick the landing</strong>
+              <strong>Terrorize crowds, bonk cars, find everything</strong>
               <em>{telemetry.secretsFound}/{telemetry.secretsTotal} campus secrets · E to honk</em>
             </span>
           </aside>
@@ -511,6 +600,8 @@ export function GooseGame() {
             <span>{mode.hint}</span>
           </div>
 
+          <div className="camera-hint">Drag to orbit · pinch to zoom · double-tap to reset</div>
+
           <div className="control-deck" aria-label="Controls">
             <span><kbd>W</kbd> dive</span>
             <span><kbd>S</kbd> pull up</span>
@@ -519,6 +610,9 @@ export function GooseGame() {
             <span><kbd>SPACE</kbd> tap / hold to flap</span>
             <span><kbd>SHIFT</kbd> flare / brake</span>
             <span><kbd>E</kbd> honk</span>
+            <i />
+            <span><kbd>DRAG</kbd> camera</span>
+            <span><kbd>SCROLL</kbd> zoom</span>
           </div>
 
           <div className="mobile-controls" aria-label="Touch flight controls">

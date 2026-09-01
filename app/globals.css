@@ -210,9 +210,38 @@
 
 .top-actions {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  justify-self: end;
   gap: 8px;
 }
+
+.camera-toolbar {
+  display: flex;
+  gap: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 999px;
+  background: rgba(5, 29, 25, 0.69);
+  padding: 3px;
+  box-shadow: 0 10px 25px rgba(5, 27, 24, 0.13);
+  backdrop-filter: blur(14px);
+}
+
+.camera-toolbar button {
+  display: grid;
+  width: 29px;
+  height: 29px;
+  place-items: center;
+  border: 0;
+  border-radius: 50%;
+  background: transparent;
+  color: rgba(255, 255, 255, 0.8);
+  cursor: pointer;
+}
+
+.camera-toolbar button:hover { background: rgba(255, 255, 255, 0.12); color: white; }
+.camera-toolbar button:active { background: #efaa49; color: #173028; }
+.camera-toolbar svg { width: 14px; height: 14px; }
 
 .hud-button {
   border: 1px solid rgba(255, 255, 255, 0.38);
@@ -324,6 +353,7 @@
   left: 29px;
   display: grid;
   gap: 8px;
+  pointer-events: none;
 }
 
 .telemetry-panel > div {
@@ -403,6 +433,7 @@
   padding: 11px 14px;
   box-shadow: 0 13px 30px rgba(5, 25, 22, 0.1);
   backdrop-filter: blur(14px);
+  pointer-events: none;
 }
 
 .objective-card strong {
@@ -456,6 +487,27 @@
   flex-direction: column;
   align-items: flex-start;
   gap: 5px;
+  pointer-events: none;
+}
+
+.camera-hint {
+  position: absolute;
+  z-index: 4;
+  bottom: 188px;
+  left: 50%;
+  display: none;
+  transform: translateX(-50%);
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 999px;
+  background: rgba(5, 29, 25, 0.58);
+  padding: 6px 10px;
+  color: rgba(255, 255, 255, 0.62);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  pointer-events: none;
+  white-space: nowrap;
+  backdrop-filter: blur(10px);
 }
 
 .mode-badge {
@@ -492,6 +544,7 @@
   font-size: 9px;
   white-space: nowrap;
   backdrop-filter: blur(14px);
+  pointer-events: none;
 }
 
 .control-deck span,
@@ -572,7 +625,8 @@ kbd {
 
 .mobile-controls { display: none; }
 
-.real-map-canvas { position: absolute; inset: 0; }
+.real-map-canvas { position: absolute; inset: 0; touch-action: none; cursor: grab; }
+.real-map-canvas:active { cursor: grabbing; }
 .real-map-canvas .maplibregl-canvas { outline: none; }
 .real-map-canvas:focus { outline: none; }
 .real-map-canvas .maplibregl-ctrl-bottom-right { right: 22px; bottom: 42px; }
@@ -609,6 +663,7 @@ kbd {
   padding: 10px 12px;
   box-shadow: 0 13px 30px rgba(5,25,22,.1);
   backdrop-filter: blur(14px);
+  pointer-events: none;
 }
 .stamina-card > span { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 7px; }
 .stamina-card svg { width: 14px; height: 14px; color: #efaa49; }
@@ -633,6 +688,7 @@ kbd {
   padding: 10px 12px;
   box-shadow: 0 13px 30px rgba(5,25,22,.12);
   backdrop-filter: blur(14px);
+  pointer-events: none;
 }
 .chaos-card > span { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 3px 8px; }
 .chaos-card svg { width: 16px; height: 16px; grid-row: 1 / 3; color: #ffc75b; }
@@ -697,6 +753,7 @@ kbd {
 
 @media (max-width: 900px) {
   .control-deck { display: none; }
+  .camera-hint { display: block; }
   .mobile-controls {
     position: absolute;
     z-index: 6;
@@ -770,6 +827,7 @@ kbd {
   .game-topbar { grid-template-columns: 1fr auto; padding: 15px 17px; }
   .brand-lockup strong { font-size: 10px; }
   .location-chip { display: none; }
+  .camera-toolbar { display: none; }
   .launch-card { top: auto; bottom: 49px; left: 15px; width: calc(100vw - 30px); transform: none; border-radius: 22px; padding: 23px; }
   .launch-card h1 { margin-top: 16px; font-size: 39px; }
   .launch-card > p:not(.launch-note) { font-size: 13px; }
@@ -784,6 +842,7 @@ kbd {
   .objective-icon { display: none; }
   .objective-card strong { max-width: 126px; font-size: 10px; }
   .mode-stack { bottom: 155px; left: 17px; }
+  .camera-hint { bottom: 180px; max-width: 58vw; overflow: hidden; text-overflow: ellipsis; }
   .mode-stack > span { display: none; }
   .game-toast { top: 67px; width: max-content; max-width: calc(100vw - 34px); text-align: center; }
   .map-credit { display: none; }

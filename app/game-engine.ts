@@ -1,6 +1,18 @@
 import * as THREE from 'three';
 import type { CustomLayerInterface, Map as MapLibreMap } from 'maplibre-gl';
 
+import {
+  MAX_CAMPUS_NPCS,
+  createCampusNpc,
+  createCrowdFleet,
+  knockDownCampusNpc,
+  panicCampusNpc,
+  simulateCampusNpc,
+  updateCrowdVisuals,
+  type CampusNpc,
+  type CrowdRoute,
+} from './campus-crowd';
+import { BONUS_CHAOS_SECRETS, type BonusChaosSecret } from './chaos-secrets';
 import { WMU_TREE_POINTS } from './wmu-trees';
 
 export const WMU_SPAWN: [number, number] = [-85.61771, 42.284996];
@@ -32,6 +44,9 @@ export type GooseEngine = {
   start: () => void;
   reset: () => void;
   setKey: (code: string, pressed: boolean) => void;
+  scaleCameraZoom: (multiplier: number) => void;
+  orbitCamera: (yawDelta: number, pitchDelta: number) => void;
+  resetCamera: () => void;
   destroy: () => void;
 };
 
@@ -109,7 +124,13 @@ type BuildingCollider = {
   height: number;
 };
 
-type CampusSecretKind = 'radio' | 'duck-council' | 'diploma-tornado' | 'sky-ring' | 'dean-ufo';
+type CampusSecretKind =
+  | 'radio'
+  | 'duck-council'
+  | 'diploma-tornado'
+  | 'sky-ring'
+  | 'dean-ufo'
+  | 'chaos-bonus';
 
 type CampusSecret = {
   id: string;
@@ -121,6 +142,9 @@ type CampusSecret = {
   activation: number;
   honkCount: number;
   honkWindow: number;
+  altitude: number;
+  terrainResolved: boolean;
+  definition?: BonusChaosSecret;
 };
 
 type Splash = {
@@ -353,8 +377,17 @@ export function createGooseEngine(
   const camera = new THREE.Camera();
   const goose = createGooseRig();
   const trafficFleet = createTrafficFleet(MAX_TRAFFIC);
+  const crowdFleet = createCrowdFleet(MAX_CAMPUS_NPCS);
   scene.add(goose.root);
   scene.add(trafficFleet.bodies, trafficFleet.cabins, trafficFleet.wheels);
+  scene.add(
+    crowdFleet.heads,
+    crowdFleet.torsos,
+    crowdFleet.leftArms,
+    crowdFleet.rightArms,
+    crowdFleet.leftLegs,
+    crowdFleet.rightLegs,
+  );
   scene.add(new THREE.HemisphereLight(0xdaf0f2, 0x6d6a4f, 2.35));
   const sun = new THREE.DirectionalLight(0xfff1c2, 3.2);
   sun.position.set(-90, 150, 60);
@@ -492,6 +525,9 @@ export function createGooseEngine(
   let tumbleAngularSpeed = 0;
   let hitCooldown = 0;
   let cameraShakeRemaining = 0;
+  let lowGravityRemaining = 0;
+  let megaHonkRemaining = 0;
+  let slipperyRemaining = 0;
   let audioContext: AudioContext | null = null;
   let airborneTime = 0;
   let peakAgl = 0;
@@ -510,12 +546,21 @@ export function createGooseEngine(
   >();
   const buildingColliders: BuildingCollider[] = [];
   const traffic: TrafficCar[] = [];
+  const campusNpcs: CampusNpc[] = [];
+  const pedestrianRoutes: CrowdRoute[] = [];
+  const pedestrianRouteKeys = new Set<string>();
   const splashes: Splash[] = [];
   const honkWaves: HonkWave[] = [];
   const campusSecrets: CampusSecret[] = [];
   let secretsFound = 0;
   const cameraPosition = new THREE.Vector3(0, state.position.y + 15, -18);
   const cameraTarget = new THREE.Vector3(0, state.position.y + 1, 8);
+  let cameraDistanceScale = 0.72;
+  let cameraDistanceTarget = 0.72;
+  let cameraOrbitYaw = 0;
+  let cameraOrbitYawTarget = 0;
+  let cameraOrbitPitch = 24 * DEG;
+  let cameraOrbitPitchTarget = 24 * DEG;
 
   const localToLngLat = (east: number, north: number) =>
     new maplibre.MercatorCoordinate(
@@ -747,8 +792,11 @@ export function createGooseEngine(
       north: number,
       altitude: number,
       radius: number,
+      definition?: BonusChaosSecret,
     ) => {
-      const ground = terrainAt(east, north, state.ground);
+      const elevation = map.queryTerrainElevation(localToLngLat(east, north));
+      const terrainResolved = !terrainEnabled || (typeof elevation === 'number' && Number.isFinite(elevation));
+      const ground = terrainResolved && typeof elevation === 'number' ? elevation : state.ground;
       group.position.set(east, ground + altitude, north);
       group.userData.baseY = group.position.y;
       finishGroup(group);
@@ -762,6 +810,9 @@ export function createGooseEngine(
         activation: 0,
         honkCount: 0,
         honkWindow: 0,
+        altitude,
+        terrainResolved,
+        definition,
       });
     };
 
@@ -873,6 +924,100 @@ export function createGooseEngine(
     saucer.add(dome);
     ufoSite.add(saucer);
     addSecret('dean-ufo', 'dean-ufo', ufoSite, 213.5, 567.8, 0.08, 13);
+
+    BONUS_CHAOS_SECRETS.forEach((definition) => {
+      const group = new THREE.Group();
+      group.name = definition.label;
+      const material = new THREE.MeshStandardMaterial({
+        color: definition.color,
+        roughness: 0.55,
+        metalness: 0.2,
+        emissive: new THREE.Color(definition.color).multiplyScalar(0.18),
+        emissiveIntensity: 0.55,
+      });
+      const beaconMaterial = new THREE.MeshBasicMaterial({
+        color: definition.color,
+        transparent: true,
+        opacity: 0.72,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      });
+
+      if (definition.visual === 'air-gate') {
+        const gate = new THREE.Mesh(new THREE.TorusGeometry(3.2, 0.22, 9, 38), material);
+        gate.name = 'bonus-spinner';
+        group.add(gate);
+        const inner = new THREE.Mesh(new THREE.TorusGeometry(2.65, 0.055, 7, 34), beaconMaterial);
+        inner.name = 'bonus-pulse';
+        group.add(inner);
+        for (let index = 0; index < 6; index += 1) {
+          const angle = (index / 6) * Math.PI * 2;
+          const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.13, 7, 5), cream);
+          bulb.position.set(Math.cos(angle) * 3.2, Math.sin(angle) * 3.2, 0);
+          group.add(bulb);
+        }
+      } else if (definition.visual === 'honk-shrine') {
+        const circle = new THREE.Mesh(new THREE.TorusGeometry(2.3, 0.09, 7, 36), beaconMaterial);
+        circle.name = 'bonus-pulse';
+        circle.rotation.x = Math.PI / 2;
+        circle.position.y = 0.1;
+        group.add(circle);
+        const post = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.28, 2.4, 8), material);
+        post.position.y = 1.2;
+        group.add(post);
+        const bell = new THREE.Mesh(new THREE.ConeGeometry(0.65, 0.85, 10), material);
+        bell.name = 'bonus-spinner';
+        bell.rotation.x = Math.PI;
+        bell.position.y = 2.75;
+        group.add(bell);
+      } else if (definition.visual === 'bonk-cluster') {
+        for (let index = 0; index < 7; index += 1) {
+          const angle = (index / 7) * Math.PI * 2;
+          const prop = new THREE.Mesh(
+            new THREE.ConeGeometry(0.28 + (index % 2) * 0.08, 0.95 + (index % 3) * 0.12, 7),
+            material,
+          );
+          prop.position.set(Math.cos(angle) * 1.75, 0.48, Math.sin(angle) * 1.75);
+          prop.rotation.z = (index % 2 ? -1 : 1) * 0.08;
+          group.add(prop);
+        }
+        const marker = new THREE.Mesh(new THREE.TorusGeometry(2.6, 0.07, 7, 36), beaconMaterial);
+        marker.name = 'bonus-pulse';
+        marker.rotation.x = Math.PI / 2;
+        marker.position.y = 0.08;
+        group.add(marker);
+      } else if (definition.visual === 'rideable') {
+        const platform = new THREE.Mesh(new THREE.BoxGeometry(3.1, 0.35, 1.5), material);
+        platform.name = 'bonus-spinner';
+        platform.position.y = 0.24;
+        group.add(platform);
+        const marker = new THREE.Mesh(new THREE.TorusGeometry(2.2, 0.075, 7, 36), beaconMaterial);
+        marker.name = 'bonus-pulse';
+        marker.rotation.x = Math.PI / 2;
+        marker.position.y = 0.08;
+        group.add(marker);
+      } else {
+        const goal = new THREE.Mesh(new THREE.TorusGeometry(2.15, 0.18, 9, 36), material);
+        goal.name = 'bonus-spinner';
+        goal.position.y = 2.3;
+        group.add(goal);
+        const toy = new THREE.Mesh(new THREE.DodecahedronGeometry(0.65, 0), material);
+        toy.name = 'bonus-pulse';
+        toy.position.set(0, 0.7, 0.3);
+        group.add(toy);
+      }
+
+      addSecret(
+        definition.id,
+        'chaos-bonus',
+        group,
+        definition.east,
+        definition.north,
+        definition.altitude,
+        definition.radius,
+        definition,
+      );
+    });
   };
 
   createCampusSecrets();
@@ -1163,6 +1308,60 @@ export function createGooseEngine(
     trafficBuilt = true;
   };
 
+  const collectPedestrianRoutes = () => {
+    if (!map.getSource(roadSourceId) || pedestrianRoutes.length >= 80) return false;
+    const features = map.querySourceFeatures(roadSourceId, { sourceLayer: 'transportation' }) as Array<{
+      properties?: Record<string, unknown>;
+      geometry: { type: string; coordinates: unknown };
+    }>;
+    let added = 0;
+
+    const acceptLine = (coordinates: number[][]) => {
+      if (coordinates.length < 2 || pedestrianRoutes.length >= 80) return;
+      const points = coordinates
+        .filter((coordinate) => coordinate.length >= 2)
+        .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
+        .filter((point) => Math.hypot(point.x, point.z) < 1200);
+      if (points.length < 2) return;
+      const endpoints = [
+        `${points[0].x.toFixed(0)}:${points[0].z.toFixed(0)}`,
+        `${points.at(-1)?.x.toFixed(0)}:${points.at(-1)?.z.toFixed(0)}`,
+      ].sort();
+      const key = endpoints.join('|');
+      if (pedestrianRouteKeys.has(key)) return;
+      const route = routeFromPoints(points);
+      if (route.total < 14) return;
+      pedestrianRouteKeys.add(key);
+      pedestrianRoutes.push(route);
+      added += 1;
+    };
+
+    features.forEach((feature) => {
+      const roadClass = typeof feature.properties?.class === 'string' ? feature.properties.class : '';
+      const subclass = typeof feature.properties?.subclass === 'string' ? feature.properties.subclass : '';
+      const pedestrianClass = new Set(['path', 'pedestrian', 'footway', 'steps', 'track', 'minor', 'service']);
+      if (
+        (!pedestrianClass.has(roadClass) && !pedestrianClass.has(subclass)) ||
+        feature.properties?.brunnel === 'tunnel' ||
+        feature.properties?.brunnel === 'bridge'
+      ) return;
+      if (feature.geometry.type === 'LineString') acceptLine(feature.geometry.coordinates as number[][]);
+      if (feature.geometry.type === 'MultiLineString') {
+        (feature.geometry.coordinates as number[][][]).forEach(acceptLine);
+      }
+    });
+
+    const targetCount = Math.min(MAX_CAMPUS_NPCS, pedestrianRoutes.length * 4);
+    while (campusNpcs.length < targetCount) {
+      const index = campusNpcs.length;
+      const route = pedestrianRoutes[index % pedestrianRoutes.length];
+      const distance = route.total * ((index * 0.61803398875 + 0.17) % 1);
+      campusNpcs.push(createCampusNpc(index, route, distance, terrainAt));
+    }
+    if (added > 0 || campusNpcs.length > 0) updateCrowdVisuals(crowdFleet, campusNpcs, 1, elapsedTime);
+    return added > 0;
+  };
+
   const simulateTraffic = (dt: number) => {
     const gooseGrounded = state.mode !== 'flying';
     traffic.forEach((car, index) => {
@@ -1270,6 +1469,83 @@ export function createGooseEngine(
     trafficFleet.wheels.instanceMatrix.needsUpdate = true;
   };
 
+  const terrorizeCampusCrowd = (radius: number, awardable = true) => {
+    const nearby = campusNpcs
+      .map((npc) => ({
+        npc,
+        distance: Math.hypot(npc.position.x - state.position.x, npc.position.z - state.position.z),
+      }))
+      .filter(({ npc, distance }) =>
+        distance <= radius &&
+        Math.abs(state.position.y - npc.ground) < 20 &&
+        npc.mode !== 'ragdoll' &&
+        npc.honkCooldown <= 0,
+      )
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, megaHonkRemaining > 0 ? 22 : 12);
+    let scored = 0;
+    nearby.forEach(({ npc }) => {
+      const canScore = awardable && npc.scoreCooldown <= 0;
+      if (panicCampusNpc(npc, state.position) && canScore) {
+        npc.scoreCooldown = 8;
+        scored += 1;
+      }
+    });
+    return { panicked: nearby.length, scored };
+  };
+
+  const resolveCrowdInteractions = () => {
+    if (campusNpcs.length === 0) return;
+    const startX = previousState.position.x;
+    const startZ = previousState.position.z;
+    const segmentX = state.position.x - startX;
+    const segmentZ = state.position.z - startZ;
+    const segmentLengthSquared = segmentX * segmentX + segmentZ * segmentZ;
+
+    for (const npc of campusNpcs) {
+      if (npc.mode === 'ragdoll' || npc.mode === 'recover' || npc.collisionCooldown > 0) continue;
+      const pointX = npc.position.x - startX;
+      const pointZ = npc.position.z - startZ;
+      const t = segmentLengthSquared > 0.0001
+        ? clamp((pointX * segmentX + pointZ * segmentZ) / segmentLengthSquared, 0, 1)
+        : 1;
+      const closestX = startX + segmentX * t;
+      const closestZ = startZ + segmentZ * t;
+      const dx = npc.position.x - closestX;
+      const dz = npc.position.z - closestZ;
+      const horizontalDistance = Math.hypot(dx, dz);
+      const vertical = state.position.y - npc.ground;
+      if (horizontalDistance > 0.78 || vertical < -0.25 || vertical > 1.85) continue;
+
+      const npcVelocity = npc.direction.clone().multiplyScalar(npc.speed);
+      const relativeSpeed = state.velocity.clone().sub(npcVelocity).length();
+      if (relativeSpeed < 2.35) {
+        panicCampusNpc(npc, state.position);
+        npc.collisionCooldown = 0.8;
+        continue;
+      }
+
+      const severity = clamp((relativeSpeed - 2) / 10, 0.2, 1);
+      const outward = new THREE.Vector3(dx, 0, dz);
+      if (outward.lengthSq() < 0.01) outward.set(npc.direction.z, 0, -npc.direction.x);
+      outward.normalize();
+      const impulse = state.velocity
+        .clone()
+        .multiplyScalar(0.32)
+        .addScaledVector(outward, 1.7 + severity * 2.2);
+      impulse.y = 2.6 + severity * 3.2;
+      if (!knockDownCampusNpc(npc, impulse)) continue;
+      state.velocity.addScaledVector(outward, -0.55 * severity);
+      state.velocity.y = Math.max(state.velocity.y, 0.5 + severity);
+      cameraShakeRemaining = Math.max(cameraShakeRemaining, 0.12 + severity * 0.12);
+      if (npc.scoreCooldown <= 0) {
+        npc.scoreCooldown = 7;
+        awardChaos(state.mode === 'flying' ? 260 : 180, state.mode === 'flying' ? 'AIRBORNE CAMPUS BOWLING' : 'CAMPUS BOWLING');
+      }
+      break;
+    }
+  };
+
   const awardChaos = (basePoints: number, label: string) => {
     chaosComboEvents += 1;
     chaosCombo = Math.min(5, 1 + Math.floor((chaosComboEvents - 1) / 3));
@@ -1310,10 +1586,73 @@ export function createGooseEngine(
     awardChaos(points, `${label} · SECRET ${secretsFound}/${campusSecrets.length}`);
   };
 
+  const unleashBonusEffect = (secret: CampusSecret) => {
+    const definition = secret.definition;
+    if (!definition) return;
+    const horizontal = new THREE.Vector3(state.forward.x, 0, state.forward.z);
+    if (horizontal.lengthSq() < 0.01) horizontal.set(Math.sin(state.heading), 0, Math.cos(state.heading));
+    horizontal.normalize();
+
+    if (definition.effect === 'launch') {
+      launchGoose(definition.id === 'bench-catapult' ? 17 : 12, definition.id === 'bench-catapult' ? 12 : 5);
+      cameraShakeRemaining = 0.28;
+    } else if (definition.effect === 'boost') {
+      if (state.mode !== 'flying') launchGoose(7, 4);
+      state.velocity.addScaledVector(horizontal, 11).addScaledVector(UP, 3.5);
+      state.stamina = 1;
+      cameraShakeRemaining = 0.16;
+    } else if (definition.effect === 'low-gravity') {
+      lowGravityRemaining = 10;
+      if (state.mode !== 'flying') launchGoose(8.5, 3);
+    } else if (definition.effect === 'mega-honk') {
+      megaHonkRemaining = 10;
+      spawnHonkWave();
+    } else if (definition.effect === 'slippery') {
+      slipperyRemaining = 12;
+    } else if (definition.effect === 'spin') {
+      launchGoose(13, 7);
+      tumbleRemaining = 1.2;
+      tumbleAngularSpeed = 16;
+      cameraShakeRemaining = 0.24;
+    } else if (definition.effect === 'stamina') {
+      state.stamina = 1;
+      state.velocity.addScaledVector(horizontal, 3.5);
+      spawnHonkWave();
+    } else if (definition.effect === 'traffic-wobble') {
+      traffic.forEach((car) => {
+        if (car.position.distanceToSquared(state.position) < 55 * 55) {
+          car.wobbleRemaining = Math.max(car.wobbleRemaining, 5);
+          car.reactionRemaining = Math.max(car.reactionRemaining, 2.5);
+        }
+      });
+      terrorizeCampusCrowd(55, false);
+      cameraShakeRemaining = 0.2;
+    }
+  };
+
+  const activateBonusSecret = (secret: CampusSecret) => {
+    if (!secret.definition || secret.found) return;
+    discoverSecret(secret, secret.definition.points, secret.definition.label.toUpperCase());
+    unleashBonusEffect(secret);
+  };
+
   const registerSecretHonk = () => {
     campusSecrets.forEach((secret) => {
       if (secret.found) return;
       const distance = state.position.distanceTo(secret.position);
+      if (secret.kind === 'chaos-bonus' && secret.definition && distance < secret.radius) {
+        const { definition } = secret;
+        if (definition.trigger !== 'honk' && definition.trigger !== 'multi-honk') return;
+        if (secret.honkWindow <= 0) secret.honkCount = 0;
+        secret.honkCount += 1;
+        secret.honkWindow = definition.id === 'student-megaphone' ? 7 : 4;
+        if (secret.honkCount < definition.requiredHonks) {
+          hooks.onToast(`${definition.label} · honk ${secret.honkCount}/${definition.requiredHonks}`);
+          return;
+        }
+        activateBonusSecret(secret);
+        return;
+      }
       if (secret.kind === 'duck-council' && distance < secret.radius && state.onWater) {
         discoverSecret(secret, 900, 'CHOSEN OF THE POND');
         cameraShakeRemaining = 0.14;
@@ -1342,12 +1681,32 @@ export function createGooseEngine(
 
   const updateCampusSecrets = (dt: number) => {
     campusSecrets.forEach((secret, secretIndex) => {
+      if (!secret.terrainResolved && Math.hypot(secret.position.x - state.position.x, secret.position.z - state.position.z) < 750) {
+        const elevation = map.queryTerrainElevation(localToLngLat(secret.position.x, secret.position.z));
+        if (typeof elevation === 'number' && Number.isFinite(elevation)) {
+          secret.terrainResolved = true;
+          secret.position.y = elevation + secret.altitude;
+          secret.group.position.y = secret.position.y;
+          secret.group.userData.baseY = secret.position.y;
+        }
+      }
       secret.honkWindow = Math.max(0, secret.honkWindow - dt);
       if (secret.honkWindow === 0 && !secret.found) secret.honkCount = 0;
       secret.activation += secret.found ? dt : 0;
       const pulse = 1 + Math.sin(elapsedTime * 3.2 + secretIndex) * 0.045;
 
-      if (secret.kind === 'radio') {
+      if (secret.kind === 'chaos-bonus') {
+        const spinner = secret.group.getObjectByName('bonus-spinner');
+        const beacon = secret.group.getObjectByName('bonus-pulse');
+        if (spinner) {
+          spinner.rotation.z += dt * (secret.found ? 2.8 : 0.35);
+          if (secret.definition?.visual !== 'air-gate') spinner.rotation.y += dt * (secret.found ? 3.4 : 0.24);
+        }
+        if (beacon) beacon.scale.setScalar(secret.found ? 1.18 + Math.sin(elapsedTime * 8) * 0.15 : pulse);
+        if (secret.found) {
+          secret.group.position.y = secret.group.userData.baseY + Math.sin(elapsedTime * 3.7 + secretIndex) * 0.16;
+        }
+      } else if (secret.kind === 'radio') {
         const beacon = secret.group.getObjectByName('secret-beacon');
         if (beacon) {
           beacon.rotation.z += dt * (secret.found ? 4.5 : 0.75);
@@ -1378,7 +1737,15 @@ export function createGooseEngine(
 
       if (secret.found) return;
       const distance = state.position.distanceTo(secret.position);
-      if (secret.kind === 'diploma-tornado' && distance < secret.radius) {
+      if (secret.kind === 'chaos-bonus' && secret.definition) {
+        const { definition } = secret;
+        const contactRadius = definition.visual === 'bonk-cluster'
+          ? Math.min(definition.radius, 3.2)
+          : Math.min(definition.radius, 2.6);
+        const touched = definition.trigger === 'touch' && distance < contactRadius;
+        const flewThrough = definition.trigger === 'air' && state.mode === 'flying' && distance < definition.radius;
+        if (touched || flewThrough) activateBonusSecret(secret);
+      } else if (secret.kind === 'diploma-tornado' && distance < secret.radius) {
         discoverSecret(secret, 600, 'ACADEMIC MENACE');
         launchGoose(7.5, 2.5);
         cameraShakeRemaining = 0.18;
@@ -1460,7 +1827,8 @@ export function createGooseEngine(
     spawnHonkWave();
     playHonk();
     const agl = state.position.y - state.ground;
-    const radius = state.mode === 'flying' && agl < 20 ? 34 : 26;
+    const baseRadius = state.mode === 'flying' && agl < 20 ? 34 : 26;
+    const radius = baseRadius * (megaHonkRemaining > 0 ? 2.4 : 1);
     const nearby = traffic
       .map((car) => ({
         car,
@@ -1478,8 +1846,19 @@ export function createGooseEngine(
         scoredCars += 1;
       }
     });
-    if (scoredCars > 0) {
-      awardChaos(50 * scoredCars, scoredCars >= 2 ? `HONK CHAIN ×${scoredCars}` : 'HONK IF YOU YIELD');
+    const crowdReaction = terrorizeCampusCrowd(radius, true);
+    if (scoredCars > 0 || crowdReaction.scored > 0) {
+      const totalTargets = scoredCars + crowdReaction.scored;
+      const label = scoredCars > 0 && crowdReaction.scored > 0
+        ? `CAMPUS PANIC ×${totalTargets}`
+        : crowdReaction.scored > 0
+          ? `HONK PANIC ×${crowdReaction.scored}`
+          : scoredCars >= 2
+            ? `HONK CHAIN ×${scoredCars}`
+            : 'HONK IF YOU YIELD';
+      awardChaos(50 * scoredCars + 35 * crowdReaction.scored, label);
+    } else if (crowdReaction.panicked > 0) {
+      hooks.onToast(`HONK! · ${crowdReaction.panicked} students scattered`);
     } else {
       hooks.onToast('HONK!');
     }
@@ -1490,6 +1869,9 @@ export function createGooseEngine(
     honkCooldown = Math.max(0, honkCooldown - dt);
     hitCooldown = Math.max(0, hitCooldown - dt);
     cameraShakeRemaining = Math.max(0, cameraShakeRemaining - dt);
+    lowGravityRemaining = Math.max(0, lowGravityRemaining - dt);
+    megaHonkRemaining = Math.max(0, megaHonkRemaining - dt);
+    slipperyRemaining = Math.max(0, slipperyRemaining - dt);
     if (chaosComboRemaining > 0) {
       chaosComboRemaining = Math.max(0, chaosComboRemaining - dt);
       if (chaosComboRemaining === 0) {
@@ -1678,11 +2060,11 @@ export function createGooseEngine(
   const simulateGround = (dt: number) => {
     const turnInput = Number(keys.has('KeyD')) - Number(keys.has('KeyA'));
     const moveInput = Number(keys.has('KeyW')) - Number(keys.has('KeyS'));
-    const topSpeed = state.mode === 'swimming' ? 2.4 : 3.8;
+    const topSpeed = state.mode === 'swimming' ? 2.4 : slipperyRemaining > 0 ? 7.2 : 3.8;
     state.heading += turnInput * (1.7 + Math.abs(moveInput) * 0.45) * dt;
     const forward = new THREE.Vector3(Math.sin(state.heading), 0, Math.cos(state.heading));
     const desired = forward.multiplyScalar(moveInput >= 0 ? moveInput * topSpeed : moveInput * 1.25);
-    const response = state.mode === 'swimming' ? 1.2 : 2.5;
+    const response = state.mode === 'swimming' ? 1.2 : slipperyRemaining > 0 ? 0.6 : 2.5;
     state.velocity.lerp(desired, 1 - Math.exp(-response * dt));
     state.position.addScaledVector(state.velocity, dt);
     state.position.y = state.ground + 0.04;
@@ -1732,7 +2114,8 @@ export function createGooseEngine(
       FLIGHT.deepStallDrag * state.stall * state.stall +
       0.12 * brake;
     const dynamicPressure = 0.5 * FLIGHT.rho * speed * speed;
-    const force = new THREE.Vector3(0, -FLIGHT.mass * FLIGHT.gravity, 0);
+    const gravityScale = lowGravityRemaining > 0 ? 0.42 : 1;
+    const force = new THREE.Vector3(0, -FLIGHT.mass * FLIGHT.gravity * gravityScale, 0);
     force.addScaledVector(liftDirection, dynamicPressure * FLIGHT.wingArea * cl);
     force.addScaledVector(forward, -dynamicPressure * FLIGHT.wingArea * cd);
 
@@ -1821,11 +2204,13 @@ export function createGooseEngine(
       sampleSurface();
     }
     simulateTraffic(dt);
+    campusNpcs.forEach((npc) => simulateCampusNpc(npc, dt, elapsedTime, terrainAt));
     if (tumbleRemaining > 0) simulateTumble(dt);
     else if (state.mode === 'planing') simulateWaterPlaning(dt);
     else if (state.mode === 'flying') simulateFlight(dt);
     else simulateGround(dt);
     resolveTrafficInteractions();
+    resolveCrowdInteractions();
     updateCampusSecrets(dt);
     if (state.flapRemaining > 0) {
       state.flapRemaining = Math.max(0, state.flapRemaining - dt);
@@ -1884,21 +2269,30 @@ export function createGooseEngine(
   };
 
   const updateCamera = (dt: number, pose: SimState, immediate = false) => {
+    const inputBlend = immediate ? 1 : 1 - Math.exp(-12 * dt);
+    cameraDistanceScale = lerp(cameraDistanceScale, cameraDistanceTarget, inputBlend);
+    const yawDelta = Math.atan2(
+      Math.sin(cameraOrbitYawTarget - cameraOrbitYaw),
+      Math.cos(cameraOrbitYawTarget - cameraOrbitYaw),
+    );
+    cameraOrbitYaw += yawDelta * inputBlend;
+    cameraOrbitPitch = lerp(cameraOrbitPitch, cameraOrbitPitchTarget, inputBlend);
+
     const horizontal = new THREE.Vector3(pose.forward.x, 0, pose.forward.z);
     if (horizontal.lengthSq() < 0.01) horizontal.set(Math.sin(pose.heading), 0, Math.cos(pose.heading));
     horizontal.normalize();
     const speed = clamp(pose.velocity.length(), 8, 26);
     const isFlying = pose.mode === 'flying' || pose.mode === 'planing';
-    const chaseBack = isFlying ? 7 + 0.06 * speed : 4.8;
-    const chaseHeight = isFlying ? 3.2 + 0.055 * speed : 2.5;
-    const lookAhead = isFlying ? 4.5 + 0.08 * speed : 3;
-    const desiredPosition = pose.position
+    const orbitOrigin = pose.position.clone().addScaledVector(UP, 0.65);
+    const radial = horizontal.clone().multiplyScalar(-1).applyAxisAngle(UP, cameraOrbitYaw);
+    const distance = (isFlying ? 7.25 + 0.025 * speed : 5.65) * cameraDistanceScale;
+    const desiredPosition = orbitOrigin
       .clone()
-      .addScaledVector(horizontal, -chaseBack)
-      .addScaledVector(UP, chaseHeight);
+      .addScaledVector(radial, distance * Math.cos(cameraOrbitPitch))
+      .addScaledVector(UP, distance * Math.sin(cameraOrbitPitch));
     desiredPosition.y = Math.max(
       desiredPosition.y,
-      terrainAt(desiredPosition.x, desiredPosition.z, pose.ground) + 2.5,
+      terrainAt(desiredPosition.x, desiredPosition.z, pose.ground) + 1.5,
     );
     for (const building of buildingColliders) {
       if (
@@ -1917,7 +2311,8 @@ export function createGooseEngine(
       desiredPosition.y += Math.sin(elapsedTime * 117 + 0.6) * 0.3 * shake;
       desiredPosition.z += Math.cos(elapsedTime * 83) * 0.48 * shake;
     }
-    const desiredTarget = pose.position.clone().addScaledVector(horizontal, lookAhead).addScaledVector(UP, 0.65);
+    const lookAhead = (isFlying ? 1.8 : 0.7) * Math.max(0, Math.cos(cameraOrbitYaw));
+    const desiredTarget = orbitOrigin.clone().addScaledVector(horizontal, lookAhead);
     const positionBlend = immediate ? 1 : 1 - Math.exp(-5 * dt);
     const targetBlend = immediate ? 1 : 1 - Math.exp(-7 * dt);
     cameraPosition.lerp(desiredPosition, positionBlend);
@@ -1978,6 +2373,9 @@ export function createGooseEngine(
     tumbleAngularSpeed = 0;
     hitCooldown = 0;
     cameraShakeRemaining = 0;
+    lowGravityRemaining = 0;
+    megaHonkRemaining = 0;
+    slipperyRemaining = 0;
     airborneTime = 0;
     peakAgl = 0;
     waterSurfaceY = spawnGround;
@@ -1985,14 +2383,23 @@ export function createGooseEngine(
     waterDryTime = 0;
     waterTouchdownSeverity = 0;
     waterSprayClock = 0;
+    cameraDistanceScale = 0.72;
+    cameraDistanceTarget = 0.72;
+    cameraOrbitYaw = 0;
+    cameraOrbitYawTarget = 0;
+    cameraOrbitPitch = 24 * DEG;
+    cameraOrbitPitchTarget = 24 * DEG;
     accumulator = 0;
+    campusNpcs.forEach((npc, index) => {
+      campusNpcs[index] = createCampusNpc(index, npc.route, npc.distance, terrainAt);
+    });
     for (const wave of honkWaves.splice(0)) {
       scene.remove(wave.mesh);
       wave.mesh.geometry.dispose();
       wave.mesh.material.dispose();
     }
-    cameraPosition.set(0, state.position.y + 4.1, -8);
-    cameraTarget.set(0, state.position.y + 0.65, 5.8);
+    cameraPosition.set(0, state.position.y + 2.8, -5);
+    cameraTarget.set(0, state.position.y + 0.65, 1.8);
     sampleSurface();
     copyState(previousState, state);
     copyState(renderState, state);
@@ -2032,10 +2439,11 @@ export function createGooseEngine(
   const onIdle = () => {
     const hadTraffic = trafficBuilt;
     buildTraffic();
+    const crowdChanged = collectPedestrianRoutes();
     const buildingsChanged = buildTexturedBuildings();
     const treesChanged = unresolvedTreeCount > 0 ? updateTrees(true) : false;
     if (!hadTraffic && trafficBuilt) updateTrafficVisuals(1);
-    if ((!hadTraffic && trafficBuilt) || buildingsChanged || treesChanged) map.triggerRepaint();
+    if ((!hadTraffic && trafficBuilt) || crowdChanged || buildingsChanged || treesChanged) map.triggerRepaint();
   };
   map.on('idle', onIdle);
   onIdle();
@@ -2057,6 +2465,7 @@ export function createGooseEngine(
       if (steps >= 8) accumulator = 0;
       interpolateState(accumulator / FIXED_DT);
       if (trafficBuilt) updateTrafficVisuals(accumulator / FIXED_DT);
+      if (campusNpcs.length > 0) updateCrowdVisuals(crowdFleet, campusNpcs, accumulator / FIXED_DT, elapsedTime);
       treeRefreshClock -= frameDt;
       if (unresolvedTreeCount > 0 && treeRefreshClock <= 0) {
         treeRefreshClock = 1.25;
@@ -2083,7 +2492,7 @@ export function createGooseEngine(
     start() {
       playing = true;
       previousTime = performance.now();
-      hooks.onToast('Five campus secrets are out there — hold Space to flap, press E to honk');
+      hooks.onToast('Twenty-five campus secrets are out there — honk, bonk, and terrorize the crowds');
     },
     reset() {
       resetState();
@@ -2103,6 +2512,21 @@ export function createGooseEngine(
       } else {
         keys.delete(code);
       }
+    },
+    scaleCameraZoom(multiplier) {
+      cameraDistanceTarget = clamp(cameraDistanceTarget * multiplier, 0.5, 2.6);
+      map.triggerRepaint();
+    },
+    orbitCamera(yawDelta, pitchDelta) {
+      cameraOrbitYawTarget = (cameraOrbitYawTarget + yawDelta + Math.PI * 3) % (Math.PI * 2) - Math.PI;
+      cameraOrbitPitchTarget = clamp(cameraOrbitPitchTarget + pitchDelta, 10 * DEG, 72 * DEG);
+      map.triggerRepaint();
+    },
+    resetCamera() {
+      cameraDistanceTarget = 0.72;
+      cameraOrbitYawTarget = 0;
+      cameraOrbitPitchTarget = 24 * DEG;
+      map.triggerRepaint();
     },
     destroy() {
       destroyed = true;
