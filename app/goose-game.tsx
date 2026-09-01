@@ -1139,7 +1139,7 @@ export function GooseGame() {
                 target="_blank"
                 rel="noreferrer"
               >
-                Esri World Imagery · contributors
+                Esri World Imagery (Clarity) · contributors
               </a>
             </div>
           </aside>
@@ -1332,7 +1332,7 @@ export function GooseGame() {
         <span className="map-credit">
           ©{' '}
           <a href={AERIAL_INFORMATION_URL} target="_blank" rel="noreferrer">
-            Esri World Imagery contributors
+            Esri World Imagery (Clarity) contributors
           </a>{' '}
           ·{' '}
           <a
