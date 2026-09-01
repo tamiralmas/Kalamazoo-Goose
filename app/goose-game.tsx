@@ -77,13 +77,22 @@ const modeCopy: Record<FlightMode, { label: string; hint: string }> = {
   swimming: { label: 'Swimming', hint: 'Space to take off again' },
 };
 
+type CameraPointer = {
+  x: number;
+  y: number;
+  startX: number;
+  startY: number;
+  downAt: number;
+};
+
 export function GooseGame() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const engineRef = useRef<GooseEngine | null>(null);
   const playingRef = useRef(false);
   const toastTimerRef = useRef<number | null>(null);
-  const cameraPointersRef = useRef(new Map<number, { x: number; y: number }>());
+  const cameraPointersRef = useRef(new Map<number, CameraPointer>());
+  const lastCameraTapRef = useRef(0);
   const [mapReady, setMapReady] = useState(false);
   const [terrainReady, setTerrainReady] = useState(false);
   const [mapError, setMapError] = useState(false);
@@ -99,12 +108,21 @@ export function GooseGame() {
     let cancelled = false;
     let loaded = false;
     let terrainTimer: number | null = null;
+    let mapCanvas: HTMLCanvasElement | null = null;
+    const coarsePointer = window.matchMedia('(any-pointer: coarse)').matches;
+    const pixelRatio = Math.min(window.devicePixelRatio || 1, coarsePointer ? 1.5 : 2);
 
     const showToast = (message: string) => {
       if (cancelled) return;
       setToast(message);
       if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
       toastTimerRef.current = window.setTimeout(() => setToast(null), 3400);
+    };
+    const onWebglContextLost = (event: Event) => {
+      event.preventDefault();
+      CONTROL_CODES.forEach((code) => engineRef.current?.setKey(code, false));
+      cameraPointers.clear();
+      showToast('Graphics paused — restoring the 3D campus…');
     };
 
     void import('maplibre-gl')
@@ -124,9 +142,15 @@ export function GooseGame() {
           renderWorldCopies: false,
           centerClampedToGround: false,
           attributionControl: false,
-          canvasContextAttributes: { antialias: true },
+          pixelRatio,
+          canvasContextAttributes: {
+            antialias: !coarsePointer,
+            powerPreference: 'high-performance',
+          },
         });
         mapRef.current = map;
+        mapCanvas = map.getCanvas();
+        mapCanvas.addEventListener('webglcontextlost', onWebglContextLost);
         map.addControl(new maplibre.AttributionControl({ compact: true }), 'bottom-right');
 
         map.on('error', () => {
@@ -365,6 +389,10 @@ export function GooseGame() {
       CONTROL_CODES.forEach((code) => engineRef.current?.setKey(code, false));
       cameraPointers.clear();
     };
+    const preventContextMenu = (event: Event) => event.preventDefault();
+    const onVisibilityChange = () => {
+      if (document.hidden) clearControls();
+    };
     const onCameraWheel = (event: WheelEvent) => {
       if (!playingRef.current) return;
       event.preventDefault();
@@ -379,6 +407,10 @@ export function GooseGame() {
     window.addEventListener('keydown', onKeyDown, { passive: false });
     window.addEventListener('keyup', onKeyUp);
     window.addEventListener('blur', clearControls);
+    window.addEventListener('pagehide', clearControls);
+    window.addEventListener('orientationchange', clearControls);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    container.addEventListener('contextmenu', preventContextMenu);
     container.addEventListener('wheel', onCameraWheel, { passive: false });
 
     return () => {
@@ -386,10 +418,15 @@ export function GooseGame() {
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
       window.removeEventListener('blur', clearControls);
+      window.removeEventListener('pagehide', clearControls);
+      window.removeEventListener('orientationchange', clearControls);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      container.removeEventListener('contextmenu', preventContextMenu);
       container.removeEventListener('wheel', onCameraWheel);
       cameraPointers.clear();
       if (toastTimerRef.current !== null) window.clearTimeout(toastTimerRef.current);
       if (terrainTimer !== null) window.clearTimeout(terrainTimer);
+      mapCanvas?.removeEventListener('webglcontextlost', onWebglContextLost);
       engineRef.current?.destroy();
       engineRef.current = null;
       mapRef.current?.remove();
@@ -433,11 +470,19 @@ export function GooseGame() {
 
   const setCameraPointer = (event: ReactPointerEvent<HTMLDivElement>, pressed: boolean) => {
     if (pressed) {
-      if (!playingRef.current || !(event.target instanceof HTMLCanvasElement)) return;
+      if (!playingRef.current) return;
+      const target = event.target;
+      if (target instanceof Element && target.closest('.maplibregl-control-container')) return;
       if (event.pointerType === 'mouse' && event.button !== 0) return;
       if (cameraPointersRef.current.size >= 2) return;
       event.preventDefault();
-      cameraPointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      cameraPointersRef.current.set(event.pointerId, {
+        x: event.clientX,
+        y: event.clientY,
+        startX: event.clientX,
+        startY: event.clientY,
+        downAt: performance.now(),
+      });
       try {
         event.currentTarget.setPointerCapture(event.pointerId);
       } catch {
@@ -445,9 +490,25 @@ export function GooseGame() {
       }
       return;
     }
-    if (!cameraPointersRef.current.has(event.pointerId)) return;
+    const pointer = cameraPointersRef.current.get(event.pointerId);
+    if (!pointer) return;
     event.preventDefault();
+    const wasOnlyPointer = cameraPointersRef.current.size === 1;
     cameraPointersRef.current.delete(event.pointerId);
+    const isTap =
+      event.pointerType !== 'mouse' &&
+      wasOnlyPointer &&
+      performance.now() - pointer.downAt < 280 &&
+      Math.hypot(event.clientX - pointer.startX, event.clientY - pointer.startY) < 12;
+    if (isTap) {
+      const now = performance.now();
+      if (now - lastCameraTapRef.current < 340) {
+        engineRef.current?.resetCamera();
+        lastCameraTapRef.current = 0;
+      } else {
+        lastCameraTapRef.current = now;
+      }
+    }
   };
 
   const moveCameraPointer = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -455,7 +516,11 @@ export function GooseGame() {
     if (!previous) return;
     event.preventDefault();
     if (cameraPointersRef.current.size === 1) {
-      cameraPointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+      cameraPointersRef.current.set(event.pointerId, {
+        ...previous,
+        x: event.clientX,
+        y: event.clientY,
+      });
       engineRef.current?.orbitCamera(
         -(event.clientX - previous.x) * 0.0045,
         -(event.clientY - previous.y) * 0.0035,
@@ -466,7 +531,11 @@ export function GooseGame() {
     const oldCenterX = (before[0].x + before[1].x) * 0.5;
     const oldCenterY = (before[0].y + before[1].y) * 0.5;
     const oldDistance = Math.hypot(before[1].x - before[0].x, before[1].y - before[0].y);
-    cameraPointersRef.current.set(event.pointerId, { x: event.clientX, y: event.clientY });
+    cameraPointersRef.current.set(event.pointerId, {
+      ...previous,
+      x: event.clientX,
+      y: event.clientY,
+    });
     const after = [...cameraPointersRef.current.values()];
     const newCenterX = (after[0].x + after[1].x) * 0.5;
     const newCenterY = (after[0].y + after[1].y) * 0.5;
@@ -545,7 +614,14 @@ export function GooseGame() {
             <span><Users /><strong>Walking crowds</strong></span>
           </div>
           <p className="launch-note">
-            {mapError ? 'A map service failed to respond. It will retry when the page reloads.' : 'Tap Space for one wingbeat · Hold it for continuous flapping'}
+            {mapError ? (
+              'A map service failed to respond. It will retry when the page reloads.'
+            ) : (
+              <>
+                <span className="desktop-instructions">Tap Space for one wingbeat · Hold it for continuous flapping</span>
+                <span className="touch-instructions">Use the on-screen controls · Hold Flap for continuous wingbeats</span>
+              </>
+            )}
           </p>
         </section>
       )}
@@ -567,6 +643,13 @@ export function GooseGame() {
             </div>
           </section>
 
+          <section className={`mobile-status-strip${telemetry.score >= 10_000 ? ' is-infamous' : ''}`} aria-label="Mobile flight status">
+            <span><small>Speed</small><strong>{telemetry.speed.toFixed(0)}<em>m/s</em></strong></span>
+            <span><small>Altitude</small><strong>{telemetry.agl.toFixed(0)}<em>m</em></strong></span>
+            <span><small>Stamina</small><strong>{Math.round(telemetry.stamina * 100)}<em>%</em></strong></span>
+            <span><small>Chaos</small><strong>{telemetry.score.toLocaleString()}</strong></span>
+          </section>
+
           <aside className="objective-card">
             <span className="objective-icon"><Trophy /></span>
             <span>
@@ -581,7 +664,7 @@ export function GooseGame() {
             <i><b style={{ width: `${telemetry.stamina * 100}%` }} /></i>
           </div>
 
-          <div className="chaos-card" aria-live="polite" aria-label={`Chaos score ${telemetry.score}, combo times ${telemetry.combo}`}>
+          <div className="chaos-card" aria-label={`Chaos score ${telemetry.score}, combo times ${telemetry.combo}`}>
             <span><Trophy /><small>Chaos score</small><strong>{telemetry.score.toLocaleString()}</strong></span>
             <em className={telemetry.score >= 10_000 ? 'is-infamous' : telemetry.combo > 1 ? 'is-hot' : ''}>
               {telemetry.score >= 10_000 ? 'CROWD FEAR' : `COMBO ×${telemetry.combo}`}
@@ -589,7 +672,11 @@ export function GooseGame() {
           </div>
 
           {telemetry.stall > 0.22 && (
-            <div className="stall-warning"><TriangleAlert /> STALL · LOWER THE NOSE WITH W</div>
+            <div className="stall-warning">
+              <TriangleAlert />
+              <span className="desktop-instructions">STALL · LOWER THE NOSE WITH W</span>
+              <span className="touch-instructions">STALL · HOLD DIVE</span>
+            </div>
           )}
 
           <div className="flight-reticle" aria-hidden="true"><span /><i /></div>

@@ -520,6 +520,7 @@ export function createGooseEngine(
   map: MapLibreMap,
   hooks: Hooks,
 ): GooseEngine {
+  const fixedStep = window.matchMedia('(any-pointer: coarse)').matches ? 1 / 60 : FIXED_DT;
   const scene = new THREE.Scene();
   const camera = new THREE.Camera();
   const goose = createGooseRig();
@@ -2006,22 +2007,32 @@ export function createGooseEngine(
     });
   };
 
-  const playHonk = () => {
+  const unlockAudio = () => {
     try {
       audioContext ??= new AudioContext();
       if (audioContext.state === 'suspended') void audioContext.resume();
-      const now = audioContext.currentTime;
-      const gain = audioContext.createGain();
+      return audioContext;
+    } catch {
+      return null;
+    }
+  };
+
+  const playHonk = () => {
+    try {
+      const context = unlockAudio();
+      if (!context) return;
+      const now = context.currentTime;
+      const gain = context.createGain();
       gain.gain.setValueAtTime(0.0001, now);
       gain.gain.exponentialRampToValueAtTime(0.11, now + 0.018);
       gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.34);
-      gain.connect(audioContext.destination);
+      gain.connect(context.destination);
       [
         { start: 205, end: 142, volume: 0.7 },
         { start: 154, end: 112, volume: 0.42 },
       ].forEach(({ start, end, volume }) => {
-        const oscillator = audioContext!.createOscillator();
-        const voiceGain = audioContext!.createGain();
+        const oscillator = context.createOscillator();
+        const voiceGain = context.createGain();
         oscillator.type = 'square';
         oscillator.frequency.setValueAtTime(start, now);
         oscillator.frequency.exponentialRampToValueAtTime(end, now + 0.31);
@@ -2185,7 +2196,7 @@ export function createGooseEngine(
         state.mode = 'waddling';
       }
     }
-    if (tumbleRemaining <= FIXED_DT) {
+    if (tumbleRemaining <= fixedStep) {
       state.bank = 0;
       state.alpha = FLIGHT.trimAlpha;
       if (state.mode !== 'flying') {
@@ -2693,7 +2704,7 @@ export function createGooseEngine(
         ? 0.035
         : tumbleRemaining > 0 ||
             (state.mode === 'flying' && state.position.y - state.ground < 3 && state.velocity.y < 0)
-          ? FIXED_DT
+          ? fixedStep
         : 0.12;
       sampleSurface();
     }
@@ -2969,16 +2980,16 @@ export function createGooseEngine(
     if (playing) {
       accumulator += frameDt;
       let steps = 0;
-      while (accumulator >= FIXED_DT && steps < 8) {
+      while (accumulator >= fixedStep && steps < 8) {
         copyState(previousState, state);
-        simulate(FIXED_DT);
-        accumulator -= FIXED_DT;
+        simulate(fixedStep);
+        accumulator -= fixedStep;
         steps += 1;
       }
       if (steps >= 8) accumulator = 0;
-      interpolateState(accumulator / FIXED_DT);
-      if (trafficBuilt) updateTrafficVisuals(accumulator / FIXED_DT);
-      if (campusNpcs.length > 0) updateCrowdVisuals(crowdFleet, campusNpcs, accumulator / FIXED_DT, elapsedTime);
+      interpolateState(accumulator / fixedStep);
+      if (trafficBuilt) updateTrafficVisuals(accumulator / fixedStep);
+      if (campusNpcs.length > 0) updateCrowdVisuals(crowdFleet, campusNpcs, accumulator / fixedStep, elapsedTime);
       treeRefreshClock -= frameDt;
       if (unresolvedTreeCount > 0 && treeRefreshClock <= 0) {
         treeRefreshClock = 1.25;
@@ -3003,11 +3014,13 @@ export function createGooseEngine(
 
   return {
     start() {
+      unlockAudio();
       playing = true;
       previousTime = performance.now();
       hooks.onToast('Twenty-five campus secrets are out there — honk, bonk, and terrorize the crowds');
     },
     reset() {
+      unlockAudio();
       resetState();
       playing = true;
       previousTime = performance.now();
@@ -3019,6 +3032,7 @@ export function createGooseEngine(
           queuedFlaps = Math.min(2, queuedFlaps + 1);
         }
         if ((code === 'KeyE' || code === 'KeyH') && !keys.has(code)) {
+          unlockAudio();
           queuedHonks = Math.min(1, queuedHonks + 1);
         }
         keys.add(code);
