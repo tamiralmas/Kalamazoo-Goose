@@ -795,13 +795,13 @@ export function GooseGame() {
       <div className="sky-vignette" aria-hidden="true" />
 
       <header className="game-topbar">
-        <div className="brand-lockup" aria-label="Wild Goose Open Earth">
+        <div className="brand-lockup" aria-label="Kalamazoo Goose">
           <span className="brand-mark">
             <Bird />
           </span>
           <span>
-            <strong>WILD GOOSE</strong>
-            <small>OPEN EARTH · WMU</small>
+            <strong>KALAMAZOO</strong>
+            <small>GOOSE · WMU</small>
           </span>
         </div>
         <div className="location-chip">

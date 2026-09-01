@@ -6086,7 +6086,7 @@ export function createGooseEngine(
   };
 
   const customLayer: CustomLayerInterface = {
-    id: 'goose-shared-3d-world',
+    id: 'kalamazoo-goose-3d-world',
     type: 'custom',
     renderingMode: '3d',
     onAdd(_map, gl) {

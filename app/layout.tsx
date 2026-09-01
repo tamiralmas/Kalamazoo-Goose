@@ -13,20 +13,28 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  title: 'Wild Goose: Open Earth',
+  title: 'Kalamazoo Goose',
   description:
-    'Fly a Canada goose through a living OpenStreetMap world, land with a splash, waddle across campus, and stop traffic.',
+    'Fly, splash down, recruit a flock, and cause campus chaos as a Canada goose at Western Michigan University.',
   openGraph: {
-    title: 'Wild Goose: Open Earth',
+    title: 'Kalamazoo Goose',
     description:
-      'Take wing above Western Michigan University, find open water, and explore Kalamazoo as one very determined goose.',
+      'Take wing above Western Michigan University, recruit a flock, and explore Kalamazoo as one very determined goose.',
     type: 'website',
-    images: [{ url: '/og.png', width: 1200, height: 630, alt: 'Wild Goose flying above a lakeside campus' }],
+    images: [
+      {
+        url: '/og.png',
+        width: 1200,
+        height: 630,
+        alt: 'Kalamazoo Goose flying above Western Michigan University',
+      },
+    ],
   },
   twitter: {
     card: 'summary_large_image',
-    title: 'Wild Goose: Open Earth',
-    description: 'A playful 3D goose flight game over a living OpenStreetMap world.',
+    title: 'Kalamazoo Goose',
+    description:
+      'A chaotic 3D goose sandbox set around Western Michigan University.',
     images: ['/og.png'],
   },
 };
