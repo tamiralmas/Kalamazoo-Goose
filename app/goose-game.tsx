@@ -46,6 +46,8 @@ const INITIAL_TELEMETRY: GameTelemetry = {
   mode: 'flying',
   score: 0,
   combo: 1,
+  secretsFound: 0,
+  secretsTotal: 5,
 };
 
 const CONTROL_CODES = [
@@ -62,6 +64,7 @@ const CONTROL_CODES = [
 
 const modeCopy: Record<FlightMode, { label: string; hint: string }> = {
   flying: { label: 'Gliding', hint: 'Stunt, flap, and cause chaos' },
+  planing: { label: 'Planing', hint: 'Skim the surface and ride out the splashdown' },
   waddling: { label: 'Waddling', hint: 'Cause extremely polite gridlock' },
   swimming: { label: 'Swimming', hint: 'Space to take off again' },
 };
@@ -442,7 +445,7 @@ export function GooseGame() {
           <div className="eyebrow"><span /> REAL-SCALE CAMPUS · AERIAL ROOFS · CHAOS SANDBOX</div>
           <h1 id="launch-title">Take wing<br />over WMU.</h1>
           <p>
-            Fly, honk, bonk traffic, botch landings, and make a mess over a real-scale WMU built from aerial imagery and OpenStreetMap data.
+            Fly, honk, bonk traffic, skim across ponds, and uncover five absurd campus secrets in a real-scale aerial WMU.
           </p>
           <Button className="launch-button" size="lg" onClick={startGame} disabled={!mapReady}>
             <Feather /> {mapReady ? 'Fly from WMU' : mapError ? 'Map is reconnecting…' : 'Loading 3D campus…'}
@@ -480,7 +483,7 @@ export function GooseGame() {
             <span>
               <small>Campus chaos</small>
               <strong>Honk, bonk cars, stick the landing</strong>
-              <em>E to honk · chain stunts for combos</em>
+              <em>{telemetry.secretsFound}/{telemetry.secretsTotal} campus secrets · E to honk</em>
             </span>
           </aside>
 
@@ -502,7 +505,7 @@ export function GooseGame() {
 
           <div className="mode-stack">
             <span className={`mode-badge mode-${telemetry.mode}`}>
-              {telemetry.mode === 'flying' ? <Bird /> : telemetry.mode === 'swimming' ? <Waves /> : <Footprints />}
+              {telemetry.mode === 'flying' ? <Bird /> : telemetry.mode === 'swimming' || telemetry.mode === 'planing' ? <Waves /> : <Footprints />}
               {mode.label}
             </span>
             <span>{mode.hint}</span>
