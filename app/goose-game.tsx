@@ -366,7 +366,7 @@ export function GooseGame() {
       cameraPointers.clear();
     };
     const onCameraWheel = (event: WheelEvent) => {
-      if (!playingRef.current || !(event.target instanceof HTMLCanvasElement)) return;
+      if (!playingRef.current) return;
       event.preventDefault();
       const normalized = event.deltaMode === 1
         ? event.deltaY * 16
@@ -513,8 +513,8 @@ export function GooseGame() {
         </div>
         <div className="top-actions">
           <div className="camera-toolbar" aria-label="Camera controls">
-            <button type="button" title="Zoom in" aria-label="Zoom camera in" onClick={() => engineRef.current?.scaleCameraZoom(0.82)}><ZoomIn /></button>
-            <button type="button" title="Zoom out" aria-label="Zoom camera out" onClick={() => engineRef.current?.scaleCameraZoom(1.22)}><ZoomOut /></button>
+            <button type="button" title="Zoom in" aria-label="Zoom camera in" onClick={() => engineRef.current?.scaleCameraZoom(0.72)}><ZoomIn /></button>
+            <button type="button" title="Zoom out" aria-label="Zoom camera out" onClick={() => engineRef.current?.scaleCameraZoom(1.38)}><ZoomOut /></button>
             <button type="button" title="Reset camera" aria-label="Reset camera" onClick={() => engineRef.current?.resetCamera()}><RotateCcw /></button>
           </div>
           <Button
@@ -583,7 +583,9 @@ export function GooseGame() {
 
           <div className="chaos-card" aria-live="polite" aria-label={`Chaos score ${telemetry.score}, combo times ${telemetry.combo}`}>
             <span><Trophy /><small>Chaos score</small><strong>{telemetry.score.toLocaleString()}</strong></span>
-            <em className={telemetry.combo > 1 ? 'is-hot' : ''}>COMBO ×{telemetry.combo}</em>
+            <em className={telemetry.score >= 10_000 ? 'is-infamous' : telemetry.combo > 1 ? 'is-hot' : ''}>
+              {telemetry.score >= 10_000 ? 'CROWD FEAR' : `COMBO ×${telemetry.combo}`}
+            </em>
           </div>
 
           {telemetry.stall > 0.22 && (

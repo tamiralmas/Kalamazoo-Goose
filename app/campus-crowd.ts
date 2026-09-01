@@ -1,11 +1,12 @@
 import * as THREE from 'three';
 
-export const MAX_CAMPUS_NPCS = 40;
+export const MAX_CAMPUS_NPCS = 84;
 
 export type CrowdRoute = {
   points: THREE.Vector3[];
   cumulative: number[];
   total: number;
+  sidewalkOffset?: number;
 };
 
 export type CampusNpcMode = 'walk' | 'flee' | 'ragdoll' | 'recover';
@@ -282,7 +283,8 @@ export function createCampusNpc(
 
   const routeDistance = clamp(distance, 0, route.total);
   const directionSign = (index % 2 === 0 ? 1 : -1) as -1 | 1;
-  const laneOffset = (random01(index, 1) - 0.5) * 1.1;
+  const sidewalkSide = random01(index, 2) < 0.5 ? -1 : 1;
+  const laneOffset = sidewalkSide * (route.sidewalkOffset ?? 0) + (random01(index, 1) - 0.5) * 1.1;
   sampleCrowdRoute(route, routeDistance, samplePosition, sampleDirection);
   sampleDirection.multiplyScalar(directionSign);
   sampleRight.set(sampleDirection.z, 0, -sampleDirection.x);

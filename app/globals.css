@@ -696,6 +696,7 @@ kbd {
 .chaos-card strong { font-size: 18px; line-height: 1; font-variant-numeric: tabular-nums; }
 .chaos-card em { border-radius: 999px; background: rgba(255,255,255,.08); padding: 5px 7px; color: rgba(255,255,255,.62); font-size: 8px; font-style: normal; font-weight: 850; letter-spacing: .06em; white-space: nowrap; }
 .chaos-card em.is-hot { background: #ffc75b; color: #183128; animation: combo-pulse .48s ease-in-out infinite alternate; }
+.chaos-card em.is-infamous { background: #e75f49; color: #fff4db; animation: combo-pulse .38s ease-in-out infinite alternate; }
 @keyframes combo-pulse { to { transform: scale(1.06); box-shadow: 0 0 18px rgba(255,199,91,.42); } }
 
 .stall-warning {
