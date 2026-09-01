@@ -34,46 +34,46 @@
 }
 
 :root {
-  --background: oklch(0.18 0.028 171);
+  --background: oklch(0.18 0.05 48);
   --foreground: oklch(0.97 0.016 100);
-  --card: oklch(0.22 0.032 171 / 92%);
+  --card: oklch(0.22 0.052 48 / 92%);
   --card-foreground: oklch(0.97 0.016 100);
-  --popover: oklch(0.2 0.03 171);
+  --popover: oklch(0.2 0.05 48);
   --popover-foreground: oklch(0.97 0.016 100);
-  --primary: oklch(0.78 0.15 70);
-  --primary-foreground: oklch(0.19 0.04 55);
+  --primary: #f1c500;
+  --primary-foreground: #532e1f;
   --secondary: oklch(0.97 0.015 100 / 90%);
-  --secondary-foreground: oklch(0.22 0.035 171);
-  --muted: oklch(0.34 0.03 171);
-  --muted-foreground: oklch(0.79 0.025 165);
-  --accent: oklch(0.74 0.095 196);
-  --accent-foreground: oklch(0.16 0.03 171);
+  --secondary-foreground: #532e1f;
+  --muted: oklch(0.34 0.055 48);
+  --muted-foreground: oklch(0.8 0.04 76);
+  --accent: #f1c500;
+  --accent-foreground: #532e1f;
   --destructive: oklch(0.63 0.22 28);
   --border: oklch(0.95 0.02 100 / 18%);
   --input: oklch(0.95 0.02 100 / 22%);
-  --ring: oklch(0.78 0.15 70);
+  --ring: #f1c500;
   --radius: 0.85rem;
 }
 
 .dark {
-  --background: oklch(0.14 0.028 171);
+  --background: oklch(0.14 0.046 48);
   --foreground: oklch(0.97 0.016 100);
-  --card: oklch(0.19 0.03 171 / 94%);
+  --card: oklch(0.19 0.05 48 / 94%);
   --card-foreground: oklch(0.97 0.016 100);
-  --popover: oklch(0.18 0.03 171);
+  --popover: oklch(0.18 0.048 48);
   --popover-foreground: oklch(0.97 0.016 100);
-  --primary: oklch(0.78 0.15 70);
-  --primary-foreground: oklch(0.16 0.03 55);
+  --primary: #f1c500;
+  --primary-foreground: #532e1f;
   --secondary: oklch(0.91 0.018 100);
-  --secondary-foreground: oklch(0.19 0.03 171);
-  --muted: oklch(0.28 0.028 171);
-  --muted-foreground: oklch(0.74 0.025 165);
-  --accent: oklch(0.7 0.09 196);
-  --accent-foreground: oklch(0.14 0.03 171);
+  --secondary-foreground: #532e1f;
+  --muted: oklch(0.28 0.052 48);
+  --muted-foreground: oklch(0.76 0.04 76);
+  --accent: #f1c500;
+  --accent-foreground: #532e1f;
   --destructive: oklch(0.66 0.2 28);
   --border: oklch(0.95 0.02 100 / 14%);
   --input: oklch(0.95 0.02 100 / 18%);
-  --ring: oklch(0.78 0.15 70);
+  --ring: #f1c500;
 }
 
 @layer base {
@@ -137,10 +137,10 @@
   background:
     linear-gradient(
       180deg,
-      rgba(5, 24, 22, 0.18),
+      rgba(47, 26, 16, 0.18),
       transparent 24%,
       transparent 67%,
-      rgba(5, 20, 18, 0.48)
+      rgba(39, 21, 12, 0.48)
     ),
     radial-gradient(
       circle at 73% 28%,
@@ -184,7 +184,7 @@
   place-items: center;
   border: 1px solid rgba(255, 255, 255, 0.42);
   border-radius: 50%;
-  background: rgba(6, 31, 27, 0.72);
+  background: rgba(61, 34, 20, 0.72);
   box-shadow: inset 0 0 0 3px rgba(255, 255, 255, 0.05);
   backdrop-filter: blur(14px);
 }
@@ -192,7 +192,7 @@
 .brand-mark svg {
   width: 19px;
   height: 19px;
-  color: #f4ae4d;
+  color: #f1c500;
 }
 
 .brand-lockup strong,
@@ -222,7 +222,7 @@
   gap: 10px;
   border: 1px solid rgba(255, 255, 255, 0.28);
   border-radius: 999px;
-  background: rgba(5, 29, 25, 0.69);
+  background: rgba(58, 32, 19, 0.69);
   padding: 9px 18px;
   box-shadow: 0 12px 35px rgba(0, 0, 0, 0.12);
   backdrop-filter: blur(16px);
@@ -230,7 +230,7 @@
 
 .location-chip svg {
   width: 16px;
-  color: #f6ac43;
+  color: #f1c500;
 }
 
 .location-chip strong {
@@ -257,9 +257,9 @@
   gap: 4px;
   border: 1px solid rgba(255, 255, 255, 0.28);
   border-radius: 999px;
-  background: rgba(5, 29, 25, 0.69);
+  background: rgba(58, 32, 19, 0.69);
   padding: 3px;
-  box-shadow: 0 10px 25px rgba(5, 27, 24, 0.13);
+  box-shadow: 0 10px 25px rgba(53, 29, 17, 0.13);
   backdrop-filter: blur(14px);
 }
 
@@ -280,8 +280,8 @@
   color: white;
 }
 .camera-toolbar button:active {
-  background: #efaa49;
-  color: #173028;
+  background: #f1c500;
+  color: #532e1f;
 }
 .camera-toolbar svg {
   width: 14px;
@@ -304,7 +304,7 @@
   border: 1px solid rgba(255, 255, 255, 0.38);
   border-radius: 50%;
   background: rgba(255, 255, 255, 0.88);
-  box-shadow: 0 10px 25px rgba(5, 27, 24, 0.13);
+  box-shadow: 0 10px 25px rgba(53, 29, 17, 0.13);
 }
 
 .launch-card {
@@ -321,11 +321,11 @@
   border-radius: 27px;
   background: linear-gradient(
     155deg,
-    rgba(8, 39, 34, 0.95),
-    rgba(7, 29, 27, 0.86)
+    rgba(76, 43, 25, 0.95),
+    rgba(57, 32, 19, 0.86)
   );
   padding: clamp(25px, 3.7vw, 42px);
-  box-shadow: 0 28px 80px rgba(5, 24, 22, 0.3);
+  box-shadow: 0 28px 80px rgba(47, 26, 16, 0.3);
   backdrop-filter: blur(18px);
 }
 
@@ -333,7 +333,7 @@
   display: flex;
   align-items: center;
   gap: 8px;
-  color: #d2ddd4;
+  color: #eadcc7;
   font-size: 10px;
   font-weight: 700;
   letter-spacing: 0.16em;
@@ -343,8 +343,8 @@
   width: 7px;
   height: 7px;
   border-radius: 50%;
-  background: #93d47a;
-  box-shadow: 0 0 0 4px rgba(147, 212, 122, 0.12);
+  background: #f1c500;
+  box-shadow: 0 0 0 4px rgba(241, 197, 0, 0.12);
 }
 
 .launch-card h1 {
@@ -358,7 +358,7 @@
 .launch-card > p:not(.launch-note) {
   max-width: 365px;
   margin: 0;
-  color: rgba(238, 244, 235, 0.72);
+  color: rgba(255, 247, 227, 0.72);
   font-size: 15px;
   line-height: 1.55;
 }
@@ -390,7 +390,7 @@
   border: 1px solid rgba(255, 255, 255, 0.09);
   border-radius: 12px;
   background: rgba(255, 255, 255, 0.045);
-  color: rgba(242, 247, 239, 0.67);
+  color: rgba(255, 248, 232, 0.67);
   font-size: 9px;
   text-align: center;
 }
@@ -398,13 +398,13 @@
 .launch-features svg {
   width: 14px;
   height: 14px;
-  color: #e7a849;
+  color: #f1c500;
 }
 
 .launch-note {
   margin: 14px 0 0;
   text-align: center;
-  color: rgba(238, 244, 235, 0.45);
+  color: rgba(255, 247, 227, 0.45);
   font-size: 9px;
   letter-spacing: 0.08em;
   text-transform: uppercase;
@@ -427,9 +427,9 @@
   gap: 11px;
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 15px;
-  background: rgba(5, 29, 25, 0.7);
+  background: rgba(58, 32, 19, 0.7);
   padding: 10px 12px;
-  box-shadow: 0 13px 30px rgba(5, 25, 22, 0.1);
+  box-shadow: 0 13px 30px rgba(49, 27, 16, 0.1);
   backdrop-filter: blur(14px);
 }
 
@@ -442,7 +442,7 @@
   place-items: center;
   border-radius: 10px;
   background: rgba(255, 255, 255, 0.09);
-  color: #efaa49;
+  color: #f1c500;
 }
 
 .telemetry-icon svg,
@@ -506,9 +506,9 @@
   gap: 12px;
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 16px;
-  background: rgba(5, 29, 25, 0.7);
+  background: rgba(58, 32, 19, 0.7);
   padding: 11px 14px;
-  box-shadow: 0 13px 30px rgba(5, 25, 22, 0.1);
+  box-shadow: 0 13px 30px rgba(49, 27, 16, 0.1);
   backdrop-filter: blur(14px);
   pointer-events: none;
 }
@@ -535,7 +535,7 @@
 
 .objective-card em {
   margin-top: 1px;
-  color: #efb157;
+  color: #f1c500;
   font-size: 9px;
 }
 
@@ -565,12 +565,12 @@
   align-items: center;
   gap: 7px;
   transform: translateX(-50%);
-  border: 1px solid rgba(137, 226, 255, 0.48);
+  border: 1px solid rgba(255, 208, 112, 0.48);
   border-radius: 999px;
-  background: rgba(18, 66, 78, 0.78);
+  background: rgba(82, 47, 24, 0.78);
   padding: 7px 11px;
-  box-shadow: 0 0 26px rgba(93, 211, 241, 0.22);
-  color: #d9f8ff;
+  box-shadow: 0 0 26px rgba(241, 197, 0, 0.22);
+  color: #fff1cc;
   font-size: 10px;
   font-weight: 850;
   letter-spacing: 0.08em;
@@ -581,7 +581,7 @@
 .jetstream-indicator svg {
   width: 14px;
   height: 14px;
-  color: #8be5fb;
+  color: #ffd36a;
 }
 
 .flight-reticle {
@@ -651,7 +651,7 @@
   transform: translateX(-50%);
   border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: 999px;
-  background: rgba(5, 29, 25, 0.58);
+  background: rgba(58, 32, 19, 0.58);
   padding: 6px 10px;
   color: rgba(255, 255, 255, 0.62);
   font-size: 8px;
@@ -666,7 +666,7 @@
   height: 26px;
   gap: 6px;
   border: 1px solid rgba(255, 255, 255, 0.25);
-  background: rgba(5, 29, 25, 0.78);
+  background: rgba(58, 32, 19, 0.78);
   padding: 0 11px;
   color: #f6f3e7;
   backdrop-filter: blur(14px);
@@ -677,13 +677,13 @@
   height: 13px !important;
 }
 .mode-swimming svg {
-  color: #70d3ec;
+  color: #ffbd32;
 }
 .mode-waddling svg {
-  color: #f4ae4d;
+  color: #f1c500;
 }
 .mode-flying svg {
-  color: #aee398;
+  color: #ffd978;
 }
 .mode-stack > span {
   color: rgba(255, 255, 255, 0.67);
@@ -702,9 +702,9 @@
   transform: translateX(-50%);
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 15px;
-  background: rgba(5, 29, 25, 0.74);
+  background: rgba(58, 32, 19, 0.74);
   padding: 9px 13px;
-  box-shadow: 0 13px 35px rgba(4, 22, 20, 0.12);
+  box-shadow: 0 13px 35px rgba(43, 24, 14, 0.12);
   color: rgba(255, 255, 255, 0.62);
   font-size: 9px;
   white-space: nowrap;
@@ -758,9 +758,9 @@ kbd {
   transform: translateX(-50%);
   border: 1px solid rgba(255, 255, 255, 0.26);
   border-radius: 999px;
-  background: rgba(8, 38, 33, 0.88);
+  background: rgba(74, 42, 25, 0.88);
   padding: 9px 16px;
-  box-shadow: 0 14px 40px rgba(4, 24, 21, 0.2);
+  box-shadow: 0 14px 40px rgba(47, 26, 16, 0.2);
   color: #f8f3df;
   font-size: 11px;
   font-weight: 700;
@@ -799,7 +799,7 @@ kbd {
   width: 3px;
   height: 3px;
   border-radius: 50%;
-  background: #f4ae4d;
+  background: #f1c500;
 }
 .map-credit {
   margin-left: auto;
@@ -842,7 +842,7 @@ kbd {
 .real-map-canvas .maplibregl-ctrl-attrib {
   border-radius: 8px;
   background: rgba(246, 244, 231, 0.84);
-  color: #173128;
+  color: #532e1f;
   font-size: 9px;
   backdrop-filter: blur(10px);
 }
@@ -851,7 +851,7 @@ kbd {
   border: 1px solid rgba(255, 255, 255, 0.36);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.88);
-  box-shadow: 0 10px 25px rgba(5, 27, 24, 0.13);
+  box-shadow: 0 10px 25px rgba(53, 29, 17, 0.13);
   pointer-events: auto;
 }
 .map-reset-button:disabled {
@@ -887,7 +887,7 @@ kbd {
   opacity: 0.75;
 }
 .game-launch-card .launch-features strong {
-  color: rgba(245, 247, 239, 0.78);
+  color: rgba(255, 249, 235, 0.78);
   font-size: 9px;
   font-weight: 650;
 }
@@ -900,9 +900,9 @@ kbd {
   width: 225px;
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 14px;
-  background: rgba(5, 29, 25, 0.7);
+  background: rgba(58, 32, 19, 0.7);
   padding: 10px 12px;
-  box-shadow: 0 13px 30px rgba(5, 25, 22, 0.1);
+  box-shadow: 0 13px 30px rgba(49, 27, 16, 0.1);
   backdrop-filter: blur(14px);
   pointer-events: none;
 }
@@ -915,7 +915,7 @@ kbd {
 .stamina-card svg {
   width: 14px;
   height: 14px;
-  color: #efaa49;
+  color: #f1c500;
 }
 .stamina-card small {
   color: rgba(255, 255, 255, 0.58);
@@ -939,7 +939,7 @@ kbd {
   display: block;
   height: 100%;
   border-radius: inherit;
-  background: linear-gradient(90deg, #e7a849, #a9dc78);
+  background: linear-gradient(90deg, #f1c500, #ffd36a);
   transition: width 120ms linear;
 }
 
@@ -957,11 +957,11 @@ kbd {
   border-radius: 14px;
   background: linear-gradient(
     135deg,
-    rgba(39, 40, 22, 0.84),
-    rgba(5, 29, 25, 0.76)
+    rgba(74, 45, 20, 0.84),
+    rgba(58, 32, 19, 0.76)
   );
   padding: 10px 12px;
-  box-shadow: 0 13px 30px rgba(5, 25, 22, 0.12);
+  box-shadow: 0 13px 30px rgba(49, 27, 16, 0.12);
   backdrop-filter: blur(14px);
   pointer-events: none;
 }
@@ -1002,7 +1002,7 @@ kbd {
 }
 .chaos-card em.is-hot {
   background: #ffc75b;
-  color: #183128;
+  color: #532e1f;
   animation: combo-pulse 0.48s ease-in-out infinite alternate;
 }
 .chaos-card em.is-infamous {
@@ -1026,8 +1026,8 @@ kbd {
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.24);
   border-radius: 17px;
-  background: rgba(5, 29, 25, 0.86);
-  box-shadow: 0 18px 44px rgba(3, 20, 17, 0.24);
+  background: rgba(58, 32, 19, 0.86);
+  box-shadow: 0 18px 44px rgba(39, 21, 12, 0.24);
   pointer-events: auto;
   backdrop-filter: blur(14px);
 }
@@ -1059,7 +1059,7 @@ kbd {
 .minimap-desktop-title svg {
   width: 13px;
   height: 13px;
-  color: #efaa49;
+  color: #f1c500;
 }
 .minimap-desktop-title small {
   color: rgba(255, 255, 255, 0.48);
@@ -1084,8 +1084,8 @@ kbd {
   overflow: hidden;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 11px;
-  background: #687b68;
-  box-shadow: inset 0 0 24px rgba(4, 24, 20, 0.18);
+  background: #7b5a3d;
+  box-shadow: inset 0 0 24px rgba(47, 26, 16, 0.18);
   isolation: isolate;
 }
 
@@ -1098,7 +1098,7 @@ kbd {
   background:
     linear-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 255, 255, 0.08) 1px, transparent 1px),
-    radial-gradient(circle, transparent 47%, rgba(4, 27, 23, 0.22));
+    radial-gradient(circle, transparent 47%, rgba(53, 29, 17, 0.22));
   background-size:
     40px 40px,
     40px 40px,
@@ -1140,11 +1140,11 @@ kbd {
   place-items: center;
   border: 1px solid rgba(255, 255, 255, 0.42);
   border-radius: 50%;
-  background: rgba(7, 35, 30, 0.74);
+  background: rgba(68, 39, 23, 0.74);
   color: #fff8e4;
   font-size: 8px;
   font-weight: 900;
-  box-shadow: 0 4px 12px rgba(3, 20, 17, 0.18);
+  box-shadow: 0 4px 12px rgba(39, 21, 12, 0.18);
 }
 
 .minimap-goose-marker,
@@ -1163,11 +1163,11 @@ kbd {
   width: 28px;
   height: 28px;
   border: 2px solid rgba(255, 255, 255, 0.94);
-  background: #173d34;
+  background: #532e1f;
   color: #ffd170;
   box-shadow:
-    0 4px 15px rgba(3, 20, 17, 0.5),
-    0 0 0 3px rgba(23, 61, 52, 0.28);
+    0 4px 15px rgba(39, 21, 12, 0.5),
+    0 0 0 3px rgba(108, 64, 35, 0.34);
 }
 
 .minimap-goose-marker::before {
@@ -1265,10 +1265,10 @@ kbd {
   text-transform: uppercase;
 }
 .mode-flying {
-  box-shadow: inset 0 0 0 1px rgba(174, 227, 152, 0.2);
+  box-shadow: inset 0 0 0 1px rgba(241, 197, 0, 0.2);
 }
 .mode-swimming {
-  box-shadow: inset 0 0 0 1px rgba(112, 211, 236, 0.25);
+  box-shadow: inset 0 0 0 1px rgba(255, 202, 82, 0.25);
 }
 .mode-waddling {
   box-shadow: inset 0 0 0 1px rgba(244, 174, 77, 0.25);
@@ -1276,10 +1276,10 @@ kbd {
 .is-playing .sky-vignette {
   background: linear-gradient(
     180deg,
-    rgba(5, 24, 22, 0.17),
+    rgba(47, 26, 16, 0.17),
     transparent 20%,
     transparent 70%,
-    rgba(5, 20, 18, 0.42)
+    rgba(39, 21, 12, 0.42)
   );
 }
 .map-upgrade-card {
@@ -1309,7 +1309,7 @@ kbd {
   width: 17px;
   height: 17px;
   margin-bottom: 3px;
-  color: #efaa49;
+  color: #f1c500;
 }
 .upgrade-data-grid strong {
   font-size: 10px;
@@ -1336,11 +1336,11 @@ kbd {
   animation: map-pulse 1.4s ease-in-out infinite;
 }
 .map-load-state.is-ready {
-  color: #cde9c3;
+  color: #ffe3a1;
 }
 .map-load-state.is-ready i {
-  background: #93d47a;
-  box-shadow: 0 0 0 4px rgba(147, 212, 122, 0.12);
+  background: #f1c500;
+  box-shadow: 0 0 0 4px rgba(241, 197, 0, 0.12);
   animation: none;
 }
 .map-load-state.is-error i {
@@ -1385,8 +1385,8 @@ kbd {
     overflow: hidden;
     border: 1px solid rgba(255, 255, 255, 0.22);
     border-radius: 14px;
-    background: rgba(5, 29, 25, 0.88);
-    box-shadow: 0 10px 25px rgba(4, 22, 20, 0.16);
+    background: rgba(58, 32, 19, 0.88);
+    box-shadow: 0 10px 25px rgba(43, 24, 14, 0.16);
     pointer-events: none;
   }
 
@@ -1451,16 +1451,16 @@ kbd {
     column-gap: 7px;
     border: 1px solid rgba(255, 255, 255, 0.18);
     border-radius: 999px;
-    background: rgba(5, 29, 25, 0.78);
+    background: rgba(58, 32, 19, 0.78);
     padding: 6px 11px;
-    box-shadow: 0 8px 20px rgba(4, 22, 20, 0.12);
+    box-shadow: 0 8px 20px rgba(43, 24, 14, 0.12);
     pointer-events: none;
   }
   .mobile-discovery-chip > span {
     display: grid;
     grid-row: 1 / 3;
     place-items: center;
-    color: #efaa49;
+    color: #f1c500;
   }
   .mobile-discovery-chip svg {
     width: 14px;
@@ -1535,9 +1535,9 @@ kbd {
     display: grid;
     place-items: center;
     border: 1px solid rgba(255, 255, 255, 0.3);
-    background: rgba(5, 29, 25, 0.9);
+    background: rgba(58, 32, 19, 0.9);
     color: #fff;
-    box-shadow: 0 7px 18px rgba(4, 24, 21, 0.16);
+    box-shadow: 0 7px 18px rgba(47, 26, 16, 0.16);
     touch-action: none;
     -webkit-tap-highlight-color: transparent;
   }
@@ -1546,8 +1546,8 @@ kbd {
   .touch-actions button:active,
   .touch-pad button[data-pressed='true'],
   .touch-actions button[data-pressed='true'] {
-    background: rgba(239, 170, 73, 0.94);
-    color: #173028;
+    background: rgba(241, 197, 0, 0.94);
+    color: #532e1f;
     transform: scale(0.96);
   }
   .touch-pad button:first-child {
@@ -1585,11 +1585,11 @@ kbd {
   .touch-actions .flap-action {
     width: 70px;
     height: 70px;
-    background: rgba(239, 170, 73, 0.95);
-    color: #173028;
+    background: rgba(241, 197, 0, 0.95);
+    color: #532e1f;
   }
   .touch-actions .honk-action {
-    background: rgba(46, 74, 51, 0.94);
+    background: rgba(94, 55, 27, 0.94);
     color: #ffd070;
   }
   .touch-actions svg {
@@ -1712,7 +1712,7 @@ kbd {
     width: 16px;
     height: 16px;
     flex: 0 0 auto;
-    color: #efaa49;
+    color: #f1c500;
   }
   .minimap-mobile-toggle > span {
     display: grid;

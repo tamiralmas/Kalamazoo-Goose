@@ -18,6 +18,10 @@ export const metadata: Metadata = {
   title: 'Kalamazoo Goose',
   description:
     'Fly, splash down, recruit a flock, and cause campus chaos as a Canada goose at Western Michigan University.',
+  icons: {
+    icon: [{ url: '/favicon.svg', type: 'image/svg+xml' }],
+    shortcut: '/favicon.svg',
+  },
   openGraph: {
     title: 'Kalamazoo Goose',
     description:
@@ -45,7 +49,7 @@ export const viewport: Viewport = {
   width: 'device-width',
   initialScale: 1,
   viewportFit: 'cover',
-  themeColor: '#0b2a25',
+  themeColor: '#532e1f',
 };
 
 export default function RootLayout({
