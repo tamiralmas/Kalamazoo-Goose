@@ -2172,6 +2172,12 @@ export function createGooseEngine(
         waterSurfaceY = state.ground;
         waterTouchdownSeverity = 1;
         waterPlaningElapsed = 0;
+        tumbleRemaining = 0;
+        tumbleAngle = 0;
+        tumbleAngularSpeed = 0;
+        state.bank = 0;
+        state.alpha = FLIGHT.trimAlpha;
+        return;
       } else {
         state.velocity.y = Math.abs(state.velocity.y) > 1 ? -state.velocity.y * 0.22 : 0;
         state.velocity.x *= Math.exp(-2.5 * dt);
@@ -2685,7 +2691,8 @@ export function createGooseEngine(
     if (surfaceClock <= 0) {
       surfaceClock = state.mode === 'planing'
         ? 0.035
-        : state.mode === 'flying' && state.position.y - state.ground < 3 && state.velocity.y < 0
+        : tumbleRemaining > 0 ||
+            (state.mode === 'flying' && state.position.y - state.ground < 3 && state.velocity.y < 0)
           ? FIXED_DT
         : 0.12;
       sampleSurface();
