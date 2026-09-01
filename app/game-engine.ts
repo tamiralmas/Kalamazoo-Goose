@@ -688,6 +688,7 @@ export function createGooseEngine(
   let waterTouchdownSeverity = 0;
   let waterSprayClock = 0;
   let waterContactLatched = false;
+  let waterContactReleaseTime = 0;
   const texturedBuildingKeys = new Set<string>();
   const buildingMaterials = new Map<
     string,
@@ -2162,10 +2163,21 @@ export function createGooseEngine(
     state.position.addScaledVector(state.velocity, dt);
     if (state.position.y <= state.ground + 0.05) {
       state.position.y = state.ground + 0.05;
-      state.velocity.y = Math.abs(state.velocity.y) > 1 ? -state.velocity.y * 0.22 : 0;
-      state.velocity.x *= Math.exp(-2.5 * dt);
-      state.velocity.z *= Math.exp(-2.5 * dt);
-      state.mode = state.onWater ? 'swimming' : 'waddling';
+      if (state.onWater) {
+        const horizontalSpeed = Math.hypot(state.velocity.x, state.velocity.z);
+        state.velocity.y = 0;
+        state.velocity.x *= 0.58;
+        state.velocity.z *= 0.58;
+        state.mode = horizontalSpeed >= 3 ? 'planing' : 'swimming';
+        waterSurfaceY = state.ground;
+        waterTouchdownSeverity = 1;
+        waterPlaningElapsed = 0;
+      } else {
+        state.velocity.y = Math.abs(state.velocity.y) > 1 ? -state.velocity.y * 0.22 : 0;
+        state.velocity.x *= Math.exp(-2.5 * dt);
+        state.velocity.z *= Math.exp(-2.5 * dt);
+        state.mode = 'waddling';
+      }
     }
     if (tumbleRemaining <= FIXED_DT) {
       state.bank = 0;
@@ -2490,6 +2502,14 @@ export function createGooseEngine(
   };
 
   const simulateGround = (dt: number) => {
+    if (state.mode === 'swimming') {
+      waterDryTime = state.onWater ? 0 : waterDryTime + dt;
+      if (waterDryTime > 0.18) {
+        state.mode = 'waddling';
+        waterDryTime = 0;
+        hooks.onToast('Waddled onto shore');
+      }
+    }
     const turnInput = Number(keys.has('KeyD')) - Number(keys.has('KeyA'));
     const moveInput = Number(keys.has('KeyW')) - Number(keys.has('KeyS'));
     const topSpeed = state.mode === 'swimming' ? 2.4 : slipperyRemaining > 0 ? 7.2 : 3.8;
@@ -2574,7 +2594,7 @@ export function createGooseEngine(
       const bankDegrees = Math.abs(state.bank / DEG);
       const landingCounts = airborneTime > 1.5 && peakAgl > 3;
       state.position.y = state.ground + 0.05;
-      const waterRun = state.onWater && landingSpeed >= 3 && impact < 6;
+      const waterRun = state.onWater && landingSpeed >= 3;
       state.mode = state.onWater ? (waterRun ? 'planing' : 'swimming') : 'waddling';
       state.heading = Math.atan2(state.forward.x, state.forward.z);
       const waterSeverity = clamp(impact / 7 + bankDegrees / 90, 0, 1);
@@ -2595,6 +2615,7 @@ export function createGooseEngine(
         state.position.y = waterSurfaceY + (waterRun ? 0.1 : 0.04);
         spawnSplash(clamp(0.18 + impact / 7 + landingSpeed / 30, 0.2, 1));
         waterContactLatched = true;
+        waterContactReleaseTime = 0;
         if (landingCounts) {
           if (impact > 4.5 || bankDegrees > 35) awardChaos(350, 'BELLY FLOP');
           else if (impact >= 0.7 && impact < 2.3 && bankDegrees < 20) awardChaos(300, 'PERFECT SPLASHDOWN');
@@ -2625,15 +2646,17 @@ export function createGooseEngine(
     }
   };
 
-  const ensureWaterEntrySplash = () => {
+  const ensureWaterEntrySplash = (dt: number) => {
     const touchingWater =
       state.onWater &&
       state.position.y <= state.ground + 0.2 &&
       highestRoofAt(state.position.x, state.position.z, state.position.y + 0.12) === null;
     if (!touchingWater) {
-      waterContactLatched = false;
+      waterContactReleaseTime += dt;
+      if (waterContactReleaseTime >= 0.18) waterContactLatched = false;
       return;
     }
+    waterContactReleaseTime = 0;
     if (waterContactLatched) return;
 
     const impact = Math.max(0, -previousState.velocity.y, -state.velocity.y);
@@ -2660,8 +2683,10 @@ export function createGooseEngine(
     beginFlapIfNeeded();
     surfaceClock -= dt;
     if (surfaceClock <= 0) {
-      surfaceClock = state.mode === 'planing' || (state.mode === 'flying' && state.position.y - state.ground < 2 && state.velocity.y < 0)
+      surfaceClock = state.mode === 'planing'
         ? 0.035
+        : state.mode === 'flying' && state.position.y - state.ground < 3 && state.velocity.y < 0
+          ? FIXED_DT
         : 0.12;
       sampleSurface();
     }
@@ -2673,7 +2698,7 @@ export function createGooseEngine(
     else simulateGround(dt);
     resolveBuildingInteractions();
     refreshBuildingSupport();
-    ensureWaterEntrySplash();
+    ensureWaterEntrySplash(dt);
     resolveTrafficInteractions();
     resolveCrowdInteractions();
     updateCampusSecrets(dt);
@@ -2863,6 +2888,7 @@ export function createGooseEngine(
     waterTouchdownSeverity = 0;
     waterSprayClock = 0;
     waterContactLatched = false;
+    waterContactReleaseTime = 0;
     cameraDistanceScale = 0.72;
     cameraDistanceTarget = 0.72;
     cameraOrbitYaw = 0;
