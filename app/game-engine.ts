@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import type { UVGenerator } from 'three';
 import type { CustomLayerInterface, Map as MapLibreMap } from 'maplibre-gl';
 
 import { WMU_TREE_POINTS } from './wmu-trees';
@@ -15,6 +16,8 @@ export type GameTelemetry = {
   stamina: number;
   stall: number;
   mode: FlightMode;
+  score: number;
+  combo: number;
 };
 
 type MapLibreModule = typeof import('maplibre-gl');
@@ -57,18 +60,52 @@ type Route = {
   points: THREE.Vector3[];
   cumulative: number[];
   total: number;
+  cruise: number;
+  laneWidth: number;
 };
 
 type TrafficCar = {
-  root: THREE.Group;
+  index: number;
   route: Route;
   distance: number;
+  directionSign: -1 | 1;
+  laneOffset: number;
   speed: number;
   cruise: number;
   ground: number;
   targetGround: number;
   elevationTimer: number;
   stopped: boolean;
+  position: THREE.Vector3;
+  previousPosition: THREE.Vector3;
+  direction: THREE.Vector3;
+  previousDirection: THREE.Vector3;
+  reactionRemaining: number;
+  honkScoreCooldown: number;
+  collisionCooldown: number;
+  nearMissCooldown: number;
+  wobbleRemaining: number;
+};
+
+type TrafficFleet = {
+  bodies: THREE.InstancedMesh<THREE.BoxGeometry, THREE.MeshStandardMaterial>;
+  cabins: THREE.InstancedMesh<THREE.BoxGeometry, THREE.MeshStandardMaterial>;
+  wheels: THREE.InstancedMesh<THREE.CylinderGeometry, THREE.MeshStandardMaterial>;
+};
+
+type HonkWave = {
+  mesh: THREE.Mesh<THREE.TorusGeometry, THREE.MeshBasicMaterial>;
+  age: number;
+  life: number;
+};
+
+type BuildingCollider = {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
+  ground: number;
+  height: number;
 };
 
 type Splash = {
@@ -90,6 +127,10 @@ const FLAP_PERIOD = 0.36;
 const DOWNSTROKE = 0.2;
 const FLAP_STAMINA_COST = 0.014;
 const SPAWN_ALTITUDE = 64;
+const MAX_TRAFFIC = 32;
+const BUILDING_TEXTURE_MAX_ZOOM = 18;
+const BUILDING_TEXTURE_MIN_ZOOM = 15;
+const CHAOS_COMBO_SECONDS = 4;
 
 const FLIGHT = {
   mass: 4.5,
@@ -149,7 +190,7 @@ function makeWingGeometry(side: -1 | 1) {
 function createGooseRig() {
   const root = new THREE.Group();
   root.name = 'Canada goose';
-  root.scale.setScalar(1.06);
+  root.scale.setScalar(0.4);
   root.traverse((object) => {
     object.frustumCulled = false;
   });
@@ -234,47 +275,55 @@ function createGooseRig() {
   return { root, leftWing, rightWing, legs } satisfies GooseRig;
 }
 
-function createCar(color: number) {
-  const root = new THREE.Group();
-  const paint = new THREE.MeshStandardMaterial({ color, roughness: 0.5, metalness: 0.12 });
-  const glass = new THREE.MeshStandardMaterial({ color: 0x22333a, roughness: 0.24 });
-  const tire = new THREE.MeshStandardMaterial({ color: 0x171918, roughness: 0.96 });
-  const body = new THREE.Mesh(new THREE.BoxGeometry(1.72, 0.43, 3.7), paint);
-  body.position.y = 0.48;
-  root.add(body);
-  const cabin = new THREE.Mesh(new THREE.BoxGeometry(1.42, 0.5, 1.85), glass);
-  cabin.position.set(0, 0.9, -0.08);
-  root.add(cabin);
-  for (const x of [-0.78, 0.78]) {
-    for (const z of [-1.16, 1.16]) {
-      const wheel = new THREE.Mesh(new THREE.CylinderGeometry(0.24, 0.24, 0.16, 9), tire);
-      wheel.rotation.z = Math.PI / 2;
-      wheel.position.set(x, 0.25, z);
-      root.add(wheel);
-    }
-  }
-  root.scale.setScalar(0.84);
-  root.traverse((object) => {
-    object.frustumCulled = false;
+function createTrafficFleet(capacity: number) {
+  const bodyMaterial = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    roughness: 0.52,
+    metalness: 0.12,
   });
-  return root;
+  const glassMaterial = new THREE.MeshStandardMaterial({
+    color: 0x26383e,
+    roughness: 0.24,
+    metalness: 0.08,
+  });
+  const tireMaterial = new THREE.MeshStandardMaterial({ color: 0x171918, roughness: 0.96 });
+  const bodies = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(1.82, 0.52, 4.4),
+    bodyMaterial,
+    capacity,
+  );
+  const cabins = new THREE.InstancedMesh(
+    new THREE.BoxGeometry(1.52, 0.72, 2.15),
+    glassMaterial,
+    capacity,
+  );
+  const wheelGeometry = new THREE.CylinderGeometry(0.31, 0.31, 0.2, 10);
+  wheelGeometry.rotateZ(Math.PI / 2);
+  const wheels = new THREE.InstancedMesh(wheelGeometry, tireMaterial, capacity * 4);
+  bodies.count = 0;
+  cabins.count = 0;
+  wheels.count = 0;
+  bodies.frustumCulled = false;
+  cabins.frustumCulled = false;
+  wheels.frustumCulled = false;
+  return { bodies, cabins, wheels } satisfies TrafficFleet;
 }
 
-function routeFromPoints(points: THREE.Vector3[]) {
+function routeFromPoints(points: THREE.Vector3[], cruise = 7, laneWidth = 1.35) {
   const cumulative = [0];
   for (let index = 1; index < points.length; index += 1) {
     cumulative.push(cumulative[index - 1] + points[index].distanceTo(points[index - 1]));
   }
-  return { points, cumulative, total: cumulative[cumulative.length - 1] } satisfies Route;
+  return { points, cumulative, total: cumulative[cumulative.length - 1], cruise, laneWidth } satisfies Route;
 }
 
 function sampleRoute(route: Route, distance: number) {
-  const wrapped = ((distance % route.total) + route.total) % route.total;
+  const routeDistance = clamp(distance, 0, route.total);
   let index = 1;
-  while (index < route.cumulative.length - 1 && route.cumulative[index] < wrapped) index += 1;
+  while (index < route.cumulative.length - 1 && route.cumulative[index] < routeDistance) index += 1;
   const startDistance = route.cumulative[index - 1];
   const segmentLength = Math.max(route.cumulative[index] - startDistance, 0.001);
-  const t = (wrapped - startDistance) / segmentLength;
+  const t = (routeDistance - startDistance) / segmentLength;
   const position = route.points[index - 1].clone().lerp(route.points[index], t);
   const direction = route.points[index].clone().sub(route.points[index - 1]).normalize();
   return { position, direction };
@@ -288,7 +337,9 @@ export function createGooseEngine(
   const scene = new THREE.Scene();
   const camera = new THREE.Camera();
   const goose = createGooseRig();
+  const trafficFleet = createTrafficFleet(MAX_TRAFFIC);
   scene.add(goose.root);
+  scene.add(trafficFleet.bodies, trafficFleet.cabins, trafficFleet.wheels);
   scene.add(new THREE.HemisphereLight(0xdaf0f2, 0x6d6a4f, 2.35));
   const sun = new THREE.DirectionalLight(0xfff1c2, 3.2);
   sun.position.set(-90, 150, 60);
@@ -324,6 +375,13 @@ export function createGooseEngine(
     (layer) => layer.type === 'fill-extrusion' && layer['source-layer'] === 'building',
   );
   if (buildingLayerIndex < 0) throw new Error('The map style did not provide 3D buildings.');
+  const buildingLayer = styleLayers[buildingLayerIndex];
+  const buildingLayerId = buildingLayer.id;
+  const buildingSourceId =
+    'source' in buildingLayer && typeof buildingLayer.source === 'string'
+      ? buildingLayer.source
+      : null;
+  if (!buildingSourceId) throw new Error('The map style did not provide OSM building geometry.');
   const customLayerBeforeId = styleLayers[buildingLayerIndex + 1]?.id;
 
   const state: SimState = {
@@ -409,8 +467,34 @@ export function createGooseEngine(
   let lastYieldToast = -10;
   let elapsedTime = 0;
   let queuedFlaps = 0;
+  let queuedHonks = 0;
+  let honkCooldown = 0;
+  let chaosScore = 0;
+  let chaosCombo = 1;
+  let chaosComboEvents = 0;
+  let chaosComboRemaining = 0;
+  let tumbleRemaining = 0;
+  let tumbleAngle = 0;
+  let tumbleAngularSpeed = 0;
+  let hitCooldown = 0;
+  let cameraShakeRemaining = 0;
+  let audioContext: AudioContext | null = null;
+  let airborneTime = 0;
+  let peakAgl = 0;
+  let builtInBuildingsHidden = false;
+  const texturedBuildingKeys = new Set<string>();
+  const buildingMaterials = new Map<
+    string,
+    {
+      texture: THREE.Texture;
+      roof: THREE.MeshBasicMaterial;
+      wall: THREE.MeshStandardMaterial;
+    }
+  >();
+  const buildingColliders: BuildingCollider[] = [];
   const traffic: TrafficCar[] = [];
   const splashes: Splash[] = [];
+  const honkWaves: HonkWave[] = [];
   const cameraPosition = new THREE.Vector3(0, state.position.y + 15, -18);
   const cameraTarget = new THREE.Vector3(0, state.position.y + 1, 8);
 
@@ -433,6 +517,216 @@ export function createGooseEngine(
   const terrainAt = (east: number, north: number, fallback = state.ground) => {
     const elevation = map.queryTerrainElevation(localToLngLat(east, north));
     return typeof elevation === 'number' && Number.isFinite(elevation) ? elevation : fallback;
+  };
+
+  const finiteNumber = (value: unknown, fallback: number) => {
+    const parsed = typeof value === 'number' ? value : Number(value);
+    return Number.isFinite(parsed) ? parsed : fallback;
+  };
+
+  const chooseBuildingTextureTile = (ring: number[][]) => {
+    const mercatorPoints = ring.map(([longitude, latitude]) =>
+      maplibre.MercatorCoordinate.fromLngLat([longitude, latitude], 0),
+    );
+    for (let zoom = BUILDING_TEXTURE_MAX_ZOOM; zoom >= BUILDING_TEXTURE_MIN_ZOOM; zoom -= 1) {
+      const scale = 2 ** zoom;
+      const tileX = Math.floor(mercatorPoints[0].x * scale);
+      const tileY = Math.floor(mercatorPoints[0].y * scale);
+      if (
+        mercatorPoints.every(
+          (point) => Math.floor(point.x * scale) === tileX && Math.floor(point.y * scale) === tileY,
+        )
+      ) {
+        return { zoom, tileX, tileY };
+      }
+    }
+    const scale = 2 ** BUILDING_TEXTURE_MIN_ZOOM;
+    const center = mercatorPoints.reduce(
+      (sum, point) => ({ x: sum.x + point.x, y: sum.y + point.y }),
+      { x: 0, y: 0 },
+    );
+    return {
+      zoom: BUILDING_TEXTURE_MIN_ZOOM,
+      tileX: Math.floor((center.x / mercatorPoints.length) * scale),
+      tileY: Math.floor((center.y / mercatorPoints.length) * scale),
+    };
+  };
+
+  const getBuildingMaterials = (zoom: number, tileX: number, tileY: number) => {
+    const key = `${zoom}/${tileY}/${tileX}`;
+    const cached = buildingMaterials.get(key);
+    if (cached) return cached;
+
+    const roof = new THREE.MeshBasicMaterial({
+      color: 0xffffff,
+      depthTest: true,
+      depthWrite: true,
+    });
+    const wall = new THREE.MeshStandardMaterial({
+      color: 0x9f9b91,
+      roughness: 0.92,
+      metalness: 0.015,
+      depthTest: true,
+      depthWrite: true,
+    });
+    const url = `https://imagery.michigan.gov/server/rest/services/Michigan_imagery_public/MapServer/tile/${zoom}/${tileY}/${tileX}`;
+    const loader = new THREE.TextureLoader();
+    loader.setCrossOrigin('anonymous');
+    const texture = loader.load(
+      url,
+      (loadedTexture) => {
+        loadedTexture.colorSpace = THREE.SRGBColorSpace;
+        loadedTexture.wrapS = THREE.ClampToEdgeWrapping;
+        loadedTexture.wrapT = THREE.ClampToEdgeWrapping;
+        loadedTexture.minFilter = THREE.LinearMipmapLinearFilter;
+        loadedTexture.magFilter = THREE.LinearFilter;
+        loadedTexture.anisotropy = Math.min(8, renderer?.capabilities.getMaxAnisotropy() ?? 4);
+        loadedTexture.needsUpdate = true;
+        map.triggerRepaint();
+      },
+      undefined,
+      () => {
+        roof.map = null;
+        roof.color.setHex(0xc7c1b5);
+        roof.needsUpdate = true;
+      },
+    );
+    texture.colorSpace = THREE.SRGBColorSpace;
+    roof.map = texture;
+    const materialSet = { texture, roof, wall };
+    buildingMaterials.set(key, materialSet);
+    return materialSet;
+  };
+
+  const makeBuildingUvGenerator = (
+    zoom: number,
+    tileX: number,
+    tileY: number,
+  ): UVGenerator => {
+    const scale = 2 ** zoom;
+    const topUv = (vertices: number[], index: number) => {
+      const east = vertices[index * 3];
+      const negativeNorth = vertices[index * 3 + 1];
+      const mercatorX = origin.x + east * meterScale;
+      const mercatorY = origin.y + negativeNorth * meterScale;
+      return new THREE.Vector2(
+        clamp(mercatorX * scale - tileX, 0, 1),
+        clamp(1 - (mercatorY * scale - tileY), 0, 1),
+      );
+    };
+    return {
+      generateTopUV(_geometry, vertices, indexA, indexB, indexC) {
+        return [topUv(vertices, indexA), topUv(vertices, indexB), topUv(vertices, indexC)];
+      },
+      generateSideWallUV(_geometry, vertices, indexA, indexB, indexC, indexD) {
+        const height = Math.max(
+          vertices[indexA * 3 + 2],
+          vertices[indexB * 3 + 2],
+          vertices[indexC * 3 + 2],
+          vertices[indexD * 3 + 2],
+          1,
+        );
+        return [
+          new THREE.Vector2(0, vertices[indexA * 3 + 2] / height),
+          new THREE.Vector2(1, vertices[indexB * 3 + 2] / height),
+          new THREE.Vector2(1, vertices[indexC * 3 + 2] / height),
+          new THREE.Vector2(0, vertices[indexD * 3 + 2] / height),
+        ];
+      },
+    };
+  };
+
+  const buildTexturedBuildings = () => {
+    if (!map.getSource(buildingSourceId)) return false;
+    const features = map.querySourceFeatures(buildingSourceId, { sourceLayer: 'building' }) as Array<{
+      id?: string | number;
+      properties?: Record<string, unknown>;
+      geometry: { type: string; coordinates: unknown };
+    }>;
+    let added = 0;
+
+    features.forEach((feature) => {
+      const polygonSets = feature.geometry.type === 'Polygon'
+        ? [feature.geometry.coordinates as number[][][]]
+        : feature.geometry.type === 'MultiPolygon'
+          ? (feature.geometry.coordinates as number[][][][])
+          : [];
+      const properties = feature.properties ?? {};
+      const levels = finiteNumber(properties.levels, 0);
+      const height = clamp(
+        finiteNumber(properties.render_height ?? properties.height, levels > 0 ? levels * 3.1 : 3.2),
+        2.6,
+        180,
+      );
+      const base = clamp(
+        finiteNumber(properties.render_min_height ?? properties.min_height, 0),
+        0,
+        height - 0.5,
+      );
+
+      polygonSets.forEach((rings, polygonIndex) => {
+        const outerRing = rings[0]?.filter((coordinate) => coordinate.length >= 2) ?? [];
+        if (outerRing.length < 4) return;
+        const localOuter = outerRing.map(([longitude, latitude]) => geoToLocal(longitude, latitude));
+        const minX = Math.min(...localOuter.map((point) => point.x));
+        const maxX = Math.max(...localOuter.map((point) => point.x));
+        const minZ = Math.min(...localOuter.map((point) => point.z));
+        const maxZ = Math.max(...localOuter.map((point) => point.z));
+        const centerX = (minX + maxX) * 0.5;
+        const centerZ = (minZ + maxZ) * 0.5;
+        if (Math.hypot(centerX, centerZ) > 1800 || maxX - minX < 0.8 || maxZ - minZ < 0.8) return;
+
+        const footprintKey = [
+          feature.id ?? 'building',
+          polygonIndex,
+          minX.toFixed(1),
+          minZ.toFixed(1),
+          maxX.toFixed(1),
+          maxZ.toFixed(1),
+          height.toFixed(1),
+        ].join(':');
+        if (texturedBuildingKeys.has(footprintKey)) return;
+
+        const shapePoints = localOuter.slice(0, -1).map((point) => new THREE.Vector2(point.x, -point.z));
+        if (shapePoints.length < 3) return;
+        const shape = new THREE.Shape(shapePoints);
+        rings.slice(1).forEach((holeRing) => {
+          const holePoints = holeRing
+            .filter((coordinate) => coordinate.length >= 2)
+            .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
+            .slice(0, -1)
+            .map((point) => new THREE.Vector2(point.x, -point.z));
+          if (holePoints.length >= 3) shape.holes.push(new THREE.Path(holePoints));
+        });
+
+        const { zoom, tileX, tileY } = chooseBuildingTextureTile(outerRing);
+        const materials = getBuildingMaterials(zoom, tileX, tileY);
+        const geometry = new THREE.ExtrudeGeometry(shape, {
+          depth: Math.max(0.5, height - base),
+          steps: 1,
+          bevelEnabled: false,
+          curveSegments: 1,
+          UVGenerator: makeBuildingUvGenerator(zoom, tileX, tileY),
+        });
+        geometry.rotateX(-Math.PI / 2);
+        const ground = terrainAt(centerX, centerZ, state.ground);
+        geometry.translate(0, ground + base, 0);
+        geometry.computeVertexNormals();
+        const mesh = new THREE.Mesh(geometry, [materials.roof, materials.wall]);
+        mesh.name = 'MiSAIL-textured OSM building';
+        mesh.frustumCulled = false;
+        scene.add(mesh);
+        buildingColliders.push({ minX, maxX, minZ, maxZ, ground, height });
+        texturedBuildingKeys.add(footprintKey);
+        added += 1;
+      });
+    });
+
+    if (added > 0 && !builtInBuildingsHidden) {
+      map.setLayoutProperty(buildingLayerId, 'visibility', 'none');
+      builtInBuildingsHidden = true;
+    }
+    return added > 0;
   };
 
   const treeTrunks = new THREE.InstancedMesh(
@@ -591,6 +885,15 @@ export function createGooseEngine(
   const buildTraffic = () => {
     if (trafficBuilt || !map.getSource(roadSourceId)) return;
     const allowed = new Set(['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'minor', 'service']);
+    const cruiseByClass: Record<string, number> = {
+      motorway: 13,
+      trunk: 11.5,
+      primary: 10.5,
+      secondary: 9,
+      tertiary: 8,
+      minor: 6.7,
+      service: 4.7,
+    };
     const features = map.querySourceFeatures(roadSourceId, { sourceLayer: 'transportation' }) as Array<{
       properties?: Record<string, unknown>;
       geometry: { type: string; coordinates: unknown };
@@ -598,83 +901,390 @@ export function createGooseEngine(
     const routes: Route[] = [];
     const seen = new Set<string>();
 
-    const acceptLine = (coordinates: number[][]) => {
+    const acceptLine = (coordinates: number[][], roadClass: string) => {
       if (coordinates.length < 2) return;
       const points = coordinates
         .filter((coordinate) => coordinate.length >= 2)
         .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
-        .filter((point) => Math.hypot(point.x, point.z) < 1800);
+        .filter((point) => Math.hypot(point.x, point.z) < 1400);
       if (points.length < 2) return;
-      const key = `${points[0].x.toFixed(0)}:${points[0].z.toFixed(0)}:${points.at(-1)?.x.toFixed(0)}:${points.at(-1)?.z.toFixed(0)}`;
+      const endpoints = [
+        `${points[0].x.toFixed(0)}:${points[0].z.toFixed(0)}`,
+        `${points.at(-1)?.x.toFixed(0)}:${points.at(-1)?.z.toFixed(0)}`,
+      ].sort();
+      const key = endpoints.join('|');
       if (seen.has(key)) return;
       seen.add(key);
-      const route = routeFromPoints(points);
+      const route = routeFromPoints(
+        points,
+        cruiseByClass[roadClass] ?? 6.7,
+        roadClass === 'service' ? 0.95 : 1.4,
+      );
       if (route.total >= 45) routes.push(route);
     };
 
     features.forEach((feature) => {
       const classValue = feature.properties?.class ?? feature.properties?.subclass;
       const roadClass = typeof classValue === 'string' ? classValue : '';
-      if (!allowed.has(roadClass) || feature.properties?.brunnel === 'tunnel') return;
-      if (feature.geometry.type === 'LineString') acceptLine(feature.geometry.coordinates as number[][]);
+      if (!allowed.has(roadClass) || feature.properties?.brunnel === 'tunnel' || feature.properties?.brunnel === 'bridge') return;
+      if (feature.geometry.type === 'LineString') acceptLine(feature.geometry.coordinates as number[][], roadClass);
       if (feature.geometry.type === 'MultiLineString') {
-        (feature.geometry.coordinates as number[][][]).forEach(acceptLine);
+        (feature.geometry.coordinates as number[][][]).forEach((line) => acceptLine(line, roadClass));
       }
     });
 
     routes.sort((a, b) => b.total - a.total);
     if (routes.length === 0) return;
     const colors = [0xc94b43, 0xe5ae39, 0x3d6f9f, 0xe8e4d6, 0x5a7358, 0x8b5a88, 0x33383c, 0xd47a36];
-    const count = Math.min(8, Math.max(4, routes.length));
+    const activeRoutes = Math.min(routes.length, 20);
+    const count = Math.min(MAX_TRAFFIC, Math.max(20, activeRoutes * 2));
     for (let index = 0; index < count; index += 1) {
-      const route = routes[index % Math.min(routes.length, 8)];
-      const root = createCar(colors[index % colors.length]);
-      scene.add(root);
+      const route = routes[index % activeRoutes];
+      const directionSign = (index % 2 === 0 ? 1 : -1) as -1 | 1;
+      const distance = route.total * ((index * 0.61803398875 + 0.11) % 1);
+      const sample = sampleRoute(route, distance);
+      const direction = sample.direction.multiplyScalar(directionSign);
+      const right = new THREE.Vector3(direction.z, 0, -direction.x);
+      const position = sample.position.addScaledVector(right, route.laneWidth);
+      const ground = terrainAt(position.x, position.z, state.ground);
+      position.y = ground + 0.04;
+      trafficFleet.bodies.setColorAt(index, new THREE.Color(colors[index % colors.length]));
       traffic.push({
-        root,
+        index,
         route,
-        distance: route.total * ((index * 0.271 + 0.13) % 1),
-        speed: 4 + (index % 3),
-        cruise: 6.1 + (index % 4) * 0.85,
-        ground: state.ground,
-        targetGround: state.ground,
-        elevationTimer: index * 0.025,
+        distance,
+        directionSign,
+        laneOffset: route.laneWidth,
+        speed: route.cruise * (0.83 + (index % 5) * 0.035),
+        cruise: route.cruise * (0.93 + (index % 4) * 0.035),
+        ground,
+        targetGround: ground,
+        elevationTimer: index * 0.02,
         stopped: false,
+        position: position.clone(),
+        previousPosition: position.clone(),
+        direction: direction.clone(),
+        previousDirection: direction.clone(),
+        reactionRemaining: 0,
+        honkScoreCooldown: 0,
+        collisionCooldown: 0,
+        nearMissCooldown: 0,
+        wobbleRemaining: 0,
       });
     }
+    trafficFleet.bodies.count = count;
+    trafficFleet.cabins.count = count;
+    trafficFleet.wheels.count = count * 4;
+    if (trafficFleet.bodies.instanceColor) trafficFleet.bodies.instanceColor.needsUpdate = true;
     trafficBuilt = true;
   };
 
-  const updateTraffic = (dt: number) => {
+  const simulateTraffic = (dt: number) => {
     const gooseGrounded = state.mode !== 'flying';
     traffic.forEach((car, index) => {
-      const sample = sampleRoute(car.route, car.distance);
-      const distanceToGoose = Math.hypot(
-        sample.position.x - state.position.x,
-        sample.position.z - state.position.z,
-      );
-      const shouldStop = gooseGrounded && distanceToGoose < 15;
-      const targetSpeed = shouldStop ? 0 : car.cruise;
-      car.speed = moveToward(car.speed, targetSpeed, (shouldStop ? 10 : 2.5) * dt);
-      car.distance += car.speed * dt;
+      car.previousPosition.copy(car.position);
+      car.previousDirection.copy(car.direction);
+      car.reactionRemaining = Math.max(0, car.reactionRemaining - dt);
+      car.honkScoreCooldown = Math.max(0, car.honkScoreCooldown - dt);
+      car.collisionCooldown = Math.max(0, car.collisionCooldown - dt);
+      car.nearMissCooldown = Math.max(0, car.nearMissCooldown - dt);
+      car.wobbleRemaining = Math.max(0, car.wobbleRemaining - dt);
+
+      const toGooseX = state.position.x - car.position.x;
+      const toGooseZ = state.position.z - car.position.z;
+      const rightX = car.direction.z;
+      const rightZ = -car.direction.x;
+      const longitudinal = toGooseX * car.direction.x + toGooseZ * car.direction.z;
+      const lateral = Math.abs(toGooseX * rightX + toGooseZ * rightZ);
+      const stopDistance = 4.5 + 0.7 * car.speed + (car.speed * car.speed) / 10;
+      const shouldYield = gooseGrounded && longitudinal > -2 && longitudinal < stopDistance && lateral < 2.3;
+
+      let targetSpeed = car.reactionRemaining > 0 ? car.cruise * 0.18 : car.cruise;
+      if (shouldYield) targetSpeed = 0;
+      let closestLeaderGap = Infinity;
+      let leaderSpeed = targetSpeed;
+      traffic.forEach((other) => {
+        if (other === car || other.route !== car.route || other.directionSign !== car.directionSign) return;
+        const gap = (other.distance - car.distance) * car.directionSign;
+        if (gap > 0 && gap < closestLeaderGap) {
+          closestLeaderGap = gap;
+          leaderSpeed = other.speed;
+        }
+      });
+      const desiredGap = 6.5 + 1.2 * car.speed;
+      if (closestLeaderGap < desiredGap) {
+        targetSpeed = Math.min(targetSpeed, closestLeaderGap < 5 ? 0 : leaderSpeed * 0.82);
+      }
+
+      const acceleration = targetSpeed < car.speed ? (shouldYield ? 7 : 4.5) : 1.8;
+      car.speed = moveToward(car.speed, targetSpeed, acceleration * dt);
+      car.distance += car.speed * car.directionSign * dt;
+      if (car.distance > car.route.total) {
+        car.distance = Math.max(0, 2 * car.route.total - car.distance);
+        car.directionSign = -1;
+      } else if (car.distance < 0) {
+        car.distance = Math.min(car.route.total, -car.distance);
+        car.directionSign = 1;
+      }
+
       const next = sampleRoute(car.route, car.distance);
+      car.direction.copy(next.direction).multiplyScalar(car.directionSign);
+      const right = new THREE.Vector3(car.direction.z, 0, -car.direction.x);
+      next.position.addScaledVector(right, car.laneOffset);
       car.elevationTimer -= dt;
       if (car.elevationTimer <= 0) {
-        car.elevationTimer = 0.22 + index * 0.012;
+        car.elevationTimer = 0.55 + index * 0.015;
         car.targetGround = terrainAt(next.position.x, next.position.z, car.targetGround);
       }
       car.ground = lerp(car.ground, car.targetGround, 1 - Math.exp(-8 * dt));
-      car.root.position.set(next.position.x, car.ground + 0.06, next.position.z);
-      car.root.rotation.y = Math.atan2(next.direction.x, next.direction.z);
-      if (shouldStop && !car.stopped && elapsedTime - lastYieldToast > 5) {
+      car.position.set(next.position.x, car.ground + 0.04, next.position.z);
+      if (shouldYield && !car.stopped && elapsedTime - lastYieldToast > 5) {
         lastYieldToast = elapsedTime;
         hooks.onToast('Traffic stopped for the goose');
       }
-      car.stopped = shouldStop;
+      car.stopped = shouldYield || car.reactionRemaining > 0;
     });
   };
 
+  const updateTrafficVisuals = (blend: number) => {
+    const position = new THREE.Vector3();
+    const direction = new THREE.Vector3();
+    const quaternion = new THREE.Quaternion();
+    const scale = new THREE.Vector3(1, 1, 1);
+    const world = new THREE.Matrix4();
+    const local = new THREE.Matrix4();
+    const matrix = new THREE.Matrix4();
+    const wheelPositions = [
+      [-0.82, 0.32, -1.42],
+      [0.82, 0.32, -1.42],
+      [-0.82, 0.32, 1.42],
+      [0.82, 0.32, 1.42],
+    ] as const;
+
+    traffic.forEach((car) => {
+      position.lerpVectors(car.previousPosition, car.position, blend);
+      direction.lerpVectors(car.previousDirection, car.direction, blend).normalize();
+      const heading = Math.atan2(direction.x, direction.z);
+      const wobble = Math.sin(elapsedTime * 17 + car.index * 1.9) * 0.065 * clamp(car.wobbleRemaining, 0, 1);
+      quaternion.setFromEuler(new THREE.Euler(0, heading, wobble, 'YXZ'));
+      world.compose(position, quaternion, scale);
+
+      local.makeTranslation(0, 0.58, 0);
+      matrix.multiplyMatrices(world, local);
+      trafficFleet.bodies.setMatrixAt(car.index, matrix);
+      local.makeTranslation(0, 1.03, -0.2);
+      matrix.multiplyMatrices(world, local);
+      trafficFleet.cabins.setMatrixAt(car.index, matrix);
+      wheelPositions.forEach(([x, y, z], wheelIndex) => {
+        local.makeTranslation(x, y, z);
+        matrix.multiplyMatrices(world, local);
+        trafficFleet.wheels.setMatrixAt(car.index * 4 + wheelIndex, matrix);
+      });
+    });
+    trafficFleet.bodies.instanceMatrix.needsUpdate = true;
+    trafficFleet.cabins.instanceMatrix.needsUpdate = true;
+    trafficFleet.wheels.instanceMatrix.needsUpdate = true;
+  };
+
+  const awardChaos = (basePoints: number, label: string) => {
+    chaosComboEvents += 1;
+    chaosCombo = Math.min(5, 1 + Math.floor((chaosComboEvents - 1) / 3));
+    chaosComboRemaining = CHAOS_COMBO_SECONDS;
+    const points = basePoints * chaosCombo;
+    chaosScore += points;
+    hooks.onToast(`${label} · +${points}${chaosCombo > 1 ? ` · x${chaosCombo}` : ''}`);
+  };
+
+  const playHonk = () => {
+    try {
+      audioContext ??= new AudioContext();
+      if (audioContext.state === 'suspended') void audioContext.resume();
+      const now = audioContext.currentTime;
+      const gain = audioContext.createGain();
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(0.11, now + 0.018);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.34);
+      gain.connect(audioContext.destination);
+      [
+        { start: 205, end: 142, volume: 0.7 },
+        { start: 154, end: 112, volume: 0.42 },
+      ].forEach(({ start, end, volume }) => {
+        const oscillator = audioContext!.createOscillator();
+        const voiceGain = audioContext!.createGain();
+        oscillator.type = 'square';
+        oscillator.frequency.setValueAtTime(start, now);
+        oscillator.frequency.exponentialRampToValueAtTime(end, now + 0.31);
+        voiceGain.gain.value = volume;
+        oscillator.connect(voiceGain).connect(gain);
+        oscillator.start(now);
+        oscillator.stop(now + 0.35);
+      });
+    } catch {
+      // Audio is a bonus; browsers may block it without affecting the honk interaction.
+    }
+  };
+
+  const spawnHonkWave = () => {
+    const material = new THREE.MeshBasicMaterial({
+      color: 0xffc85a,
+      transparent: true,
+      opacity: 0.82,
+      depthTest: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    });
+    const mesh = new THREE.Mesh(new THREE.TorusGeometry(0.75, 0.045, 6, 34), material);
+    mesh.rotation.x = Math.PI / 2;
+    mesh.position.set(state.position.x, state.position.y + 0.2, state.position.z);
+    mesh.frustumCulled = false;
+    scene.add(mesh);
+    honkWaves.push({ mesh, age: 0, life: 0.48 });
+  };
+
+  const updateHonkWaves = (dt: number) => {
+    for (let index = honkWaves.length - 1; index >= 0; index -= 1) {
+      const wave = honkWaves[index];
+      wave.age += dt;
+      const life = clamp(wave.age / wave.life, 0, 1);
+      wave.mesh.scale.setScalar(1 + life * 13);
+      wave.mesh.material.opacity = 0.82 * (1 - life);
+      if (life >= 1) {
+        scene.remove(wave.mesh);
+        wave.mesh.geometry.dispose();
+        wave.mesh.material.dispose();
+        honkWaves.splice(index, 1);
+      }
+    }
+  };
+
+  const performHonk = () => {
+    queuedHonks = 0;
+    honkCooldown = 0.58;
+    spawnHonkWave();
+    playHonk();
+    const agl = state.position.y - state.ground;
+    const radius = state.mode === 'flying' && agl < 20 ? 34 : 26;
+    const nearby = traffic
+      .map((car) => ({
+        car,
+        distance: Math.hypot(car.position.x - state.position.x, car.position.z - state.position.z),
+      }))
+      .filter(({ distance }) => distance <= radius)
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, 3);
+    let scoredCars = 0;
+    nearby.forEach(({ car, distance }) => {
+      car.reactionRemaining = Math.max(car.reactionRemaining, distance < 10 ? 1.55 : 2.1);
+      car.wobbleRemaining = Math.max(car.wobbleRemaining, 1.25);
+      if (car.honkScoreCooldown <= 0 && car.speed > 0.8) {
+        car.honkScoreCooldown = 6;
+        scoredCars += 1;
+      }
+    });
+    if (scoredCars > 0) {
+      awardChaos(50 * scoredCars, scoredCars >= 2 ? `HONK CHAIN ×${scoredCars}` : 'HONK IF YOU YIELD');
+    } else {
+      hooks.onToast('HONK!');
+    }
+  };
+
+  const updateChaosTimers = (dt: number) => {
+    honkCooldown = Math.max(0, honkCooldown - dt);
+    hitCooldown = Math.max(0, hitCooldown - dt);
+    cameraShakeRemaining = Math.max(0, cameraShakeRemaining - dt);
+    if (chaosComboRemaining > 0) {
+      chaosComboRemaining = Math.max(0, chaosComboRemaining - dt);
+      if (chaosComboRemaining === 0) {
+        chaosComboEvents = 0;
+        chaosCombo = 1;
+      }
+    }
+    if (tumbleRemaining > 0) {
+      tumbleRemaining = Math.max(0, tumbleRemaining - dt);
+      tumbleAngle += tumbleAngularSpeed * dt;
+      tumbleAngularSpeed *= Math.exp(-0.7 * dt);
+    }
+    if (state.mode === 'flying' && tumbleRemaining <= 0) {
+      airborneTime += dt;
+      peakAgl = Math.max(peakAgl, state.position.y - state.ground);
+    }
+  };
+
+  const simulateTumble = (dt: number) => {
+    state.velocity.y -= FLIGHT.gravity * 0.75 * dt;
+    state.velocity.x *= Math.exp(-1.45 * dt);
+    state.velocity.z *= Math.exp(-1.45 * dt);
+    state.position.addScaledVector(state.velocity, dt);
+    if (state.position.y <= state.ground + 0.05) {
+      state.position.y = state.ground + 0.05;
+      state.velocity.y = Math.abs(state.velocity.y) > 1 ? -state.velocity.y * 0.22 : 0;
+      state.velocity.x *= Math.exp(-2.5 * dt);
+      state.velocity.z *= Math.exp(-2.5 * dt);
+      state.mode = state.onWater ? 'swimming' : 'waddling';
+    }
+    if (tumbleRemaining <= FIXED_DT) {
+      state.bank = 0;
+      state.alpha = FLIGHT.trimAlpha;
+      if (state.mode !== 'flying') {
+        state.velocity.y = 0;
+        const horizontal = Math.hypot(state.velocity.x, state.velocity.z);
+        if (horizontal > 2) {
+          state.velocity.x *= 2 / horizontal;
+          state.velocity.z *= 2 / horizontal;
+        }
+      }
+    }
+  };
+
+  const resolveTrafficInteractions = () => {
+    if (traffic.length === 0) return;
+    for (const car of traffic) {
+      const dx = state.position.x - car.position.x;
+      const dz = state.position.z - car.position.z;
+      const rightX = car.direction.z;
+      const rightZ = -car.direction.x;
+      const localX = dx * rightX + dz * rightZ;
+      const localZ = dx * car.direction.x + dz * car.direction.z;
+      const vertical = state.position.y - car.ground;
+      const overlaps = Math.abs(localX) < 1.25 && Math.abs(localZ) < 2.45 && vertical > -0.2 && vertical < 1.65;
+
+      if (overlaps && hitCooldown <= 0 && car.collisionCooldown <= 0) {
+        const carVelocity = car.direction.clone().multiplyScalar(car.speed);
+        const relativeSpeed = state.velocity.clone().sub(carVelocity).length();
+        const severity = clamp((relativeSpeed - 1.5) / 8, 0.15, 1);
+        const normal = new THREE.Vector3(dx, 0, dz);
+        if (normal.lengthSq() < 0.01) normal.set(rightX, 0, rightZ);
+        normal.normalize();
+        state.velocity.addScaledVector(normal, lerp(2, 7, severity));
+        state.velocity.y = Math.max(state.velocity.y, lerp(1.2, 3.5, severity));
+        tumbleRemaining = lerp(0.55, 1.35, severity);
+        tumbleAngularSpeed = lerp(8, 17, severity) * (localX >= 0 ? 1 : -1);
+        hitCooldown = 1;
+        cameraShakeRemaining = lerp(0.12, 0.32, severity);
+        queuedFlaps = 0;
+        car.collisionCooldown = 5;
+        car.reactionRemaining = Math.max(car.reactionRemaining, 1.8);
+        car.wobbleRemaining = Math.max(car.wobbleRemaining, 1.4);
+        awardChaos(state.mode === 'flying' ? 225 : 200, state.mode === 'flying' ? 'AIRBORNE CAR BOP' : 'INSURANCE FRAUD');
+        break;
+      }
+
+      const lowFlyby =
+        state.mode === 'flying' &&
+        tumbleRemaining <= 0 &&
+        car.nearMissCooldown <= 0 &&
+        Math.hypot(dx, dz) < 3.2 &&
+        vertical >= 1.65 &&
+        vertical < 3.2;
+      if (lowFlyby) {
+        car.nearMissCooldown = 5;
+        awardChaos(125, 'CAMPUS FLYBY');
+      }
+    }
+  };
+
   const beginFlapIfNeeded = () => {
+    if (tumbleRemaining > 0) return;
     const spaceHeld = keys.has('Space');
     const wantsWingbeat = queuedFlaps > 0 || (spaceHeld && state.mode === 'flying');
     if (!wantsWingbeat || state.flapRemaining > 0) return;
@@ -689,6 +1299,8 @@ export function createGooseEngine(
       state.position.y = state.ground + 0.45;
       state.velocity.copy(forward).multiplyScalar(10.5).addScaledVector(UP, 5.8);
       state.forward.copy(forward);
+      airborneTime = 0;
+      peakAgl = 0;
       hooks.onToast('Wingbeat — you are airborne');
     }
   };
@@ -773,6 +1385,9 @@ export function createGooseEngine(
 
     if (state.position.y <= state.ground + 0.05) {
       const impact = Math.max(0, -state.velocity.y);
+      const landingSpeed = Math.hypot(state.velocity.x, state.velocity.z);
+      const bankDegrees = Math.abs(state.bank / DEG);
+      const landingCounts = airborneTime > 1.5 && peakAgl > 3;
       state.position.y = state.ground + 0.05;
       state.mode = state.onWater ? 'swimming' : 'waddling';
       state.heading = Math.atan2(state.forward.x, state.forward.z);
@@ -786,22 +1401,48 @@ export function createGooseEngine(
       queuedFlaps = 0;
       if (state.onWater) {
         spawnSplash(clamp((impact - 0.3) / 5, 0.15, 1));
-        hooks.onToast(impact < 2.4 ? 'Clean water landing — splash!' : 'Big splash — hold Shift to flare');
+        if (landingCounts) {
+          if (impact > 4.5 || bankDegrees > 35) awardChaos(350, 'BELLY FLOP');
+          else if (impact >= 0.7 && impact < 2.3 && bankDegrees < 20) awardChaos(300, 'PERFECT SPLASHDOWN');
+          else awardChaos(140, 'SPLASHDOWN-ISH');
+        } else {
+          hooks.onToast(impact < 2.4 ? 'Clean water landing — splash!' : 'Big splash — hold Shift to flare');
+        }
       } else {
-        hooks.onToast(impact < 2.4 ? 'Touchdown — now waddle' : 'Bumpy landing — flare with Shift');
+        if (landingCounts) {
+          if (impact < 2 && bankDegrees < 15 && landingSpeed >= 8 && landingSpeed <= 17) {
+            awardChaos(250, 'GREASED LANDING');
+          } else if (impact > 4.5) {
+            awardChaos(300, 'LAWN DART');
+          } else {
+            awardChaos(100, 'TOUCHDOWN-ISH');
+          }
+        } else {
+          hooks.onToast(impact < 2.4 ? 'Touchdown — now waddle' : 'Bumpy landing — flare with Shift');
+        }
+      }
+      if (impact > 4.5) {
+        tumbleRemaining = state.onWater ? 0.58 : 0.82;
+        tumbleAngularSpeed = 11 * (state.bank >= 0 ? 1 : -1);
+        cameraShakeRemaining = 0.28;
       }
     }
   };
 
   const simulate = (dt: number) => {
+    updateChaosTimers(dt);
+    if (queuedHonks > 0 && honkCooldown <= 0) performHonk();
     beginFlapIfNeeded();
     surfaceClock -= dt;
     if (surfaceClock <= 0) {
       surfaceClock = 0.12;
       sampleSurface();
     }
-    if (state.mode === 'flying') simulateFlight(dt);
+    simulateTraffic(dt);
+    if (tumbleRemaining > 0) simulateTumble(dt);
+    else if (state.mode === 'flying') simulateFlight(dt);
     else simulateGround(dt);
+    resolveTrafficInteractions();
     if (state.flapRemaining > 0) {
       state.flapRemaining = Math.max(0, state.flapRemaining - dt);
     }
@@ -849,16 +1490,24 @@ export function createGooseEngine(
       goose.leftWing.rotation.z = -0.66;
       goose.rightWing.rotation.z = 0.66;
     }
+
+    if (tumbleRemaining > 0) {
+      const tumble = new THREE.Quaternion().setFromEuler(
+        new THREE.Euler(tumbleAngle * 0.72, tumbleAngle, tumbleAngle * 0.48, 'YXZ'),
+      );
+      goose.root.quaternion.multiply(tumble).normalize();
+    }
   };
 
   const updateCamera = (dt: number, pose: SimState, immediate = false) => {
     const horizontal = new THREE.Vector3(pose.forward.x, 0, pose.forward.z);
     if (horizontal.lengthSq() < 0.01) horizontal.set(Math.sin(pose.heading), 0, Math.cos(pose.heading));
     horizontal.normalize();
-    const speed = pose.velocity.length();
-    const chaseBack = 12 + 0.25 * speed;
-    const chaseHeight = 12 + 0.25 * speed;
-    const lookAhead = 6 + 0.25 * speed;
+    const speed = clamp(pose.velocity.length(), 8, 26);
+    const isFlying = pose.mode === 'flying';
+    const chaseBack = isFlying ? 7 + 0.06 * speed : 4.8;
+    const chaseHeight = isFlying ? 3.2 + 0.055 * speed : 2.5;
+    const lookAhead = isFlying ? 4.5 + 0.08 * speed : 3;
     const desiredPosition = pose.position
       .clone()
       .addScaledVector(horizontal, -chaseBack)
@@ -867,7 +1516,24 @@ export function createGooseEngine(
       desiredPosition.y,
       terrainAt(desiredPosition.x, desiredPosition.z, pose.ground) + 2.5,
     );
-    const desiredTarget = pose.position.clone().addScaledVector(horizontal, lookAhead).addScaledVector(UP, 1.05);
+    for (const building of buildingColliders) {
+      if (
+        desiredPosition.x > building.minX - 0.6 &&
+        desiredPosition.x < building.maxX + 0.6 &&
+        desiredPosition.z > building.minZ - 0.6 &&
+        desiredPosition.z < building.maxZ + 0.6 &&
+        desiredPosition.y < building.ground + building.height + 1.5
+      ) {
+        desiredPosition.y = building.ground + building.height + 1.5;
+      }
+    }
+    const shake = clamp(cameraShakeRemaining / 0.32, 0, 1);
+    if (!immediate && shake > 0) {
+      desiredPosition.x += Math.sin(elapsedTime * 91) * 0.48 * shake;
+      desiredPosition.y += Math.sin(elapsedTime * 117 + 0.6) * 0.3 * shake;
+      desiredPosition.z += Math.cos(elapsedTime * 83) * 0.48 * shake;
+    }
+    const desiredTarget = pose.position.clone().addScaledVector(horizontal, lookAhead).addScaledVector(UP, 0.65);
     const positionBlend = immediate ? 1 : 1 - Math.exp(-5 * dt);
     const targetBlend = immediate ? 1 : 1 - Math.exp(-7 * dt);
     cameraPosition.lerp(desiredPosition, positionBlend);
@@ -895,6 +1561,8 @@ export function createGooseEngine(
       stamina: state.stamina,
       stall: state.stall,
       mode: state.mode,
+      score: chaosScore,
+      combo: chaosCombo,
     });
   };
 
@@ -913,8 +1581,27 @@ export function createGooseEngine(
     state.onWater = false;
     state.flapRemaining = 0;
     queuedFlaps = 0;
-    cameraPosition.set(0, state.position.y + 15, -18);
-    cameraTarget.set(0, state.position.y + 1, 8);
+    queuedHonks = 0;
+    honkCooldown = 0;
+    chaosScore = 0;
+    chaosCombo = 1;
+    chaosComboEvents = 0;
+    chaosComboRemaining = 0;
+    tumbleRemaining = 0;
+    tumbleAngle = 0;
+    tumbleAngularSpeed = 0;
+    hitCooldown = 0;
+    cameraShakeRemaining = 0;
+    airborneTime = 0;
+    peakAgl = 0;
+    accumulator = 0;
+    for (const wave of honkWaves.splice(0)) {
+      scene.remove(wave.mesh);
+      wave.mesh.geometry.dispose();
+      wave.mesh.material.dispose();
+    }
+    cameraPosition.set(0, state.position.y + 4.1, -8);
+    cameraTarget.set(0, state.position.y + 0.65, 5.8);
     sampleSurface();
     copyState(previousState, state);
     copyState(renderState, state);
@@ -954,8 +1641,10 @@ export function createGooseEngine(
   const onIdle = () => {
     const hadTraffic = trafficBuilt;
     buildTraffic();
+    const buildingsChanged = buildTexturedBuildings();
     const treesChanged = unresolvedTreeCount > 0 ? updateTrees(true) : false;
-    if ((!hadTraffic && trafficBuilt) || treesChanged) map.triggerRepaint();
+    if (!hadTraffic && trafficBuilt) updateTrafficVisuals(1);
+    if ((!hadTraffic && trafficBuilt) || buildingsChanged || treesChanged) map.triggerRepaint();
   };
   map.on('idle', onIdle);
 
@@ -975,7 +1664,7 @@ export function createGooseEngine(
       }
       if (steps >= 8) accumulator = 0;
       interpolateState(accumulator / FIXED_DT);
-      updateTraffic(frameDt);
+      if (trafficBuilt) updateTrafficVisuals(accumulator / FIXED_DT);
       treeRefreshClock -= frameDt;
       if (unresolvedTreeCount > 0 && treeRefreshClock <= 0) {
         treeRefreshClock = 1.25;
@@ -983,6 +1672,7 @@ export function createGooseEngine(
       }
     }
     updateSplashes(frameDt);
+    updateHonkWaves(frameDt);
     updateGoosePose(renderState);
     if (playing) updateCamera(frameDt, renderState);
     telemetryClock -= frameDt;
@@ -990,7 +1680,7 @@ export function createGooseEngine(
       telemetryClock = 0.1;
       emitTelemetry();
     }
-    if (playing || splashes.length > 0) map.triggerRepaint();
+    if (playing || splashes.length > 0 || honkWaves.length > 0) map.triggerRepaint();
     animationFrame = requestAnimationFrame(frame);
   };
 
@@ -1001,17 +1691,22 @@ export function createGooseEngine(
     start() {
       playing = true;
       previousTime = performance.now();
-      hooks.onToast('Glide from WMU — dive for speed, pull up to trade it for height');
+      hooks.onToast('Glide from WMU — hold Space to flap, press E to honk at traffic');
     },
     reset() {
       resetState();
       playing = true;
       previousTime = performance.now();
-      hooks.onToast('Respawned above Western Michigan University');
+      hooks.onToast('Fresh goose, fresh chaos — respawned above WMU');
     },
     setKey(code, pressed) {
       if (pressed) {
-        if (code === 'Space' && !keys.has(code)) queuedFlaps = Math.min(2, queuedFlaps + 1);
+        if (code === 'Space' && !keys.has(code) && tumbleRemaining <= 0) {
+          queuedFlaps = Math.min(2, queuedFlaps + 1);
+        }
+        if ((code === 'KeyE' || code === 'KeyH') && !keys.has(code)) {
+          queuedHonks = Math.min(1, queuedHonks + 1);
+        }
         keys.add(code);
       } else {
         keys.delete(code);
@@ -1022,6 +1717,10 @@ export function createGooseEngine(
       cancelAnimationFrame(animationFrame);
       map.off('idle', onIdle);
       keys.clear();
+      if (audioContext) {
+        void audioContext.close().catch(() => undefined);
+        audioContext = null;
+      }
       scene.traverse((object) => {
         if (object instanceof THREE.Mesh || object instanceof THREE.InstancedMesh) {
           object.geometry.dispose();
@@ -1029,6 +1728,8 @@ export function createGooseEngine(
           materials.forEach((material) => material.dispose());
         }
       });
+      buildingMaterials.forEach(({ texture }) => texture.dispose());
+      buildingMaterials.clear();
     },
   };
 }

@@ -617,6 +617,31 @@ kbd {
 .stamina-card > i { display: block; height: 4px; margin-top: 8px; overflow: hidden; border-radius: 999px; background: rgba(255,255,255,.12); }
 .stamina-card > i > b { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg, #e7a849, #a9dc78); transition: width 120ms linear; }
 
+.chaos-card {
+  position: absolute;
+  z-index: 4;
+  top: 250px;
+  right: 29px;
+  display: grid;
+  width: 225px;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid rgba(255, 199, 91, .28);
+  border-radius: 14px;
+  background: linear-gradient(135deg, rgba(39, 40, 22, .84), rgba(5, 29, 25, .76));
+  padding: 10px 12px;
+  box-shadow: 0 13px 30px rgba(5,25,22,.12);
+  backdrop-filter: blur(14px);
+}
+.chaos-card > span { display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 3px 8px; }
+.chaos-card svg { width: 16px; height: 16px; grid-row: 1 / 3; color: #ffc75b; }
+.chaos-card small { color: rgba(255,255,255,.58); font-size: 8px; font-weight: 750; letter-spacing: .08em; text-transform: uppercase; }
+.chaos-card strong { font-size: 18px; line-height: 1; font-variant-numeric: tabular-nums; }
+.chaos-card em { border-radius: 999px; background: rgba(255,255,255,.08); padding: 5px 7px; color: rgba(255,255,255,.62); font-size: 8px; font-style: normal; font-weight: 850; letter-spacing: .06em; white-space: nowrap; }
+.chaos-card em.is-hot { background: #ffc75b; color: #183128; animation: combo-pulse .48s ease-in-out infinite alternate; }
+@keyframes combo-pulse { to { transform: scale(1.06); box-shadow: 0 0 18px rgba(255,199,91,.42); } }
+
 .stall-warning {
   position: absolute;
   z-index: 6;
@@ -734,6 +759,8 @@ kbd {
     color: #173028;
   }
 
+  .touch-actions .honk-action { background: rgba(46, 74, 51, .86); color: #ffd070; }
+
   .touch-actions svg { width: 17px; }
   .touch-actions span { display: block; margin-top: -5px; font-size: 7px; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
   .mode-stack { bottom: 166px; }
@@ -767,7 +794,17 @@ kbd {
   .upgrade-data-grid > span { min-height: 68px; padding: 8px; }
   .upgrade-data-grid small { display: none; }
   .stamina-card { top: 142px; right: 17px; width: 150px; padding: 8px 9px; }
-  .stall-warning { top: 201px; max-width: calc(100vw - 34px); padding: 8px 11px; font-size: 8px; white-space: nowrap; }
+  .chaos-card { top: 201px; right: 17px; width: 150px; padding: 8px 9px; gap: 5px; }
+  .chaos-card strong { font-size: 15px; }
+  .chaos-card em { padding: 4px 5px; font-size: 7px; }
+  .stall-warning { top: 260px; max-width: calc(100vw - 34px); padding: 8px 11px; font-size: 8px; white-space: nowrap; }
+}
+
+@media (max-width: 380px) {
+  .touch-pad { width: 108px; grid-template-columns: repeat(3, 34px); grid-template-rows: repeat(2, 34px); }
+  .touch-actions { gap: 5px; }
+  .touch-actions button { width: 46px; height: 46px; }
+  .touch-actions .flap-action { width: 58px; height: 58px; }
 }
 
 @media (max-height: 660px) and (max-width: 700px) {

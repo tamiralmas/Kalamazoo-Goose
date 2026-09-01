@@ -5,6 +5,7 @@ import {
   Activity,
   Bird,
   Building2,
+  CarFront,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -15,9 +16,10 @@ import {
   MapPin,
   Mountain,
   Navigation,
-  Route,
   Trees,
   TriangleAlert,
+  Trophy,
+  Volume2,
   Waves,
   Wind,
 } from 'lucide-react';
@@ -42,6 +44,8 @@ const INITIAL_TELEMETRY: GameTelemetry = {
   stamina: 1,
   stall: 0,
   mode: 'flying',
+  score: 0,
+  combo: 1,
 };
 
 const CONTROL_CODES = [
@@ -52,12 +56,14 @@ const CONTROL_CODES = [
   'Space',
   'ShiftLeft',
   'ShiftRight',
+  'KeyE',
+  'KeyH',
 ];
 
 const modeCopy: Record<FlightMode, { label: string; hint: string }> = {
-  flying: { label: 'Gliding', hint: 'Trade height for speed' },
-  waddling: { label: 'Waddling', hint: 'Traffic will yield' },
-  swimming: { label: 'Swimming', hint: 'Space to take off' },
+  flying: { label: 'Gliding', hint: 'Stunt, flap, and cause chaos' },
+  waddling: { label: 'Waddling', hint: 'Cause extremely polite gridlock' },
+  swimming: { label: 'Swimming', hint: 'Space to take off again' },
 };
 
 export function GooseGame() {
@@ -406,7 +412,7 @@ export function GooseGame() {
       <div
         ref={mapContainerRef}
         className="real-map-canvas"
-        aria-label="Interactive goose flight over actual OpenStreetMap data at Western Michigan University"
+        aria-label="Interactive real-scale goose flight over aerial imagery and OpenStreetMap 3D data at Western Michigan University"
         tabIndex={-1}
       />
       <div className="sky-vignette" aria-hidden="true" />
@@ -433,18 +439,18 @@ export function GooseGame() {
 
       {!playing && (
         <section className="launch-card game-launch-card" aria-labelledby="launch-title">
-          <div className="eyebrow"><span /> REAL AERIAL IMAGERY · OSM 3D · REAL GLIDING</div>
+          <div className="eyebrow"><span /> REAL-SCALE CAMPUS · AERIAL ROOFS · CHAOS SANDBOX</div>
           <h1 id="launch-title">Take wing<br />over WMU.</h1>
           <p>
-            Fly a Canada goose over real aerial imagery, OpenStreetMap buildings and roads, and mapped campus trees—then flare into a lake with a splash.
+            Fly, honk, bonk traffic, botch landings, and make a mess over a real-scale WMU built from aerial imagery and OpenStreetMap data.
           </p>
           <Button className="launch-button" size="lg" onClick={startGame} disabled={!mapReady}>
             <Feather /> {mapReady ? 'Fly from WMU' : mapError ? 'Map is reconnecting…' : 'Loading 3D campus…'}
           </Button>
           <div className="launch-features" aria-label="World data">
-            <span><Building2 /><strong>3D buildings</strong></span>
-            <span><Route /><strong>OSM roads</strong></span>
-            <span><Trees /><strong>Mapped trees</strong></span>
+            <span><Building2 /><strong>Aerial roofs</strong></span>
+            <span><CarFront /><strong>Dense traffic</strong></span>
+            <span><Trees /><strong>Campus chaos</strong></span>
           </div>
           <p className="launch-note">
             {mapError ? 'A map service failed to respond. It will retry when the page reloads.' : 'Tap Space for one wingbeat · Hold it for continuous flapping'}
@@ -470,17 +476,22 @@ export function GooseGame() {
           </section>
 
           <aside className="objective-card">
-            <span className="objective-icon"><Waves /></span>
+            <span className="objective-icon"><Trophy /></span>
             <span>
-              <small>Open-world objective</small>
-              <strong>Find a mapped lake and land</strong>
-              <em>Hold Shift to flare before touchdown</em>
+              <small>Campus chaos</small>
+              <strong>Honk, bonk cars, stick the landing</strong>
+              <em>E to honk · chain stunts for combos</em>
             </span>
           </aside>
 
           <div className="stamina-card" aria-label={`Wing stamina ${Math.round(telemetry.stamina * 100)} percent`}>
             <span><Activity /><small>Wing stamina</small><strong>{Math.round(telemetry.stamina * 100)}%</strong></span>
             <i><b style={{ width: `${telemetry.stamina * 100}%` }} /></i>
+          </div>
+
+          <div className="chaos-card" aria-live="polite" aria-label={`Chaos score ${telemetry.score}, combo times ${telemetry.combo}`}>
+            <span><Trophy /><small>Chaos score</small><strong>{telemetry.score.toLocaleString()}</strong></span>
+            <em className={telemetry.combo > 1 ? 'is-hot' : ''}>COMBO ×{telemetry.combo}</em>
           </div>
 
           {telemetry.stall > 0.22 && (
@@ -504,6 +515,7 @@ export function GooseGame() {
             <i />
             <span><kbd>SPACE</kbd> tap / hold to flap</span>
             <span><kbd>SHIFT</kbd> flare / brake</span>
+            <span><kbd>E</kbd> honk</span>
           </div>
 
           <div className="mobile-controls" aria-label="Touch flight controls">
@@ -514,6 +526,7 @@ export function GooseGame() {
               <button aria-label="Bank right" onPointerDown={(event) => setTouchKey(event, 'KeyD', true)} onPointerUp={(event) => setTouchKey(event, 'KeyD', false)} onPointerCancel={(event) => setTouchKey(event, 'KeyD', false)} onLostPointerCapture={(event) => setTouchKey(event, 'KeyD', false)}><ChevronRight /></button>
             </div>
             <div className="touch-actions">
+              <button className="honk-action" aria-label="Honk" onPointerDown={(event) => setTouchKey(event, 'KeyE', true)} onPointerUp={(event) => setTouchKey(event, 'KeyE', false)} onPointerCancel={(event) => setTouchKey(event, 'KeyE', false)} onLostPointerCapture={(event) => setTouchKey(event, 'KeyE', false)}><Volume2 /><span>Honk</span></button>
               <button aria-label="Flare and airbrake" onPointerDown={(event) => setTouchKey(event, 'ShiftLeft', true)} onPointerUp={(event) => setTouchKey(event, 'ShiftLeft', false)} onPointerCancel={(event) => setTouchKey(event, 'ShiftLeft', false)} onLostPointerCapture={(event) => setTouchKey(event, 'ShiftLeft', false)}><Wind /><span>Flare</span></button>
               <button className="flap-action" aria-label="Flap wings" onPointerDown={(event) => setTouchKey(event, 'Space', true)} onPointerUp={(event) => setTouchKey(event, 'Space', false)} onPointerCancel={(event) => setTouchKey(event, 'Space', false)} onLostPointerCapture={(event) => setTouchKey(event, 'Space', false)}><Feather /><span>Flap</span></button>
             </div>
@@ -524,7 +537,7 @@ export function GooseGame() {
       {toast && <output className="game-toast">{toast}</output>}
 
       <footer className="game-footer">
-        <span>MICHIGAN AERIAL + OSM 3D</span><i /><span>{terrainReady ? 'REAL TERRAIN' : '3D BUILDINGS'} · WMU</span>
+        <span>MISAIL AERIAL ROOFS + OSM 3D</span><i /><span>{terrainReady ? 'REAL TERRAIN' : '3D BUILDINGS'} · WMU</span>
         <span className="map-credit">
           © <a href="https://www.michigan.gov/dtmb/services/maps/misail" target="_blank" rel="noreferrer">State of Michigan MiSAIL</a> · <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> · <a href="https://openfreemap.org" target="_blank" rel="noreferrer">OpenFreeMap</a>{terrainReady && <> · <a href="https://mapterhorn.com/attribution/" target="_blank" rel="noreferrer">Mapterhorn</a></>}
         </span>
