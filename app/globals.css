@@ -249,6 +249,18 @@
 .camera-toolbar button:active { background: #efaa49; color: #173028; }
 .camera-toolbar svg { width: 14px; height: 14px; }
 
+.camera-zoom-readout {
+  display: grid;
+  min-width: 35px;
+  place-items: center;
+  color: rgba(255, 255, 255, 0.72);
+  font-family: var(--font-geist-mono);
+  font-size: 9px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+}
+
 .hud-button {
   border: 1px solid rgba(255, 255, 255, 0.38);
   border-radius: 50%;
@@ -862,6 +874,7 @@ kbd {
 
   .camera-toolbar button { width: 44px; height: 44px; }
   .camera-toolbar svg { width: 17px; height: 17px; }
+  .camera-zoom-readout { min-width: 34px; font-size: 8px; }
   .map-reset-button { min-width: 44px; min-height: 44px; }
   .mode-stack { bottom: calc(122px + env(safe-area-inset-bottom)); }
   .game-toast { top: calc(142px + env(safe-area-inset-top)); }

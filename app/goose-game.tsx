@@ -56,6 +56,18 @@ const INITIAL_TELEMETRY: GameTelemetry = {
   combo: 1,
   secretsFound: 0,
   secretsTotal: 25,
+  students: 0,
+  studentsNearby: 0,
+  nearestStudent: null,
+  nearestStudentVertical: null,
+  groundElevation: 0,
+  east: 0,
+  north: 0,
+  heading: 0,
+  buildings: 0,
+  cameraZoom: 16.7,
+  cameraScale: 1,
+  insideBuilding: false,
 };
 
 const CONTROL_CODES = [
@@ -137,7 +149,7 @@ export function GooseGame() {
           pitch: 62,
           bearing: -15,
           maxPitch: 84,
-          maxZoom: 20,
+          maxZoom: 24,
           interactive: false,
           renderWorldCopies: false,
           centerClampedToGround: false,
@@ -556,7 +568,21 @@ export function GooseGame() {
     : `${Math.abs(telemetry.sink).toFixed(1)} m/s climb`;
 
   return (
-    <main className={`game-shell ${playing ? 'is-playing' : 'is-launching'}`}>
+    <main
+      className={`game-shell ${playing ? 'is-playing' : 'is-launching'}`}
+      data-campus-students={telemetry.students}
+      data-nearby-students={telemetry.studentsNearby}
+      data-nearest-student-meters={telemetry.nearestStudent?.toFixed(1) ?? ''}
+      data-nearest-student-vertical={telemetry.nearestStudentVertical?.toFixed(1) ?? ''}
+      data-ground-elevation={telemetry.groundElevation.toFixed(1)}
+      data-goose-east={telemetry.east.toFixed(1)}
+      data-goose-north={telemetry.north.toFixed(1)}
+      data-goose-heading={telemetry.heading.toFixed(3)}
+      data-building-colliders={telemetry.buildings}
+      data-camera-map-zoom={telemetry.cameraZoom.toFixed(3)}
+      data-camera-scale={telemetry.cameraScale.toFixed(3)}
+      data-goose-inside-building={telemetry.insideBuilding}
+    >
       <div
         ref={mapContainerRef}
         className="real-map-canvas"
@@ -578,11 +604,14 @@ export function GooseGame() {
         </div>
         <div className="location-chip">
           <MapPin />
-          <span><strong>Western Michigan University</strong><small>42.284996° N · 85.617710° W</small></span>
+          <span><strong>Western Michigan University</strong><small>42.284881° N · 85.616863° W</small></span>
         </div>
         <div className="top-actions">
           <div className="camera-toolbar" aria-label="Camera controls">
             <button type="button" title="Zoom in" aria-label="Zoom camera in" onClick={() => engineRef.current?.scaleCameraZoom(0.72)}><ZoomIn /></button>
+            <output className="camera-zoom-readout" aria-label="Camera zoom level">
+              {Math.round(100 / telemetry.cameraScale)}%
+            </output>
             <button type="button" title="Zoom out" aria-label="Zoom camera out" onClick={() => engineRef.current?.scaleCameraZoom(1.38)}><ZoomOut /></button>
             <button type="button" title="Reset camera" aria-label="Reset camera" onClick={() => engineRef.current?.resetCamera()}><RotateCcw /></button>
           </div>
