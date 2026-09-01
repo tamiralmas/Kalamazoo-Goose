@@ -24,6 +24,10 @@ import { WMU_TREE_POINTS } from './wmu-trees';
 // inside a building while still spawning at WMU.
 export const WMU_SPAWN: [number, number] = [-85.616863, 42.284881];
 
+// Campus secrets were authored before the safe lawn spawn moved. Keep their
+// geographic anchor stable so a spawn tweak can never move a landmark again.
+const WMU_CONTENT_ANCHOR: [number, number] = [-85.61771, 42.284996];
+
 export type FlightMode = 'flying' | 'planing' | 'waddling' | 'swimming';
 
 export type GameTelemetry = {
@@ -38,10 +42,21 @@ export type GameTelemetry = {
   combo: number;
   secretsFound: number;
   secretsTotal: number;
+  secretVisuals: number;
+  nearestSecretLabel: string | null;
+  nearestSecretDistance: number | null;
+  nearestSecretDirection: number;
+  nearestSecretBearing: number;
   students: number;
   studentsNearby: number;
+  studentsOnMappedWalkways: number;
   nearestStudent: number | null;
   nearestStudentVertical: number | null;
+  trees: number;
+  treesResolved: number;
+  flockSize: number;
+  flockTotal: number;
+  altitudeBoost: number;
   groundElevation: number;
   east: number;
   north: number;
@@ -50,6 +65,13 @@ export type GameTelemetry = {
   cameraZoom: number;
   cameraScale: number;
   insideBuilding: boolean;
+  renderCalls: number;
+  gooseVisible: boolean;
+  gooseScreenX: number;
+  gooseScreenY: number;
+  duckCouncilEast: number;
+  duckCouncilNorth: number;
+  duckCouncilVisible: boolean;
 };
 
 type MapLibreModule = typeof import('maplibre-gl');
@@ -74,6 +96,19 @@ type GooseRig = {
   leftWing: THREE.Group;
   rightWing: THREE.Group;
   legs: THREE.Group;
+};
+
+type FlockGoose = {
+  rig: GooseRig;
+  beacon: THREE.Mesh<THREE.TorusGeometry, THREE.MeshBasicMaterial>;
+  home: THREE.Vector2;
+  position: THREE.Vector3;
+  ground: number;
+  terrainResolved: boolean;
+  terrainSamplePosition: THREE.Vector2;
+  terrainRefreshRemaining: number;
+  recruited: boolean;
+  phase: number;
 };
 
 type SimState = {
@@ -125,7 +160,10 @@ type TrafficCar = {
 type TrafficFleet = {
   bodies: THREE.InstancedMesh<THREE.BoxGeometry, THREE.MeshStandardMaterial>;
   cabins: THREE.InstancedMesh<THREE.BoxGeometry, THREE.MeshStandardMaterial>;
-  wheels: THREE.InstancedMesh<THREE.CylinderGeometry, THREE.MeshStandardMaterial>;
+  wheels: THREE.InstancedMesh<
+    THREE.CylinderGeometry,
+    THREE.MeshStandardMaterial
+  >;
 };
 
 type HonkWave = {
@@ -140,8 +178,19 @@ type BuildingCollider = {
   maxX: number;
   minZ: number;
   maxZ: number;
+  centerGround: number;
   ground: number;
   height: number;
+  terrainResolved: boolean;
+  outer: THREE.Vector2[];
+  holes: THREE.Vector2[][];
+};
+
+type WaterArea = {
+  minX: number;
+  maxX: number;
+  minZ: number;
+  maxZ: number;
   outer: THREE.Vector2[];
   holes: THREE.Vector2[][];
 };
@@ -149,6 +198,7 @@ type BuildingCollider = {
 type CampusSecretKind =
   | 'radio'
   | 'duck-council'
+  | 'bronco-horse'
   | 'diploma-tornado'
   | 'sky-ring'
   | 'dean-ufo'
@@ -181,7 +231,7 @@ type Splash = {
 };
 
 const UP = new THREE.Vector3(0, 1, 0);
-const FIXED_DT = 1 / 120;
+const FIXED_DT = 1 / 90;
 const DEG = Math.PI / 180;
 const FALLBACK_GROUND_MSL = 0;
 const FLAP_PERIOD = 0.36;
@@ -189,10 +239,42 @@ const DOWNSTROKE = 0.2;
 const FLAP_STAMINA_COST = 0.014;
 const SPAWN_ALTITUDE = 64;
 const MAX_TRAFFIC = 32;
-const NEAR_SPAWN_CROWD_COUNT = 56;
+const NEAR_SPAWN_CROWD_COUNT = 12;
+const ALTITUDE_BOOST_HEIGHT = 100;
+const ALTITUDE_BOOST_FULL_HEIGHT = 140;
+const ALTITUDE_BOOST_RELEASE_HEIGHT = 92;
+const BUILDING_ACTIVE_RADIUS = 150;
+const TEXTURED_ROOF_RADIUS = 760;
 const BUILDING_TEXTURE_MAX_ZOOM = 18;
 const BUILDING_TEXTURE_MIN_ZOOM = 15;
 const CHAOS_COMBO_SECONDS = 4;
+const DEDICATED_WALKWAY_CLASSES = new Set([
+  'path',
+  'pedestrian',
+  'footway',
+  'steps',
+  'cycleway',
+]);
+const PEDESTRIAN_ROUTE_CLASSES = new Set([
+  'primary',
+  'secondary',
+  'tertiary',
+  'minor',
+  'service',
+  'track',
+  ...DEDICATED_WALKWAY_CLASSES,
+]);
+
+const FLOCK_ROOSTS = [
+  [-22, 34],
+  [54, -48],
+  [-78, -38],
+  [92, 82],
+  [-118, 132],
+  [178, -74],
+  [-152, 238],
+  [46, 304],
+] as const;
 
 const FLIGHT = {
   mass: 4.5,
@@ -235,11 +317,21 @@ function makeWingGeometry(side: -1 | 1) {
     'position',
     new THREE.Float32BufferAttribute(
       [
-        0, 0.03, 0.3,
-        1.75 * s, -0.05, 0.05,
-        1.48 * s, -0.08, -0.45,
-        0.76 * s, -0.02, -0.72,
-        0.12 * s, 0.03, -0.52,
+        0,
+        0.03,
+        0.3,
+        1.75 * s,
+        -0.05,
+        0.05,
+        1.48 * s,
+        -0.08,
+        -0.45,
+        0.76 * s,
+        -0.02,
+        -0.72,
+        0.12 * s,
+        0.03,
+        -0.52,
       ],
       3,
     ),
@@ -249,23 +341,35 @@ function makeWingGeometry(side: -1 | 1) {
   return geometry;
 }
 
-function createGooseRig() {
+function createGooseRig(frustumCulled = false) {
   const root = new THREE.Group();
   root.name = 'Canada goose';
   root.scale.setScalar(0.4);
   root.traverse((object) => {
-    object.frustumCulled = false;
+    object.frustumCulled = frustumCulled;
   });
 
-  const brown = new THREE.MeshStandardMaterial({ color: 0x6c5742, roughness: 0.9 });
-  const dark = new THREE.MeshStandardMaterial({ color: 0x171b19, roughness: 0.82 });
-  const cream = new THREE.MeshStandardMaterial({ color: 0xf0ead8, roughness: 0.88 });
+  const brown = new THREE.MeshStandardMaterial({
+    color: 0x6c5742,
+    roughness: 0.9,
+  });
+  const dark = new THREE.MeshStandardMaterial({
+    color: 0x171b19,
+    roughness: 0.82,
+  });
+  const cream = new THREE.MeshStandardMaterial({
+    color: 0xf0ead8,
+    roughness: 0.88,
+  });
   const wingMat = new THREE.MeshStandardMaterial({
     color: 0x4d4338,
     roughness: 0.92,
     side: THREE.DoubleSide,
   });
-  const orange = new THREE.MeshStandardMaterial({ color: 0xe37c24, roughness: 0.75 });
+  const orange = new THREE.MeshStandardMaterial({
+    color: 0xe37c24,
+    roughness: 0.75,
+  });
 
   const body = new THREE.Mesh(new THREE.SphereGeometry(0.54, 14, 10), brown);
   body.scale.set(0.9, 0.72, 1.36);
@@ -277,7 +381,10 @@ function createGooseRig() {
   breast.position.set(0, 0.7, 0.42);
   root.add(breast);
 
-  const neck = new THREE.Mesh(new THREE.CapsuleGeometry(0.135, 0.67, 5, 9), dark);
+  const neck = new THREE.Mesh(
+    new THREE.CapsuleGeometry(0.135, 0.67, 5, 9),
+    dark,
+  );
   neck.rotation.x = 0.26;
   neck.position.set(0, 1.25, 0.43);
   root.add(neck);
@@ -317,10 +424,16 @@ function createGooseRig() {
 
   const legs = new THREE.Group();
   for (const side of [-1, 1]) {
-    const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.045, 0.42, 7), orange);
+    const leg = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.035, 0.045, 0.42, 7),
+      orange,
+    );
     leg.position.set(side * 0.18, 0.29, 0.05);
     legs.add(leg);
-    const foot = new THREE.Mesh(new THREE.BoxGeometry(0.17, 0.045, 0.31), orange);
+    const foot = new THREE.Mesh(
+      new THREE.BoxGeometry(0.17, 0.045, 0.31),
+      orange,
+    );
     foot.position.set(side * 0.18, 0.075, 0.13);
     legs.add(foot);
   }
@@ -342,13 +455,31 @@ function createTrafficFleet(capacity: number) {
     color: 0xffffff,
     roughness: 0.52,
     metalness: 0.12,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
   });
   const glassMaterial = new THREE.MeshStandardMaterial({
     color: 0x26383e,
     roughness: 0.24,
     metalness: 0.08,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
   });
-  const tireMaterial = new THREE.MeshStandardMaterial({ color: 0x171918, roughness: 0.96 });
+  const tireMaterial = new THREE.MeshStandardMaterial({
+    color: 0x171918,
+    roughness: 0.96,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
+  });
   const bodies = new THREE.InstancedMesh(
     new THREE.BoxGeometry(1.82, 0.52, 4.4),
     bodyMaterial,
@@ -361,7 +492,11 @@ function createTrafficFleet(capacity: number) {
   );
   const wheelGeometry = new THREE.CylinderGeometry(0.31, 0.31, 0.2, 10);
   wheelGeometry.rotateZ(Math.PI / 2);
-  const wheels = new THREE.InstancedMesh(wheelGeometry, tireMaterial, capacity * 4);
+  const wheels = new THREE.InstancedMesh(
+    wheelGeometry,
+    tireMaterial,
+    capacity * 4,
+  );
   bodies.count = 0;
   cabins.count = 0;
   wheels.count = 0;
@@ -371,47 +506,81 @@ function createTrafficFleet(capacity: number) {
   return { bodies, cabins, wheels } satisfies TrafficFleet;
 }
 
-function routeFromPoints(points: THREE.Vector3[], cruise = 7, laneWidth = 1.35) {
+function routeFromPoints(
+  points: THREE.Vector3[],
+  cruise = 7,
+  laneWidth = 1.35,
+) {
   const cumulative = [0];
   for (let index = 1; index < points.length; index += 1) {
-    cumulative.push(cumulative[index - 1] + points[index].distanceTo(points[index - 1]));
+    cumulative.push(
+      cumulative[index - 1] + points[index].distanceTo(points[index - 1]),
+    );
   }
-  return { points, cumulative, total: cumulative[cumulative.length - 1], cruise, laneWidth } satisfies Route;
+  return {
+    points,
+    cumulative,
+    total: cumulative[cumulative.length - 1],
+    cruise,
+    laneWidth,
+  } satisfies Route;
 }
 
 function sampleRoute(route: Route, distance: number) {
   const routeDistance = clamp(distance, 0, route.total);
   let index = 1;
-  while (index < route.cumulative.length - 1 && route.cumulative[index] < routeDistance) index += 1;
+  while (
+    index < route.cumulative.length - 1 &&
+    route.cumulative[index] < routeDistance
+  )
+    index += 1;
   const startDistance = route.cumulative[index - 1];
-  const segmentLength = Math.max(route.cumulative[index] - startDistance, 0.001);
+  const segmentLength = Math.max(
+    route.cumulative[index] - startDistance,
+    0.001,
+  );
   const t = (routeDistance - startDistance) / segmentLength;
   const position = route.points[index - 1].clone().lerp(route.points[index], t);
-  const direction = route.points[index].clone().sub(route.points[index - 1]).normalize();
+  const direction = route.points[index]
+    .clone()
+    .sub(route.points[index - 1])
+    .normalize();
   return { position, direction };
 }
 
 function pointInRing(east: number, north: number, ring: THREE.Vector2[]) {
   let inside = false;
-  for (let index = 0, previous = ring.length - 1; index < ring.length; previous = index, index += 1) {
+  for (
+    let index = 0, previous = ring.length - 1;
+    index < ring.length;
+    previous = index, index += 1
+  ) {
     const a = ring[index];
     const b = ring[previous];
     const crosses =
-      (a.y > north) !== (b.y > north) &&
+      a.y > north !== b.y > north &&
       east < ((b.x - a.x) * (north - a.y)) / (b.y - a.y || 1e-9) + a.x;
     if (crosses) inside = !inside;
   }
   return inside;
 }
 
-function pointInBuilding(east: number, north: number, building: BuildingCollider) {
+function pointInBuilding(
+  east: number,
+  north: number,
+  building: BuildingCollider,
+) {
   return (
     pointInRing(east, north, building.outer) &&
     !building.holes.some((hole) => pointInRing(east, north, hole))
   );
 }
 
-function closestBuildingBoundary(east: number, north: number, building: BuildingCollider) {
+function closestBuildingBoundary(
+  east: number,
+  north: number,
+  building: BuildingCollider,
+) {
   let closestX = east;
   let closestZ = north;
   let distanceSquared = Infinity;
@@ -424,7 +593,8 @@ function closestBuildingBoundary(east: number, north: number, building: Building
       const edgeLengthSquared = edgeX * edgeX + edgeZ * edgeZ;
       if (edgeLengthSquared < 1e-8) continue;
       const t = clamp(
-        ((east - start.x) * edgeX + (north - start.y) * edgeZ) / edgeLengthSquared,
+        ((east - start.x) * edgeX + (north - start.y) * edgeZ) /
+          edgeLengthSquared,
         0,
         1,
       );
@@ -490,7 +660,8 @@ function firstBuildingCrossing(
       const lineNormalZ = tangentX;
       const startOffsetX = startX - edgeStart.x;
       const startOffsetZ = startZ - edgeStart.y;
-      const signedStart = startOffsetX * lineNormalX + startOffsetZ * lineNormalZ;
+      const signedStart =
+        startOffsetX * lineNormalX + startOffsetZ * lineNormalZ;
       const signedVelocity = movementX * lineNormalX + movementZ * lineNormalZ;
 
       if (Math.abs(signedVelocity) > 1e-8) {
@@ -501,7 +672,8 @@ function firstBuildingCrossing(
           const centerX = startX + movementX * time;
           const centerZ = startZ + movementZ * time;
           const edgeDistance =
-            (centerX - edgeStart.x) * tangentX + (centerZ - edgeStart.y) * tangentZ;
+            (centerX - edgeStart.x) * tangentX +
+            (centerZ - edgeStart.y) * tangentZ;
           if (edgeDistance < 0 || edgeDistance > edgeLength) continue;
           recordHit(
             time,
@@ -528,11 +700,19 @@ function firstBuildingCrossing(
         const centerZ = startZ + movementZ * time;
         const candidateNormalX = (centerX - endpoint.x) / radius;
         const candidateNormalZ = (centerZ - endpoint.y) / radius;
-        recordHit(time, endpoint.x, endpoint.y, candidateNormalX, candidateNormalZ);
+        recordHit(
+          time,
+          endpoint.x,
+          endpoint.y,
+          candidateNormalX,
+          candidateNormalZ,
+        );
       }
     }
   }
-  return earliest === Infinity ? null : { t: earliest, x: hitX, z: hitZ, normalX, normalZ };
+  return earliest === Infinity
+    ? null
+    : { t: earliest, x: hitX, z: hitZ, normalX, normalZ };
 }
 
 export function createGooseEngine(
@@ -540,7 +720,9 @@ export function createGooseEngine(
   map: MapLibreMap,
   hooks: Hooks,
 ): GooseEngine {
-  const fixedStep = window.matchMedia('(any-pointer: coarse)').matches ? 1 / 60 : FIXED_DT;
+  const coarsePointer = window.matchMedia('(any-pointer: coarse)').matches;
+  const fixedStep = coarsePointer ? 1 / 60 : FIXED_DT;
+  const texturedRoofLimit = coarsePointer ? 180 : 320;
   const scene = new THREE.Scene();
   const camera = new THREE.Camera();
   const goose = createGooseRig();
@@ -556,6 +738,16 @@ export function createGooseEngine(
     crowdFleet.leftLegs,
     crowdFleet.rightLegs,
   );
+  goose.root.visible = false;
+  trafficFleet.bodies.visible = false;
+  trafficFleet.cabins.visible = false;
+  trafficFleet.wheels.visible = false;
+  crowdFleet.heads.visible = false;
+  crowdFleet.torsos.visible = false;
+  crowdFleet.leftArms.visible = false;
+  crowdFleet.rightArms.visible = false;
+  crowdFleet.leftLegs.visible = false;
+  crowdFleet.rightLegs.visible = false;
   scene.add(new THREE.HemisphereLight(0xdaf0f2, 0x6d6a4f, 2.35));
   const sun = new THREE.DirectionalLight(0xfff1c2, 3.2);
   sun.position.set(-90, 150, 60);
@@ -564,17 +756,44 @@ export function createGooseEngine(
   const origin = maplibre.MercatorCoordinate.fromLngLat(WMU_SPAWN, 0);
   const meterScale = origin.meterInMercatorCoordinateUnits();
   const localToMap = new THREE.Matrix4().set(
-    meterScale, 0, 0, origin.x,
-    0, 0, -meterScale, origin.y,
-    0, meterScale, 0, origin.z,
-    0, 0, 0, 1,
+    meterScale,
+    0,
+    0,
+    origin.x,
+    0,
+    0,
+    -meterScale,
+    origin.y,
+    0,
+    meterScale,
+    0,
+    origin.z,
+    0,
+    0,
+    0,
+    1,
   );
 
   const keys = new Set<string>();
   const styleLayers = map.getStyle().layers ?? [];
   const waterLayers = styleLayers
-    .filter((layer) => layer.type === 'fill' && layer['source-layer'] === 'water')
+    .filter(
+      (layer) => layer.type === 'fill' && layer['source-layer'] === 'water',
+    )
     .map((layer) => layer.id);
+  const waterSourceLayer = styleLayers.find(
+    (layer) =>
+      layer.type === 'fill' &&
+      layer['source-layer'] === 'water' &&
+      'source' in layer &&
+      typeof layer.source === 'string',
+  );
+  const waterSourceId =
+    waterSourceLayer &&
+    'source' in waterSourceLayer &&
+    typeof waterSourceLayer.source === 'string'
+      ? waterSourceLayer.source
+      : null;
   const roadSourceLayer = styleLayers.find(
     (layer) =>
       'source-layer' in layer &&
@@ -583,20 +802,26 @@ export function createGooseEngine(
       typeof layer.source === 'string',
   );
   const roadSourceId =
-    roadSourceLayer && 'source' in roadSourceLayer && typeof roadSourceLayer.source === 'string'
+    roadSourceLayer &&
+    'source' in roadSourceLayer &&
+    typeof roadSourceLayer.source === 'string'
       ? roadSourceLayer.source
       : null;
-  if (!roadSourceId) throw new Error('The map style did not provide OSM road geometry.');
+  if (!roadSourceId)
+    throw new Error('The map style did not provide OSM road geometry.');
   const buildingLayerIndex = styleLayers.findIndex(
-    (layer) => layer.type === 'fill-extrusion' && layer['source-layer'] === 'building',
+    (layer) =>
+      layer.type === 'fill-extrusion' && layer['source-layer'] === 'building',
   );
-  if (buildingLayerIndex < 0) throw new Error('The map style did not provide 3D buildings.');
+  if (buildingLayerIndex < 0)
+    throw new Error('The map style did not provide 3D buildings.');
   const buildingLayer = styleLayers[buildingLayerIndex];
   const buildingSourceId =
     'source' in buildingLayer && typeof buildingLayer.source === 'string'
       ? buildingLayer.source
       : null;
-  if (!buildingSourceId) throw new Error('The map style did not provide OSM building geometry.');
+  if (!buildingSourceId)
+    throw new Error('The map style did not provide OSM building geometry.');
   const customLayerBeforeId = styleLayers[buildingLayerIndex + 1]?.id;
 
   const state: SimState = {
@@ -647,10 +872,23 @@ export function createGooseEngine(
   };
 
   const interpolateState = (blend: number) => {
-    renderState.position.lerpVectors(previousState.position, state.position, blend);
-    renderState.velocity.lerpVectors(previousState.velocity, state.velocity, blend);
-    renderState.forward.lerpVectors(previousState.forward, state.forward, blend);
-    if (renderState.forward.lengthSq() < 0.0001) renderState.forward.copy(state.forward);
+    renderState.position.lerpVectors(
+      previousState.position,
+      state.position,
+      blend,
+    );
+    renderState.velocity.lerpVectors(
+      previousState.velocity,
+      state.velocity,
+      blend,
+    );
+    renderState.forward.lerpVectors(
+      previousState.forward,
+      state.forward,
+      blend,
+    );
+    if (renderState.forward.lengthSq() < 0.0001)
+      renderState.forward.copy(state.forward);
     renderState.forward.normalize();
     const headingDelta = Math.atan2(
       Math.sin(state.heading - previousState.heading),
@@ -664,13 +902,18 @@ export function createGooseEngine(
     renderState.mode = state.mode;
     renderState.ground = lerp(previousState.ground, state.ground, blend);
     renderState.onWater = state.onWater;
-    renderState.flapRemaining = lerp(previousState.flapRemaining, state.flapRemaining, blend);
+    renderState.flapRemaining = lerp(
+      previousState.flapRemaining,
+      state.flapRemaining,
+      blend,
+    );
   };
 
   let playing = false;
   let destroyed = false;
   let renderer: THREE.WebGLRenderer | null = null;
   let animationFrame = 0;
+  let lastRenderCalls = 0;
   let previousTime = performance.now();
   let accumulator = 0;
   let surfaceClock = 0;
@@ -712,7 +955,12 @@ export function createGooseEngine(
   let waterSprayClock = 0;
   let waterContactLatched = false;
   let waterContactReleaseTime = 0;
+  let altitudeBoostActive = false;
   const texturedBuildingKeys = new Set<string>();
+  const texturedBuildingGroup = new THREE.Group();
+  texturedBuildingGroup.name = 'Capped aerial roof overlays';
+  texturedBuildingGroup.visible = false;
+  scene.add(texturedBuildingGroup);
   const buildingColliderByKey = new Map<string, BuildingCollider>();
   const buildingMaterials = new Map<
     string,
@@ -722,20 +970,31 @@ export function createGooseEngine(
     }
   >();
   const buildingColliders: BuildingCollider[] = [];
+  const activeBuildingColliders: BuildingCollider[] = [];
+  const activeColliderCenter = new THREE.Vector2(
+    Number.POSITIVE_INFINITY,
+    Number.POSITIVE_INFINITY,
+  );
+  let activeColliderSourceCount = -1;
   const traffic: TrafficCar[] = [];
   const trafficRoutes: Route[] = [];
   const campusNpcs: CampusNpc[] = [];
   const pedestrianRoutes: CrowdRoute[] = [];
   const pedestrianRouteKeys = new Set<string>();
+  const mappedWaterAreas: WaterArea[] = [];
+  let dryMappedWalkwayCache: CrowdRoute[] = [];
+  let dryMappedWalkwayCacheDirty = true;
   const guaranteedWalkwayBases: THREE.Vector3[][] = [];
   const crowdAnchor = new THREE.Vector2(0, 0);
   let guaranteedPedestrianRouteCount = 0;
-  let mappedCrowdAssigned = false;
+  let mappedCrowdWalkwaySignature = '';
   let crowdRelocationClock = 0;
   const splashes: Splash[] = [];
   const honkWaves: HonkWave[] = [];
   const campusSecrets: CampusSecret[] = [];
+  const flockGeese: FlockGoose[] = [];
   let secretsFound = 0;
+  let recruitedFlockCount = 0;
   const cameraPosition = new THREE.Vector3(0, state.position.y + 15, -18);
   const cameraTarget = new THREE.Vector3(0, state.position.y + 1, 8);
   let cameraDistanceScale = 1;
@@ -745,6 +1004,13 @@ export function createGooseEngine(
   let cameraOrbitPitch = 24 * DEG;
   let cameraOrbitPitchTarget = 24 * DEG;
   let campusGroundFallback = FALLBACK_GROUND_MSL;
+  let broncoSecret: CampusSecret | null = null;
+  const broncoHome = new THREE.Vector2();
+  let broncoHeading = 0.72;
+  let broncoTurnRemaining = 1.8;
+  let broncoTerrainRemaining = 0;
+  let broncoObstacleRemaining = 0;
+  let broncoGround = FALLBACK_GROUND_MSL;
 
   const localToLngLat = (east: number, north: number) =>
     new maplibre.MercatorCoordinate(
@@ -754,7 +1020,10 @@ export function createGooseEngine(
     ).toLngLat();
 
   const geoToLocal = (longitude: number, latitude: number) => {
-    const coordinate = maplibre.MercatorCoordinate.fromLngLat([longitude, latitude], 0);
+    const coordinate = maplibre.MercatorCoordinate.fromLngLat(
+      [longitude, latitude],
+      0,
+    );
     return new THREE.Vector3(
       (coordinate.x - origin.x) / meterScale,
       0,
@@ -762,15 +1031,28 @@ export function createGooseEngine(
     );
   };
 
+  const contentAnchorLocal = geoToLocal(
+    WMU_CONTENT_ANCHOR[0],
+    WMU_CONTENT_ANCHOR[1],
+  );
+  const authoredToLocal = (east: number, north: number) =>
+    new THREE.Vector2(
+      east + contentAnchorLocal.x,
+      north + contentAnchorLocal.z,
+    );
+
   const terrainAt = (east: number, north: number, fallback = state.ground) => {
     const elevation = map.queryTerrainElevation(localToLngLat(east, north));
-    return typeof elevation === 'number' && Number.isFinite(elevation) ? elevation : fallback;
+    return typeof elevation === 'number' && Number.isFinite(elevation)
+      ? elevation
+      : fallback;
   };
 
   const npcTerrainAt = (east: number, north: number, fallback: number) => {
-    const safeFallback = Math.abs(fallback - campusGroundFallback) > 80
-      ? campusGroundFallback
-      : fallback;
+    const safeFallback =
+      Math.abs(fallback - campusGroundFallback) > 80
+        ? campusGroundFallback
+        : fallback;
     return terrainAt(east, north, safeFallback);
   };
 
@@ -779,17 +1061,147 @@ export function createGooseEngine(
     return Number.isFinite(parsed) ? parsed : fallback;
   };
 
+  const collectMappedWaterAreas = () => {
+    if (!waterSourceId || !map.getSource(waterSourceId)) return false;
+    const features = map.querySourceFeatures(waterSourceId, {
+      sourceLayer: 'water',
+    }) as Array<{
+      geometry: { type: string; coordinates: unknown };
+    }>;
+    const nextAreas: WaterArea[] = [];
+    features.forEach((feature) => {
+      const polygonSets =
+        feature.geometry.type === 'Polygon'
+          ? [feature.geometry.coordinates as number[][][]]
+          : feature.geometry.type === 'MultiPolygon'
+            ? (feature.geometry.coordinates as number[][][][])
+            : [];
+      polygonSets.forEach((rings) => {
+        const outer = (rings[0] ?? [])
+          .filter((coordinate) => coordinate.length >= 2)
+          .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
+          .slice(0, -1)
+          .map((point) => new THREE.Vector2(point.x, point.z));
+        if (outer.length < 3) return;
+        const minX = Math.min(...outer.map((point) => point.x));
+        const maxX = Math.max(...outer.map((point) => point.x));
+        const minZ = Math.min(...outer.map((point) => point.y));
+        const maxZ = Math.max(...outer.map((point) => point.y));
+        if (maxX < -1400 || minX > 1400 || maxZ < -1400 || minZ > 1400) return;
+        const holes = rings
+          .slice(1)
+          .map((ring) =>
+            ring
+              .filter((coordinate) => coordinate.length >= 2)
+              .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
+              .slice(0, -1)
+              .map((point) => new THREE.Vector2(point.x, point.z)),
+          )
+          .filter((ring) => ring.length >= 3);
+        nextAreas.push({ minX, maxX, minZ, maxZ, outer, holes });
+      });
+    });
+    mappedWaterAreas.splice(0, mappedWaterAreas.length, ...nextAreas);
+    dryMappedWalkwayCacheDirty = true;
+    return nextAreas.length > 0;
+  };
+
+  const isPointInMappedWater = (east: number, north: number) =>
+    mappedWaterAreas.some(
+      (area) =>
+        east >= area.minX &&
+        east <= area.maxX &&
+        north >= area.minZ &&
+        north <= area.maxZ &&
+        pointInRing(east, north, area.outer) &&
+        !area.holes.some((hole) => pointInRing(east, north, hole)),
+    );
+
+  const crowdRouteTouchesMappedWater = (route: CrowdRoute) => {
+    if (mappedWaterAreas.length === 0) return false;
+    const lateralClearance = (route.sidewalkOffset ?? 0) + 0.9;
+    for (let index = 1; index < route.points.length; index += 1) {
+      const start = route.points[index - 1];
+      const end = route.points[index];
+      const segmentX = end.x - start.x;
+      const segmentZ = end.z - start.z;
+      const length = Math.hypot(segmentX, segmentZ);
+      const sampleCount = Math.max(1, Math.ceil(length / 4));
+      const rightX = length > 0.001 ? segmentZ / length : 0;
+      const rightZ = length > 0.001 ? -segmentX / length : 0;
+      for (let sample = 0; sample <= sampleCount; sample += 1) {
+        const amount = sample / sampleCount;
+        const east = lerp(start.x, end.x, amount);
+        const north = lerp(start.z, end.z, amount);
+        if (
+          isPointInMappedWater(east, north) ||
+          isPointInMappedWater(
+            east + rightX * lateralClearance,
+            north + rightZ * lateralClearance,
+          ) ||
+          isPointInMappedWater(
+            east - rightX * lateralClearance,
+            north - rightZ * lateralClearance,
+          )
+        )
+          return true;
+      }
+    }
+    return false;
+  };
+
+  const refreshActiveBuildingColliders = (force = false) => {
+    if (
+      !force &&
+      activeColliderSourceCount === buildingColliders.length &&
+      Math.hypot(
+        state.position.x - activeColliderCenter.x,
+        state.position.z - activeColliderCenter.y,
+      ) < 18
+    )
+      return;
+    activeColliderCenter.set(state.position.x, state.position.z);
+    activeColliderSourceCount = buildingColliders.length;
+    activeBuildingColliders.length = 0;
+    for (const building of buildingColliders) {
+      const dx =
+        state.position.x < building.minX
+          ? building.minX - state.position.x
+          : state.position.x > building.maxX
+            ? state.position.x - building.maxX
+            : 0;
+      const dz =
+        state.position.z < building.minZ
+          ? building.minZ - state.position.z
+          : state.position.z > building.maxZ
+            ? state.position.z - building.maxZ
+            : 0;
+      if (
+        dx * dx + dz * dz <=
+        BUILDING_ACTIVE_RADIUS * BUILDING_ACTIVE_RADIUS
+      ) {
+        activeBuildingColliders.push(building);
+      }
+    }
+  };
+
   const chooseBuildingTextureTile = (ring: number[][]) => {
     const mercatorPoints = ring.map(([longitude, latitude]) =>
       maplibre.MercatorCoordinate.fromLngLat([longitude, latitude], 0),
     );
-    for (let zoom = BUILDING_TEXTURE_MAX_ZOOM; zoom >= BUILDING_TEXTURE_MIN_ZOOM; zoom -= 1) {
+    for (
+      let zoom = BUILDING_TEXTURE_MAX_ZOOM;
+      zoom >= BUILDING_TEXTURE_MIN_ZOOM;
+      zoom -= 1
+    ) {
       const scale = 2 ** zoom;
       const tileX = Math.floor(mercatorPoints[0].x * scale);
       const tileY = Math.floor(mercatorPoints[0].y * scale);
       if (
         mercatorPoints.every(
-          (point) => Math.floor(point.x * scale) === tileX && Math.floor(point.y * scale) === tileY,
+          (point) =>
+            Math.floor(point.x * scale) === tileX &&
+            Math.floor(point.y * scale) === tileY,
         )
       ) {
         return { zoom, tileX, tileY };
@@ -832,7 +1244,10 @@ export function createGooseEngine(
         loadedTexture.wrapT = THREE.ClampToEdgeWrapping;
         loadedTexture.minFilter = THREE.LinearMipmapLinearFilter;
         loadedTexture.magFilter = THREE.LinearFilter;
-        loadedTexture.anisotropy = Math.min(8, renderer?.capabilities.getMaxAnisotropy() ?? 4);
+        loadedTexture.anisotropy = Math.min(
+          8,
+          renderer?.capabilities.getMaxAnisotropy() ?? 4,
+        );
         loadedTexture.needsUpdate = true;
         map.triggerRepaint();
       },
@@ -872,7 +1287,9 @@ export function createGooseEngine(
 
   const buildTexturedBuildings = () => {
     if (!map.getSource(buildingSourceId)) return false;
-    const features = map.querySourceFeatures(buildingSourceId, { sourceLayer: 'building' }) as Array<{
+    const features = map.querySourceFeatures(buildingSourceId, {
+      sourceLayer: 'building',
+    }) as Array<{
       id?: string | number;
       properties?: Record<string, unknown>;
       geometry: { type: string; coordinates: unknown };
@@ -880,15 +1297,19 @@ export function createGooseEngine(
     let changed = false;
 
     features.forEach((feature) => {
-      const polygonSets = feature.geometry.type === 'Polygon'
-        ? [feature.geometry.coordinates as number[][][]]
-        : feature.geometry.type === 'MultiPolygon'
-          ? (feature.geometry.coordinates as number[][][][])
-          : [];
+      const polygonSets =
+        feature.geometry.type === 'Polygon'
+          ? [feature.geometry.coordinates as number[][][]]
+          : feature.geometry.type === 'MultiPolygon'
+            ? (feature.geometry.coordinates as number[][][][])
+            : [];
       const properties = feature.properties ?? {};
       const levels = finiteNumber(properties.levels, 0);
       const renderHeight = clamp(
-        finiteNumber(properties.render_height ?? properties.height, levels > 0 ? levels * 3.1 : 5),
+        finiteNumber(
+          properties.render_height ?? properties.height,
+          levels > 0 ? levels * 3.1 : 5,
+        ),
         2.6,
         180,
       );
@@ -898,9 +1319,12 @@ export function createGooseEngine(
         Math.max(0, renderHeight - 0.5),
       );
       polygonSets.forEach((rings, polygonIndex) => {
-        const outerRing = rings[0]?.filter((coordinate) => coordinate.length >= 2) ?? [];
+        const outerRing =
+          rings[0]?.filter((coordinate) => coordinate.length >= 2) ?? [];
         if (outerRing.length < 4) return;
-        const localOuter = outerRing.map(([longitude, latitude]) => geoToLocal(longitude, latitude));
+        const localOuter = outerRing.map(([longitude, latitude]) =>
+          geoToLocal(longitude, latitude),
+        );
         const minX = Math.min(...localOuter.map((point) => point.x));
         const maxX = Math.max(...localOuter.map((point) => point.x));
         const minZ = Math.min(...localOuter.map((point) => point.z));
@@ -915,7 +1339,8 @@ export function createGooseEngine(
           spanZ < 0.8 ||
           spanX > 500 ||
           spanZ > 500
-        ) return;
+        )
+          return;
 
         const footprintKey = [
           feature.id ?? 'building',
@@ -927,6 +1352,72 @@ export function createGooseEngine(
           renderHeight.toFixed(1),
           renderMinHeight.toFixed(1),
         ].join(':');
+        const wantsTexturedRoof =
+          !texturedBuildingKeys.has(footprintKey) &&
+          texturedBuildingKeys.size < texturedRoofLimit &&
+          Math.hypot(centerX, centerZ) <= TEXTURED_ROOF_RADIUS;
+        const existingCollider = buildingColliderByKey.get(footprintKey);
+
+        // Once a known footprint has final terrain and already has (or cannot
+        // receive) a roof overlay, source-tile refreshes have no work to do.
+        if (existingCollider?.terrainResolved && !wantsTexturedRoof) return;
+
+        let centerGround =
+          existingCollider?.centerGround ?? campusGroundFallback;
+        let colliderGround =
+          existingCollider?.ground ?? campusGroundFallback + renderMinHeight;
+        let colliderHeight = existingCollider?.height ?? renderHeight;
+        let colliderTerrainResolved =
+          existingCollider?.terrainResolved ?? false;
+        if (!existingCollider || !existingCollider.terrainResolved) {
+          const terrainLocations = [
+            [centerX, centerZ],
+            [minX, minZ],
+            [minX, maxZ],
+            [maxX, minZ],
+            [maxX, maxZ],
+          ] as const;
+          const terrainReadings = terrainEnabled
+            ? terrainLocations.map(([east, north]) =>
+                map.queryTerrainElevation(localToLngLat(east, north)),
+              )
+            : [];
+          colliderTerrainResolved =
+            !terrainEnabled ||
+            terrainReadings.every(
+              (elevation) =>
+                typeof elevation === 'number' && Number.isFinite(elevation),
+            );
+          centerGround =
+            terrainEnabled &&
+            typeof terrainReadings[0] === 'number' &&
+            Number.isFinite(terrainReadings[0])
+              ? terrainReadings[0]
+              : campusGroundFallback;
+          const terrainSamples = terrainEnabled
+            ? terrainReadings.map((elevation) =>
+                typeof elevation === 'number' && Number.isFinite(elevation)
+                  ? elevation
+                  : centerGround,
+              )
+            : terrainLocations.map(() => centerGround);
+          const lowestTerrain = Math.min(...terrainSamples);
+          const highestTerrain = Math.max(...terrainSamples);
+          colliderGround = lowestTerrain + renderMinHeight;
+          colliderHeight = Math.max(
+            2.6,
+            highestTerrain + renderHeight - colliderGround,
+          );
+          if (existingCollider) {
+            existingCollider.centerGround = centerGround;
+            existingCollider.ground = colliderGround;
+            existingCollider.height = colliderHeight;
+            existingCollider.terrainResolved = colliderTerrainResolved;
+          }
+        }
+
+        if (existingCollider && !wantsTexturedRoof) return;
+
         const localHoles = rings.slice(1).map((holeRing) =>
           holeRing
             .filter((coordinate) => coordinate.length >= 2)
@@ -938,55 +1429,53 @@ export function createGooseEngine(
           .map((point) => new THREE.Vector2(point.x, point.z));
         const colliderHoles = localHoles
           .filter((hole) => hole.length >= 3)
-          .map((hole) => hole.map((point) => new THREE.Vector2(point.x, point.z)));
+          .map((hole) =>
+            hole.map((point) => new THREE.Vector2(point.x, point.z)),
+          );
         if (colliderOuter.length < 3) return;
 
         // Collision ingestion is deliberately independent from the decorative
         // aerial roof mesh. A failed/late texture can never make a visible OSM
         // building non-solid.
-        const centerGround = terrainAt(centerX, centerZ, campusGroundFallback);
-        const terrainSamples = [
-          centerGround,
-          terrainAt(minX, minZ, centerGround),
-          terrainAt(minX, maxZ, centerGround),
-          terrainAt(maxX, minZ, centerGround),
-          terrainAt(maxX, maxZ, centerGround),
-        ];
-        const lowestTerrain = Math.min(...terrainSamples);
-        const highestTerrain = Math.max(...terrainSamples);
-        const colliderGround = lowestTerrain + renderMinHeight;
-        const colliderHeight = Math.max(
-          2.6,
-          highestTerrain + renderHeight - colliderGround,
-        );
-        const collider: BuildingCollider = {
-          sourceKey: footprintKey,
-          minX,
-          maxX,
-          minZ,
-          maxZ,
-          ground: colliderGround,
-          height: colliderHeight,
-          outer: colliderOuter,
-          holes: colliderHoles,
-        };
-        const existingCollider = buildingColliderByKey.get(footprintKey);
-        if (existingCollider) {
-          existingCollider.ground = collider.ground;
-          existingCollider.height = collider.height;
-        } else {
+        if (!existingCollider) {
+          const collider: BuildingCollider = {
+            sourceKey: footprintKey,
+            minX,
+            maxX,
+            minZ,
+            maxZ,
+            centerGround,
+            ground: colliderGround,
+            height: colliderHeight,
+            terrainResolved: colliderTerrainResolved,
+            outer: colliderOuter,
+            holes: colliderHoles,
+          };
           buildingColliderByKey.set(footprintKey, collider);
           buildingColliders.push(collider);
           changed = true;
         }
 
-        if (texturedBuildingKeys.has(footprintKey)) return;
-        const shapePoints = localOuter.slice(0, -1).map((point) => new THREE.Vector2(point.x, -point.z));
+        if (!wantsTexturedRoof) return;
+        const shapePoints = localOuter
+          .slice(0, -1)
+          .map((point) => new THREE.Vector2(point.x, -point.z));
         if (shapePoints.length < 3) return;
+        const footprintArea =
+          Math.abs(
+            shapePoints.reduce((area, point, index) => {
+              const next = shapePoints[(index + 1) % shapePoints.length];
+              return area + point.x * next.y - next.x * point.y;
+            }, 0),
+          ) * 0.5;
+        if (footprintArea < 5) return;
         const shape = new THREE.Shape(shapePoints);
         localHoles.forEach((holePoints) => {
-          const shapeHole = holePoints.map((point) => new THREE.Vector2(point.x, -point.z));
-          if (shapeHole.length >= 3) shape.holes.push(new THREE.Path(shapeHole));
+          const shapeHole = holePoints.map(
+            (point) => new THREE.Vector2(point.x, -point.z),
+          );
+          if (shapeHole.length >= 3)
+            shape.holes.push(new THREE.Path(shapeHole));
         });
 
         const { zoom, tileX, tileY } = chooseBuildingTextureTile(outerRing);
@@ -998,14 +1487,15 @@ export function createGooseEngine(
         geometry.computeVertexNormals();
         const mesh = new THREE.Mesh(geometry, materials.roof);
         mesh.name = 'MiSAIL aerial roof overlay';
-        mesh.frustumCulled = false;
+        mesh.frustumCulled = true;
         mesh.renderOrder = 1;
-        scene.add(mesh);
+        texturedBuildingGroup.add(mesh);
         texturedBuildingKeys.add(footprintKey);
         changed = true;
       });
     });
 
+    if (changed) settleFlockRoosts();
     return changed;
   };
 
@@ -1017,9 +1507,18 @@ export function createGooseEngine(
       emissive: 0x4b2600,
       emissiveIntensity: 0.4,
     });
-    const dark = new THREE.MeshStandardMaterial({ color: 0x20312b, roughness: 0.76 });
-    const cream = new THREE.MeshStandardMaterial({ color: 0xf3ead2, roughness: 0.82 });
-    const orange = new THREE.MeshStandardMaterial({ color: 0xe9862b, roughness: 0.72 });
+    const dark = new THREE.MeshStandardMaterial({
+      color: 0x20312b,
+      roughness: 0.76,
+    });
+    const cream = new THREE.MeshStandardMaterial({
+      color: 0xf3ead2,
+      roughness: 0.82,
+    });
+    const orange = new THREE.MeshStandardMaterial({
+      color: 0xe9862b,
+      roughness: 0.72,
+    });
     const glow = new THREE.MeshBasicMaterial({
       color: 0x83f0c1,
       transparent: true,
@@ -1032,6 +1531,7 @@ export function createGooseEngine(
       group.traverse((object) => {
         object.frustumCulled = false;
       });
+      group.visible = playing;
       scene.add(group);
     };
 
@@ -1045,13 +1545,21 @@ export function createGooseEngine(
       radius: number,
       definition?: BonusChaosSecret,
     ) => {
-      const elevation = map.queryTerrainElevation(localToLngLat(east, north));
-      const terrainResolved = !terrainEnabled || (typeof elevation === 'number' && Number.isFinite(elevation));
-      const ground = terrainResolved && typeof elevation === 'number' ? elevation : state.ground;
-      group.position.set(east, ground + altitude, north);
+      const local = authoredToLocal(east, north);
+      const elevation = map.queryTerrainElevation(
+        localToLngLat(local.x, local.y),
+      );
+      const terrainResolved =
+        !terrainEnabled ||
+        (typeof elevation === 'number' && Number.isFinite(elevation));
+      const ground =
+        terrainResolved && typeof elevation === 'number'
+          ? elevation
+          : campusGroundFallback;
+      group.position.set(local.x, ground + altitude, local.y);
       group.userData.baseY = group.position.y;
       finishGroup(group);
-      campusSecrets.push({
+      const secret: CampusSecret = {
         id,
         kind,
         group,
@@ -1064,12 +1572,17 @@ export function createGooseEngine(
         altitude,
         terrainResolved,
         definition,
-      });
+      };
+      campusSecrets.push(secret);
+      return secret;
     };
 
     const radio = new THREE.Group();
     radio.name = 'Fetzer Radio Goose';
-    const radioMast = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.2, 4.4, 8), dark);
+    const radioMast = new THREE.Mesh(
+      new THREE.CylinderGeometry(0.12, 0.2, 4.4, 8),
+      dark,
+    );
     radioMast.position.y = 2.2;
     radio.add(radioMast);
     const dish = new THREE.Mesh(
@@ -1080,7 +1593,10 @@ export function createGooseEngine(
     dish.rotation.x = Math.PI / 2.8;
     dish.position.set(0, 4.25, 0.15);
     radio.add(dish);
-    const radioBeacon = new THREE.Mesh(new THREE.TorusGeometry(2.25, 0.07, 7, 32), glow.clone());
+    const radioBeacon = new THREE.Mesh(
+      new THREE.TorusGeometry(2.25, 0.07, 7, 32),
+      glow.clone(),
+    );
     radioBeacon.name = 'secret-beacon';
     radioBeacon.rotation.x = Math.PI / 2;
     radioBeacon.position.y = 5.25;
@@ -1105,9 +1621,26 @@ export function createGooseEngine(
     };
     const council = new THREE.Group();
     council.name = 'Council of Ducks';
+    for (let index = 0; index < 3; index += 1) {
+      const ripple = new THREE.Mesh(
+        new THREE.TorusGeometry(4.4 + index * 1.35, 0.075, 7, 44),
+        glow.clone(),
+      );
+      ripple.name = 'duck-ripple';
+      ripple.rotation.x = Math.PI / 2;
+      ripple.position.y = 0.08 + index * 0.025;
+      council.add(ripple);
+    }
+    const councilBeacon = new THREE.Mesh(
+      new THREE.TorusGeometry(4.8, 0.11, 8, 44),
+      glow.clone(),
+    );
+    councilBeacon.name = 'secret-beacon';
+    councilBeacon.position.y = 4.4;
+    council.add(councilBeacon);
     for (let index = 0; index < 5; index += 1) {
       const angle = (index / 5) * Math.PI * 2;
-      const duck = makeDuck(0.9);
+      const duck = makeDuck(1.25);
       duck.position.set(Math.cos(angle) * 3.2, 0, Math.sin(angle) * 3.2);
       duck.rotation.y = -angle + Math.PI / 2;
       council.add(duck);
@@ -1117,6 +1650,109 @@ export function createGooseEngine(
     duckElder.position.y = -3.2;
     council.add(duckElder);
     addSecret('duck-council', 'duck-council', council, 112.4, 332.4, 0.08, 30);
+
+    const bronco = new THREE.Group();
+    bronco.name = 'The Runaway WMU Bronco';
+    const horseBrown = new THREE.MeshStandardMaterial({
+      color: 0x6e3f25,
+      roughness: 0.9,
+    });
+    const horseDark = new THREE.MeshStandardMaterial({
+      color: 0x25170f,
+      roughness: 0.94,
+    });
+    const horseBody = new THREE.Mesh(
+      new THREE.BoxGeometry(0.82, 0.88, 1.78),
+      horseBrown,
+    );
+    horseBody.position.y = 1.08;
+    bronco.add(horseBody);
+    const horseChest = new THREE.Mesh(
+      new THREE.SphereGeometry(0.5, 10, 8),
+      horseBrown,
+    );
+    horseChest.scale.set(0.82, 1, 0.78);
+    horseChest.position.set(0, 1.18, 0.58);
+    bronco.add(horseChest);
+    const horseNeck = new THREE.Mesh(
+      new THREE.BoxGeometry(0.48, 1.05, 0.5),
+      horseBrown,
+    );
+    horseNeck.rotation.x = -0.28;
+    horseNeck.position.set(0, 1.68, 0.67);
+    bronco.add(horseNeck);
+    const horseHead = new THREE.Mesh(
+      new THREE.BoxGeometry(0.5, 0.48, 0.78),
+      horseBrown,
+    );
+    horseHead.position.set(0, 2.14, 1.02);
+    bronco.add(horseHead);
+    const muzzle = new THREE.Mesh(
+      new THREE.BoxGeometry(0.44, 0.3, 0.48),
+      cream,
+    );
+    muzzle.position.set(0, 2.04, 1.52);
+    bronco.add(muzzle);
+    for (const side of [-1, 1]) {
+      const ear = new THREE.Mesh(
+        new THREE.ConeGeometry(0.11, 0.42, 7),
+        horseDark,
+      );
+      ear.position.set(side * 0.16, 2.52, 0.92);
+      bronco.add(ear);
+      for (const z of [-0.58, 0.57]) {
+        const leg = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.085, 0.1, 0.92, 7),
+          horseDark,
+        );
+        leg.name = `bronco-leg-${side}-${z}`;
+        leg.position.set(side * 0.28, 0.48, z);
+        bronco.add(leg);
+      }
+    }
+    const mane = new THREE.Mesh(
+      new THREE.BoxGeometry(0.13, 0.72, 0.65),
+      horseDark,
+    );
+    mane.position.set(0, 1.88, 0.42);
+    mane.rotation.x = -0.25;
+    bronco.add(mane);
+    const tail = new THREE.Mesh(
+      new THREE.ConeGeometry(0.13, 0.92, 8),
+      horseDark,
+    );
+    tail.name = 'bronco-tail';
+    tail.rotation.x = -0.48;
+    tail.position.set(0, 1.02, -1.2);
+    bronco.add(tail);
+    const saddle = new THREE.Mesh(
+      new THREE.BoxGeometry(0.86, 0.16, 0.72),
+      gold,
+    );
+    saddle.position.set(0, 1.58, -0.12);
+    bronco.add(saddle);
+    const broncoBeacon = new THREE.Mesh(
+      new THREE.TorusGeometry(1.6, 0.07, 7, 34),
+      glow.clone(),
+    );
+    broncoBeacon.name = 'bronco-beacon';
+    broncoBeacon.rotation.x = Math.PI / 2;
+    broncoBeacon.position.y = 2.9;
+    bronco.add(broncoBeacon);
+    broncoSecret = addSecret(
+      'runaway-wmu-bronco',
+      'bronco-horse',
+      bronco,
+      -38,
+      178,
+      0.06,
+      2.15,
+    );
+    bronco.traverse((object) => {
+      object.frustumCulled = true;
+    });
+    broncoHome.set(broncoSecret.position.x, broncoSecret.position.z);
+    broncoGround = broncoSecret.position.y - broncoSecret.altitude;
 
     const diploma = new THREE.Group();
     diploma.name = 'Sangren Diploma Tornado';
@@ -1130,18 +1766,36 @@ export function createGooseEngine(
         }),
       );
       const angle = index * 1.71;
-      paper.position.set(Math.cos(angle) * (1 + (index % 4) * 0.24), 0.3 + index * 0.34, Math.sin(angle) * (1 + (index % 4) * 0.24));
+      paper.position.set(
+        Math.cos(angle) * (1 + (index % 4) * 0.24),
+        0.3 + index * 0.34,
+        Math.sin(angle) * (1 + (index % 4) * 0.24),
+      );
       paper.rotation.set(angle * 0.2, angle, angle * 0.45);
       diploma.add(paper);
     }
-    addSecret('diploma-tornado', 'diploma-tornado', diploma, 258.3, -105.4, 0.08, 5.5);
+    addSecret(
+      'diploma-tornado',
+      'diploma-tornado',
+      diploma,
+      258.3,
+      -105.4,
+      0.08,
+      5.5,
+    );
 
     const skyRing = new THREE.Group();
     skyRing.name = 'Miller Auditori-Honk';
-    const outerRing = new THREE.Mesh(new THREE.TorusGeometry(4.3, 0.32, 10, 44), gold);
+    const outerRing = new THREE.Mesh(
+      new THREE.TorusGeometry(4.3, 0.32, 10, 44),
+      gold,
+    );
     outerRing.name = 'portal-outer';
     skyRing.add(outerRing);
-    const innerRing = new THREE.Mesh(new THREE.TorusGeometry(3.55, 0.08, 8, 40), glow.clone());
+    const innerRing = new THREE.Mesh(
+      new THREE.TorusGeometry(3.55, 0.08, 8, 40),
+      glow.clone(),
+    );
     innerRing.name = 'portal-inner';
     skyRing.add(innerRing);
     for (let index = 0; index < 5; index += 1) {
@@ -1154,12 +1808,18 @@ export function createGooseEngine(
 
     const ufoSite = new THREE.Group();
     ufoSite.name = 'Take Me to Your Dean';
-    const cropCircle = new THREE.Mesh(new THREE.TorusGeometry(5.4, 0.12, 7, 48), glow.clone());
+    const cropCircle = new THREE.Mesh(
+      new THREE.TorusGeometry(5.4, 0.12, 7, 48),
+      glow.clone(),
+    );
     cropCircle.rotation.x = Math.PI / 2;
     cropCircle.position.y = 0.12;
     ufoSite.add(cropCircle);
     for (let index = 0; index < 7; index += 1) {
-      const cone = new THREE.Mesh(new THREE.ConeGeometry(0.24, 0.85, 8), orange);
+      const cone = new THREE.Mesh(
+        new THREE.ConeGeometry(0.24, 0.85, 8),
+        orange,
+      );
       const angle = (index / 7) * Math.PI * 2;
       cone.position.set(Math.cos(angle) * 4.8, 0.42, Math.sin(angle) * 4.8);
       ufoSite.add(cone);
@@ -1168,9 +1828,15 @@ export function createGooseEngine(
     saucer.name = 'secret-saucer';
     saucer.visible = false;
     saucer.position.y = 8;
-    const saucerBody = new THREE.Mesh(new THREE.CylinderGeometry(3.4, 2.1, 0.55, 18), dark);
+    const saucerBody = new THREE.Mesh(
+      new THREE.CylinderGeometry(3.4, 2.1, 0.55, 18),
+      dark,
+    );
     saucer.add(saucerBody);
-    const dome = new THREE.Mesh(new THREE.SphereGeometry(1.5, 14, 8, 0, Math.PI * 2, 0, Math.PI / 2), glow.clone());
+    const dome = new THREE.Mesh(
+      new THREE.SphereGeometry(1.5, 14, 8, 0, Math.PI * 2, 0, Math.PI / 2),
+      glow.clone(),
+    );
     dome.position.y = 0.25;
     saucer.add(dome);
     ufoSite.add(saucer);
@@ -1195,28 +1861,46 @@ export function createGooseEngine(
       });
 
       if (definition.visual === 'air-gate') {
-        const gate = new THREE.Mesh(new THREE.TorusGeometry(3.2, 0.22, 9, 38), material);
+        const gate = new THREE.Mesh(
+          new THREE.TorusGeometry(3.2, 0.22, 9, 38),
+          material,
+        );
         gate.name = 'bonus-spinner';
         group.add(gate);
-        const inner = new THREE.Mesh(new THREE.TorusGeometry(2.65, 0.055, 7, 34), beaconMaterial);
+        const inner = new THREE.Mesh(
+          new THREE.TorusGeometry(2.65, 0.055, 7, 34),
+          beaconMaterial,
+        );
         inner.name = 'bonus-pulse';
         group.add(inner);
         for (let index = 0; index < 6; index += 1) {
           const angle = (index / 6) * Math.PI * 2;
-          const bulb = new THREE.Mesh(new THREE.SphereGeometry(0.13, 7, 5), cream);
+          const bulb = new THREE.Mesh(
+            new THREE.SphereGeometry(0.13, 7, 5),
+            cream,
+          );
           bulb.position.set(Math.cos(angle) * 3.2, Math.sin(angle) * 3.2, 0);
           group.add(bulb);
         }
       } else if (definition.visual === 'honk-shrine') {
-        const circle = new THREE.Mesh(new THREE.TorusGeometry(2.3, 0.09, 7, 36), beaconMaterial);
+        const circle = new THREE.Mesh(
+          new THREE.TorusGeometry(2.3, 0.09, 7, 36),
+          beaconMaterial,
+        );
         circle.name = 'bonus-pulse';
         circle.rotation.x = Math.PI / 2;
         circle.position.y = 0.1;
         group.add(circle);
-        const post = new THREE.Mesh(new THREE.CylinderGeometry(0.18, 0.28, 2.4, 8), material);
+        const post = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.18, 0.28, 2.4, 8),
+          material,
+        );
         post.position.y = 1.2;
         group.add(post);
-        const bell = new THREE.Mesh(new THREE.ConeGeometry(0.65, 0.85, 10), material);
+        const bell = new THREE.Mesh(
+          new THREE.ConeGeometry(0.65, 0.85, 10),
+          material,
+        );
         bell.name = 'bonus-spinner';
         bell.rotation.x = Math.PI;
         bell.position.y = 2.75;
@@ -1225,34 +1909,57 @@ export function createGooseEngine(
         for (let index = 0; index < 7; index += 1) {
           const angle = (index / 7) * Math.PI * 2;
           const prop = new THREE.Mesh(
-            new THREE.ConeGeometry(0.28 + (index % 2) * 0.08, 0.95 + (index % 3) * 0.12, 7),
+            new THREE.ConeGeometry(
+              0.28 + (index % 2) * 0.08,
+              0.95 + (index % 3) * 0.12,
+              7,
+            ),
             material,
           );
-          prop.position.set(Math.cos(angle) * 1.75, 0.48, Math.sin(angle) * 1.75);
+          prop.position.set(
+            Math.cos(angle) * 1.75,
+            0.48,
+            Math.sin(angle) * 1.75,
+          );
           prop.rotation.z = (index % 2 ? -1 : 1) * 0.08;
           group.add(prop);
         }
-        const marker = new THREE.Mesh(new THREE.TorusGeometry(2.6, 0.07, 7, 36), beaconMaterial);
+        const marker = new THREE.Mesh(
+          new THREE.TorusGeometry(2.6, 0.07, 7, 36),
+          beaconMaterial,
+        );
         marker.name = 'bonus-pulse';
         marker.rotation.x = Math.PI / 2;
         marker.position.y = 0.08;
         group.add(marker);
       } else if (definition.visual === 'rideable') {
-        const platform = new THREE.Mesh(new THREE.BoxGeometry(3.1, 0.35, 1.5), material);
+        const platform = new THREE.Mesh(
+          new THREE.BoxGeometry(3.1, 0.35, 1.5),
+          material,
+        );
         platform.name = 'bonus-spinner';
         platform.position.y = 0.24;
         group.add(platform);
-        const marker = new THREE.Mesh(new THREE.TorusGeometry(2.2, 0.075, 7, 36), beaconMaterial);
+        const marker = new THREE.Mesh(
+          new THREE.TorusGeometry(2.2, 0.075, 7, 36),
+          beaconMaterial,
+        );
         marker.name = 'bonus-pulse';
         marker.rotation.x = Math.PI / 2;
         marker.position.y = 0.08;
         group.add(marker);
       } else {
-        const goal = new THREE.Mesh(new THREE.TorusGeometry(2.15, 0.18, 9, 36), material);
+        const goal = new THREE.Mesh(
+          new THREE.TorusGeometry(2.15, 0.18, 9, 36),
+          material,
+        );
         goal.name = 'bonus-spinner';
         goal.position.y = 2.3;
         group.add(goal);
-        const toy = new THREE.Mesh(new THREE.DodecahedronGeometry(0.65, 0), material);
+        const toy = new THREE.Mesh(
+          new THREE.DodecahedronGeometry(0.65, 0),
+          material,
+        );
         toy.name = 'bonus-pulse';
         toy.position.set(0, 0.7, 0.3);
         group.add(toy);
@@ -1273,25 +1980,300 @@ export function createGooseEngine(
 
   createCampusSecrets();
 
+  const flockBeaconMaterial = new THREE.MeshBasicMaterial({
+    color: 0xffc75b,
+    transparent: true,
+    opacity: 0.78,
+    depthWrite: false,
+  });
+  FLOCK_ROOSTS.forEach(([east, north], index) => {
+    const rig = createGooseRig(true);
+    rig.root.name = `Recruitable campus goose ${index + 1}`;
+    rig.root.scale.setScalar(0.36);
+    rig.root.visible = playing;
+    const beacon = new THREE.Mesh(
+      new THREE.TorusGeometry(1.45, 0.055, 7, 30),
+      flockBeaconMaterial.clone(),
+    );
+    beacon.name = 'Flock recruitment ring';
+    beacon.rotation.x = Math.PI / 2;
+    beacon.visible = playing;
+    const home = new THREE.Vector2(east, north);
+    const elevation = terrainEnabled
+      ? map.queryTerrainElevation(localToLngLat(east, north))
+      : campusGroundFallback;
+    const terrainResolved =
+      typeof elevation === 'number' && Number.isFinite(elevation);
+    const ground = terrainResolved ? elevation : campusGroundFallback;
+    rig.root.position.set(east, ground + 0.04, north);
+    beacon.position.set(east, ground + 0.08, north);
+    scene.add(rig.root, beacon);
+    flockGeese.push({
+      rig,
+      beacon,
+      home,
+      position: rig.root.position.clone(),
+      ground,
+      terrainResolved,
+      terrainSamplePosition: home.clone(),
+      terrainRefreshRemaining: index * 0.045,
+      recruited: false,
+      phase: index * 1.37,
+    });
+  });
+
+  const refreshFlockTerrain = (
+    member: FlockGoose,
+    east: number,
+    north: number,
+    force = false,
+  ) => {
+    if (!force && member.terrainRefreshRemaining > 0) return member.ground;
+    const sampleDx = east - member.terrainSamplePosition.x;
+    const sampleDz = north - member.terrainSamplePosition.y;
+    const sampleDistanceSquared = sampleDx * sampleDx + sampleDz * sampleDz;
+    if (!force && member.terrainResolved && sampleDistanceSquared < 1.8 * 1.8) {
+      member.terrainRefreshRemaining = 0.2;
+      return member.ground;
+    }
+    member.terrainSamplePosition.set(east, north);
+    if (!terrainEnabled) {
+      member.ground = campusGroundFallback;
+      member.terrainResolved = true;
+      member.terrainRefreshRemaining = 0.5;
+      return member.ground;
+    }
+    const elevation = map.queryTerrainElevation(localToLngLat(east, north));
+    if (typeof elevation === 'number' && Number.isFinite(elevation)) {
+      member.ground = elevation;
+      member.terrainResolved = true;
+      member.terrainRefreshRemaining = 0.24 + (member.phase % 0.09);
+    } else {
+      member.ground = campusGroundFallback;
+      member.terrainResolved = false;
+      member.terrainRefreshRemaining = 0.72 + (member.phase % 0.16);
+    }
+    return member.ground;
+  };
+
+  const settleFlockRoosts = () => {
+    flockGeese.forEach((member) => {
+      if (member.recruited) return;
+      let relocated = false;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const building = buildingColliders.find((candidate) =>
+          pointInBuilding(member.home.x, member.home.y, candidate),
+        );
+        if (!building) break;
+        const boundary = closestBuildingBoundary(
+          member.home.x,
+          member.home.y,
+          building,
+        );
+        let outwardX = boundary.x - member.home.x;
+        let outwardZ = boundary.z - member.home.y;
+        const length = Math.hypot(outwardX, outwardZ) || 1;
+        outwardX /= length;
+        outwardZ /= length;
+        member.home.set(
+          boundary.x + outwardX * 2.4,
+          boundary.z + outwardZ * 2.4,
+        );
+        relocated = true;
+      }
+      if (relocated)
+        refreshFlockTerrain(member, member.home.x, member.home.y, true);
+    });
+  };
+
+  const recruitFlockMember = (member: FlockGoose) => {
+    if (member.recruited) return;
+    member.recruited = true;
+    member.beacon.visible = false;
+    member.terrainRefreshRemaining = 0;
+    recruitedFlockCount += 1;
+    awardChaos(
+      300,
+      `FLOCK RECRUITED ${recruitedFlockCount}/${flockGeese.length}`,
+    );
+  };
+
+  const recruitNearbyFlock = (fromHonk = false) => {
+    const radius = fromHonk ? 14 : 3.2;
+    let recruited = 0;
+    for (const member of flockGeese) {
+      if (member.recruited) continue;
+      const horizontal = Math.hypot(
+        state.position.x - member.home.x,
+        state.position.z - member.home.y,
+      );
+      if (
+        horizontal <= radius &&
+        Math.abs(state.position.y - member.ground) <= (fromHonk ? 8 : 3.2)
+      ) {
+        recruitFlockMember(member);
+        recruited += 1;
+      }
+    }
+    return recruited;
+  };
+
+  const updateFlockVisuals = (dt: number, pose: SimState) => {
+    const leaderForward = new THREE.Vector3(pose.forward.x, 0, pose.forward.z);
+    if (leaderForward.lengthSq() < 0.001) {
+      leaderForward.set(Math.sin(pose.heading), 0, Math.cos(pose.heading));
+    }
+    leaderForward.normalize();
+    const leaderRight = new THREE.Vector3(leaderForward.z, 0, -leaderForward.x);
+    const airborne = pose.mode === 'flying' || pose.mode === 'planing';
+    let formationIndex = 0;
+    if (recruitedFlockCount > 0) refreshActiveBuildingColliders();
+
+    const keepOutsideBuildings = (point: THREE.Vector3, clearance: number) => {
+      let moved = false;
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        const building = activeBuildingColliders.find((candidate) => {
+          const roof = candidate.ground + candidate.height;
+          return (
+            point.y < roof - 0.01 &&
+            point.y + 0.75 > candidate.ground &&
+            point.x >= candidate.minX &&
+            point.x <= candidate.maxX &&
+            point.z >= candidate.minZ &&
+            point.z <= candidate.maxZ &&
+            pointInBuilding(point.x, point.z, candidate)
+          );
+        });
+        if (!building) return moved;
+        const boundary = closestBuildingBoundary(point.x, point.z, building);
+        let outwardX = boundary.x - point.x;
+        let outwardZ = boundary.z - point.z;
+        const length = Math.hypot(outwardX, outwardZ) || 1;
+        outwardX /= length;
+        outwardZ /= length;
+        point.x = boundary.x + outwardX * clearance;
+        point.z = boundary.z + outwardZ * clearance;
+        moved = true;
+      }
+      return moved;
+    };
+
+    flockGeese.forEach((member) => {
+      member.terrainRefreshRemaining = Math.max(
+        0,
+        member.terrainRefreshRemaining - dt,
+      );
+      if (!member.recruited) {
+        if (!member.terrainResolved && member.terrainRefreshRemaining <= 0) {
+          refreshFlockTerrain(member, member.home.x, member.home.y);
+        }
+        member.position.set(
+          member.home.x,
+          member.ground +
+            0.04 +
+            Math.abs(Math.sin(elapsedTime * 2 + member.phase)) * 0.025,
+          member.home.y,
+        );
+        member.rig.root.position.copy(member.position);
+        member.rig.root.rotation.set(
+          0,
+          member.phase + Math.sin(elapsedTime * 0.45 + member.phase) * 0.35,
+          0,
+        );
+        member.rig.legs.visible = true;
+        member.rig.leftWing.scale.set(0.42, 1, 0.84);
+        member.rig.rightWing.scale.set(0.42, 1, 0.84);
+        member.rig.leftWing.rotation.z = -0.66;
+        member.rig.rightWing.rotation.z = 0.66;
+        member.beacon.position.set(
+          member.home.x,
+          member.ground + 0.08,
+          member.home.y,
+        );
+        member.beacon.scale.setScalar(
+          1 + Math.sin(elapsedTime * 3.1 + member.phase) * 0.12,
+        );
+        member.beacon.rotation.z += dt * 0.22;
+        return;
+      }
+
+      const row = Math.floor(formationIndex / 2) + 1;
+      const side = formationIndex % 2 === 0 ? -1 : 1;
+      formationIndex += 1;
+      const target = pose.position
+        .clone()
+        .addScaledVector(leaderForward, -row * (airborne ? 3.15 : 2.2))
+        .addScaledVector(leaderRight, side * row * (airborne ? 2.55 : 1.6));
+      if (airborne) {
+        target.y = pose.position.y + 0.12 - row * 0.06;
+        keepOutsideBuildings(target, 0.85);
+      } else {
+        target.y = member.ground + 0.04;
+        refreshFlockTerrain(member, target.x, target.z);
+        target.y = member.ground + 0.04;
+        if (keepOutsideBuildings(target, 0.48)) {
+          refreshFlockTerrain(member, target.x, target.z, true);
+          target.y = member.ground + 0.04;
+        }
+      }
+      if (member.position.distanceToSquared(target) > 55 * 55)
+        member.position.copy(target);
+      else
+        member.position.lerp(
+          target,
+          1 - Math.exp(-(airborne ? 3.4 : 2.5) * dt),
+        );
+      keepOutsideBuildings(member.position, airborne ? 0.85 : 0.48);
+      member.rig.root.position.copy(member.position);
+
+      if (airborne) {
+        member.rig.root.quaternion.copy(goose.root.quaternion);
+        member.rig.legs.visible = false;
+        member.rig.leftWing.scale.set(1, 1, 1);
+        member.rig.rightWing.scale.set(1, 1, 1);
+        const flap = 0.12 - 0.46 * Math.cos(elapsedTime * 8.2 + member.phase);
+        member.rig.leftWing.rotation.z = flap;
+        member.rig.rightWing.rotation.z = -flap;
+      } else {
+        member.rig.root.rotation.set(0, pose.heading, 0);
+        member.rig.legs.visible = true;
+        member.rig.leftWing.scale.set(0.42, 1, 0.84);
+        member.rig.rightWing.scale.set(0.42, 1, 0.84);
+        member.rig.leftWing.rotation.z = -0.66;
+        member.rig.rightWing.rotation.z = 0.66;
+      }
+    });
+  };
+
   const treeTrunks = new THREE.InstancedMesh(
     new THREE.CylinderGeometry(0.22, 0.3, 1, 6),
-    new THREE.MeshStandardMaterial({ color: 0x59432c, roughness: 1, vertexColors: true }),
+    new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 1,
+      vertexColors: true,
+    }),
     WMU_TREE_POINTS.length,
   );
   const treeCrowns = new THREE.InstancedMesh(
-    new THREE.DodecahedronGeometry(1, 0),
-    new THREE.MeshStandardMaterial({ color: 0x44733f, roughness: 1, vertexColors: true }),
-    WMU_TREE_POINTS.length,
+    new THREE.IcosahedronGeometry(1, 1),
+    new THREE.MeshStandardMaterial({
+      color: 0xffffff,
+      roughness: 0.96,
+      vertexColors: true,
+    }),
+    WMU_TREE_POINTS.length * 3,
   );
   treeTrunks.frustumCulled = false;
   treeCrowns.frustumCulled = false;
+  treeTrunks.visible = playing;
+  treeCrowns.visible = playing;
   scene.add(treeTrunks, treeCrowns);
 
   const treeLocalPoints = WMU_TREE_POINTS.map(([, longitude, latitude]) =>
     geoToLocal(longitude, latitude),
   );
   const treeGrounds: Array<number | null> = WMU_TREE_POINTS.map(() =>
-    terrainEnabled ? null : state.ground,
+    terrainEnabled ? null : campusGroundFallback,
   );
 
   const updateTrees = (nearPlayerOnly = false) => {
@@ -1302,34 +2284,65 @@ export function createGooseEngine(
       if (
         terrainEnabled &&
         treeGrounds[index] === null &&
-        (!nearPlayerOnly || Math.hypot(point.x - state.position.x, point.z - state.position.z) < 650)
+        (!nearPlayerOnly ||
+          Math.hypot(point.x - state.position.x, point.z - state.position.z) <
+            650)
       ) {
-        const elevation = map.queryTerrainElevation(localToLngLat(point.x, point.z));
+        const elevation = map.queryTerrainElevation(
+          localToLngLat(point.x, point.z),
+        );
         if (typeof elevation === 'number' && Number.isFinite(elevation)) {
           treeGrounds[index] = elevation;
           unresolvedTreeCount -= 1;
           changed = true;
         }
       }
-      const ground = treeGrounds[index] ?? state.ground;
+      const ground = treeGrounds[index] ?? campusGroundFallback;
       const random = Math.abs(Math.sin(Number(id % 1000000) * 0.0173));
       const height = 5.6 + random * 4.8;
-      const crownRadius = 1.55 + random * 1.15;
+      const crownRadius = 1.9 + random * 1.35;
 
       dummy.position.set(point.x, ground + height * 0.42 + 0.08, point.z);
-      dummy.scale.set(0.72 + random * 0.26, height * 0.84, 0.72 + random * 0.26);
+      dummy.scale.set(
+        0.72 + random * 0.26,
+        height * 0.84,
+        0.72 + random * 0.26,
+      );
       dummy.rotation.y = random * Math.PI;
       dummy.updateMatrix();
       treeTrunks.setMatrixAt(index, dummy.matrix);
 
-      dummy.position.set(point.x, ground + height, point.z);
-      dummy.scale.set(crownRadius, crownRadius * 1.12, crownRadius);
-      dummy.rotation.y = random * Math.PI * 2;
-      dummy.updateMatrix();
-      treeCrowns.setMatrixAt(index, dummy.matrix);
-
-      treeTrunks.setColorAt(index, new THREE.Color().setHSL(0.075, 0.35, 0.24 + random * 0.07));
-      treeCrowns.setColorAt(index, new THREE.Color().setHSL(0.28 + random * 0.035, 0.36, 0.31 + random * 0.08));
+      treeTrunks.setColorAt(
+        index,
+        new THREE.Color().setHSL(0.075, 0.35, 0.24 + random * 0.07),
+      );
+      for (let lobe = 0; lobe < 3; lobe += 1) {
+        const crownIndex = index * 3 + lobe;
+        const angle = random * Math.PI * 2 + lobe * ((Math.PI * 2) / 3);
+        const offset = lobe === 0 ? 0 : crownRadius * 0.5;
+        const lobeScale = lobe === 0 ? 1 : 0.76;
+        dummy.position.set(
+          point.x + Math.cos(angle) * offset,
+          ground + height - (lobe === 0 ? 0 : crownRadius * 0.18),
+          point.z + Math.sin(angle) * offset,
+        );
+        dummy.scale.set(
+          crownRadius * lobeScale,
+          crownRadius * (lobe === 0 ? 1.18 : 0.82),
+          crownRadius * lobeScale,
+        );
+        dummy.rotation.y = angle;
+        dummy.updateMatrix();
+        treeCrowns.setMatrixAt(crownIndex, dummy.matrix);
+        treeCrowns.setColorAt(
+          crownIndex,
+          new THREE.Color().setHSL(
+            0.285 + random * 0.04 + lobe * 0.006,
+            0.52,
+            0.34 + random * 0.1,
+          ),
+        );
+      }
     });
     treeTrunks.instanceMatrix.needsUpdate = true;
     treeCrowns.instanceMatrix.needsUpdate = true;
@@ -1340,18 +2353,48 @@ export function createGooseEngine(
 
   updateTrees();
 
-  const highestRoofAt = (east: number, north: number, maximumRoof = Infinity) => {
+  const setGameplayVisibility = (visible: boolean) => {
+    goose.root.visible = visible;
+    trafficFleet.bodies.visible = visible;
+    trafficFleet.cabins.visible = visible;
+    trafficFleet.wheels.visible = visible;
+    crowdFleet.heads.visible = visible;
+    crowdFleet.torsos.visible = visible;
+    crowdFleet.leftArms.visible = visible;
+    crowdFleet.rightArms.visible = visible;
+    crowdFleet.leftLegs.visible = visible;
+    crowdFleet.rightLegs.visible = visible;
+    treeTrunks.visible = visible;
+    treeCrowns.visible = visible;
+    texturedBuildingGroup.visible = visible;
+    campusSecrets.forEach((secret) => {
+      secret.group.visible = visible;
+    });
+    flockGeese.forEach((member) => {
+      member.rig.root.visible = visible;
+      member.beacon.visible = visible && !member.recruited;
+    });
+  };
+
+  const highestRoofAt = (
+    east: number,
+    north: number,
+    maximumRoof = Infinity,
+  ) => {
+    refreshActiveBuildingColliders();
     let roof: number | null = null;
-    for (const building of buildingColliders) {
+    for (const building of activeBuildingColliders) {
       if (
         east < building.minX ||
         east > building.maxX ||
         north < building.minZ ||
         north > building.maxZ ||
         !pointInBuilding(east, north, building)
-      ) continue;
+      )
+        continue;
       const candidate = building.ground + building.height;
-      if (candidate <= maximumRoof && (roof === null || candidate > roof)) roof = candidate;
+      if (candidate <= maximumRoof && (roof === null || candidate > roof))
+        roof = candidate;
     }
     return roof;
   };
@@ -1362,7 +2405,8 @@ export function createGooseEngine(
     if (typeof elevation === 'number' && Number.isFinite(elevation)) {
       const previousTerrain = terrainSurfaceY;
       const lateTerrainDelta = elevation - previousTerrain;
-      const wasUsingTerrainSurface = Math.abs(state.ground - previousTerrain) < 1.5;
+      const wasUsingTerrainSurface =
+        Math.abs(state.ground - previousTerrain) < 1.5;
       if (
         state.mode === 'flying' &&
         wasUsingTerrainSurface &&
@@ -1381,8 +2425,13 @@ export function createGooseEngine(
       campusGroundFallback = elevation;
     }
     const terrainGround = terrainSurfaceY;
-    const roof = highestRoofAt(state.position.x, state.position.z, state.position.y + 0.12);
-    const nextGround = roof === null ? terrainGround : Math.max(terrainGround, roof);
+    const roof = highestRoofAt(
+      state.position.x,
+      state.position.z,
+      state.position.y + 0.12,
+    );
+    const nextGround =
+      roof === null ? terrainGround : Math.max(terrainGround, roof);
     const walkedOffDrop =
       state.mode === 'waddling' &&
       state.ground - nextGround > 0.8 &&
@@ -1399,8 +2448,14 @@ export function createGooseEngine(
     } else if (waterLayers.length > 0) {
       const point = map.project(location);
       const canvas = map.getCanvas();
-      if (point.x >= 0 && point.y >= 0 && point.x <= canvas.clientWidth && point.y <= canvas.clientHeight) {
-        state.onWater = map.queryRenderedFeatures(point, { layers: waterLayers }).length > 0;
+      if (
+        point.x >= 0 &&
+        point.y >= 0 &&
+        point.x <= canvas.clientWidth &&
+        point.y <= canvas.clientHeight
+      ) {
+        state.onWater =
+          map.queryRenderedFeatures(point, { layers: waterLayers }).length > 0;
       } else {
         state.onWater = false;
       }
@@ -1421,7 +2476,10 @@ export function createGooseEngine(
         depthTest: true,
         depthWrite: false,
       });
-      const ring = new THREE.Mesh(new THREE.TorusGeometry(0.55 + index * 0.22, 0.055, 6, 28), material);
+      const ring = new THREE.Mesh(
+        new THREE.TorusGeometry(0.55 + index * 0.22, 0.055, 6, 28),
+        material,
+      );
       ring.rotation.x = Math.PI / 2;
       ring.position.y = index * 0.035;
       rings.push(ring);
@@ -1436,7 +2494,10 @@ export function createGooseEngine(
         opacity: 0.9,
         depthWrite: false,
       });
-      const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.08 + (index % 3) * 0.02, 6, 5), material);
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.08 + (index % 3) * 0.02, 6, 5),
+        material,
+      );
       const velocity = new THREE.Vector3(
         Math.cos(angle) * (2.4 + strength * 2.5),
         3.1 + strength * 3.4 + (index % 4) * 0.25,
@@ -1455,7 +2516,8 @@ export function createGooseEngine(
   const spawnSkimSpray = (speed: number) => {
     const group = new THREE.Group();
     const forward = new THREE.Vector3(state.velocity.x, 0, state.velocity.z);
-    if (forward.lengthSq() < 0.01) forward.set(Math.sin(state.heading), 0, Math.cos(state.heading));
+    if (forward.lengthSq() < 0.01)
+      forward.set(Math.sin(state.heading), 0, Math.cos(state.heading));
     forward.normalize();
     const right = new THREE.Vector3(forward.z, 0, -forward.x);
     group.position
@@ -1471,7 +2533,10 @@ export function createGooseEngine(
         opacity: 0.82,
         depthWrite: false,
       });
-      const mesh = new THREE.Mesh(new THREE.SphereGeometry(0.045 + (index % 3) * 0.018, 5, 4), material);
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(0.045 + (index % 3) * 0.018, 5, 4),
+        material,
+      );
       mesh.position.addScaledVector(right, side * (0.18 + (index % 3) * 0.11));
       const velocity = right
         .clone()
@@ -1508,7 +2573,8 @@ export function createGooseEngine(
         splash.group.traverse((object) => {
           if (object instanceof THREE.Mesh) {
             object.geometry.dispose();
-            if (object.material instanceof THREE.Material) object.material.dispose();
+            if (object.material instanceof THREE.Material)
+              object.material.dispose();
           }
         });
         splashes.splice(index, 1);
@@ -1518,7 +2584,15 @@ export function createGooseEngine(
 
   const buildTraffic = () => {
     if (trafficBuilt || !map.getSource(roadSourceId)) return;
-    const allowed = new Set(['motorway', 'trunk', 'primary', 'secondary', 'tertiary', 'minor', 'service']);
+    const allowed = new Set([
+      'motorway',
+      'trunk',
+      'primary',
+      'secondary',
+      'tertiary',
+      'minor',
+      'service',
+    ]);
     const cruiseByClass: Record<string, number> = {
       motorway: 13,
       trunk: 11.5,
@@ -1528,7 +2602,9 @@ export function createGooseEngine(
       minor: 6.7,
       service: 4.7,
     };
-    const features = map.querySourceFeatures(roadSourceId, { sourceLayer: 'transportation' }) as Array<{
+    const features = map.querySourceFeatures(roadSourceId, {
+      sourceLayer: 'transportation',
+    }) as Array<{
       properties?: Record<string, unknown>;
       geometry: { type: string; coordinates: unknown };
     }>;
@@ -1558,19 +2634,31 @@ export function createGooseEngine(
     };
 
     features.forEach((feature) => {
-      const classValue = feature.properties?.class ?? feature.properties?.subclass;
+      const classValue =
+        feature.properties?.class ?? feature.properties?.subclass;
       const roadClass = typeof classValue === 'string' ? classValue : '';
-      if (!allowed.has(roadClass) || feature.properties?.brunnel === 'tunnel' || feature.properties?.brunnel === 'bridge') return;
-      if (feature.geometry.type === 'LineString') acceptLine(feature.geometry.coordinates as number[][], roadClass);
+      if (
+        !allowed.has(roadClass) ||
+        feature.properties?.brunnel === 'tunnel' ||
+        feature.properties?.brunnel === 'bridge'
+      )
+        return;
+      if (feature.geometry.type === 'LineString')
+        acceptLine(feature.geometry.coordinates as number[][], roadClass);
       if (feature.geometry.type === 'MultiLineString') {
-        (feature.geometry.coordinates as number[][][]).forEach((line) => acceptLine(line, roadClass));
+        (feature.geometry.coordinates as number[][][]).forEach((line) =>
+          acceptLine(line, roadClass),
+        );
       }
     });
 
     routes.sort((a, b) => b.total - a.total);
     if (routes.length === 0) return;
     trafficRoutes.push(...routes.slice(0, 24));
-    const colors = [0xc94b43, 0xe5ae39, 0x3d6f9f, 0xe8e4d6, 0x5a7358, 0x8b5a88, 0x33383c, 0xd47a36];
+    const colors = [
+      0xc94b43, 0xe5ae39, 0x3d6f9f, 0xe8e4d6, 0x5a7358, 0x8b5a88, 0x33383c,
+      0xd47a36,
+    ];
     const activeRoutes = Math.min(routes.length, 20);
     const count = Math.min(MAX_TRAFFIC, Math.max(20, activeRoutes * 2));
     for (let index = 0; index < count; index += 1) {
@@ -1583,7 +2671,10 @@ export function createGooseEngine(
       const position = sample.position.addScaledVector(right, route.laneWidth);
       const ground = terrainAt(position.x, position.z, state.ground);
       position.y = ground + 0.04;
-      trafficFleet.bodies.setColorAt(index, new THREE.Color(colors[index % colors.length]));
+      trafficFleet.bodies.setColorAt(
+        index,
+        new THREE.Color(colors[index % colors.length]),
+      );
       traffic.push({
         index,
         route,
@@ -1610,7 +2701,8 @@ export function createGooseEngine(
     trafficFleet.bodies.count = count;
     trafficFleet.cabins.count = count;
     trafficFleet.wheels.count = count * 4;
-    if (trafficFleet.bodies.instanceColor) trafficFleet.bodies.instanceColor.needsUpdate = true;
+    if (trafficFleet.bodies.instanceColor)
+      trafficFleet.bodies.instanceColor.needsUpdate = true;
     trafficBuilt = true;
   };
 
@@ -1619,49 +2711,235 @@ export function createGooseEngine(
     // These short paths sit on the open lawn around the WMU spawn. They guarantee
     // a busy, visible campus even while vector/terrain tiles are still arriving.
     const localWalkways = [
-      [[-50, -5], [-24, -3], [0, 0], [24, 4], [50, 8]],
-      [[-47, -27], [-22, -18], [2, -16], [25, -21], [47, -14]],
-      [[-44, 25], [-19, 19], [5, 21], [27, 29], [46, 24]],
-      [[-31, -42], [-27, -18], [-25, 5], [-31, 28], [-25, 44]],
-      [[-5, -46], [-4, -22], [0, 0], [4, 23], [7, 46]],
-      [[29, -42], [25, -19], [27, 3], [34, 25], [29, 43]],
-      [[-43, -35], [-21, -17], [0, 1], [22, 19], [43, 36]],
-      [[-43, 36], [-20, 18], [1, 0], [22, -18], [44, -34]],
-      [[-52, 10], [-29, 14], [-4, 12], [22, 10], [50, 15]],
-      [[-14, -47], [-11, -23], [-9, 1], [-13, 24], [-10, 47]],
-      [[14, -47], [12, -23], [10, 1], [14, 24], [11, 47]],
-      [[-51, -16], [-28, -10], [-2, -8], [24, -6], [49, -10]],
+      [
+        [-50, -5],
+        [-24, -3],
+        [0, 0],
+        [24, 4],
+        [50, 8],
+      ],
+      [
+        [-47, -27],
+        [-22, -18],
+        [2, -16],
+        [25, -21],
+        [47, -14],
+      ],
+      [
+        [-44, 25],
+        [-19, 19],
+        [5, 21],
+        [27, 29],
+        [46, 24],
+      ],
+      [
+        [-31, -42],
+        [-27, -18],
+        [-25, 5],
+        [-31, 28],
+        [-25, 44],
+      ],
+      [
+        [-5, -46],
+        [-4, -22],
+        [0, 0],
+        [4, 23],
+        [7, 46],
+      ],
+      [
+        [29, -42],
+        [25, -19],
+        [27, 3],
+        [34, 25],
+        [29, 43],
+      ],
+      [
+        [-43, -35],
+        [-21, -17],
+        [0, 1],
+        [22, 19],
+        [43, 36],
+      ],
+      [
+        [-43, 36],
+        [-20, 18],
+        [1, 0],
+        [22, -18],
+        [44, -34],
+      ],
+      [
+        [-52, 10],
+        [-29, 14],
+        [-4, 12],
+        [22, 10],
+        [50, 15],
+      ],
+      [
+        [-14, -47],
+        [-11, -23],
+        [-9, 1],
+        [-13, 24],
+        [-10, 47],
+      ],
+      [
+        [14, -47],
+        [12, -23],
+        [10, 1],
+        [14, 24],
+        [11, 47],
+      ],
+      [
+        [-51, -16],
+        [-28, -10],
+        [-2, -8],
+        [24, -6],
+        [49, -10],
+      ],
     ];
     localWalkways.forEach((line, index) => {
       const basePoints = line.map(
-        ([east, north]) => new THREE.Vector3(east * 0.64, campusGroundFallback, north * 0.64),
+        ([east, north]) =>
+          new THREE.Vector3(east * 0.64, campusGroundFallback, north * 0.64),
       );
       guaranteedWalkwayBases.push(basePoints.map((point) => point.clone()));
-      const baseRoute = routeFromPoints(
-        basePoints,
-      );
+      const baseRoute = routeFromPoints(basePoints);
       pedestrianRouteKeys.add(`campus-lawn:${index}`);
       pedestrianRoutes.push({
         points: baseRoute.points,
         cumulative: baseRoute.cumulative,
         total: baseRoute.total,
         sidewalkOffset: 0.25,
+        isMappedWalkway: false,
       });
+      dryMappedWalkwayCacheDirty = true;
     });
     guaranteedPedestrianRouteCount = localWalkways.length;
     return localWalkways.length;
   };
 
+  const getMappedPedestrianWalkways = () => {
+    if (dryMappedWalkwayCacheDirty) {
+      dryMappedWalkwayCache = pedestrianRoutes
+        .slice(guaranteedPedestrianRouteCount)
+        .filter(
+          (route) =>
+            route.isMappedWalkway && !crowdRouteTouchesMappedWater(route),
+        );
+      dryMappedWalkwayCacheDirty = false;
+    }
+    return dryMappedWalkwayCache;
+  };
+
+  const nearestDistanceOnCrowdRoute = (
+    route: CrowdRoute,
+    east: number,
+    north: number,
+  ) => {
+    let nearestDistance = 0;
+    let nearestDistanceSquared = Number.POSITIVE_INFINITY;
+    for (let index = 1; index < route.points.length; index += 1) {
+      const start = route.points[index - 1];
+      const end = route.points[index];
+      const segmentX = end.x - start.x;
+      const segmentZ = end.z - start.z;
+      const segmentLengthSquared = segmentX * segmentX + segmentZ * segmentZ;
+      const amount =
+        segmentLengthSquared > 0.0001
+          ? clamp(
+              ((east - start.x) * segmentX + (north - start.z) * segmentZ) /
+                segmentLengthSquared,
+              0,
+              1,
+            )
+          : 0;
+      const candidateX = start.x + segmentX * amount;
+      const candidateZ = start.z + segmentZ * amount;
+      const distanceSquared =
+        (candidateX - east) * (candidateX - east) +
+        (candidateZ - north) * (candidateZ - north);
+      if (distanceSquared >= nearestDistanceSquared) continue;
+      nearestDistanceSquared = distanceSquared;
+      nearestDistance = lerp(
+        route.cumulative[index - 1],
+        route.cumulative[index],
+        amount,
+      );
+    }
+    return {
+      distance: nearestDistance,
+      distanceSquared: nearestDistanceSquared,
+    };
+  };
+
+  const assignNearbyCrowdToMappedWalkways = (
+    mappedWalkways: CrowdRoute[],
+    focusX: number,
+    focusZ: number,
+  ) => {
+    const nearbyCount = Math.min(NEAR_SPAWN_CROWD_COUNT, campusNpcs.length);
+    if (mappedWalkways.length === 0 || nearbyCount === 0) return false;
+    const nearestRoutes = mappedWalkways
+      .map((route) => ({
+        route,
+        ...nearestDistanceOnCrowdRoute(route, focusX, focusZ),
+      }))
+      .sort((a, b) => a.distanceSquared - b.distanceSquared)
+      .slice(0, Math.min(6, mappedWalkways.length));
+    for (let index = 0; index < nearbyCount; index += 1) {
+      const candidate = nearestRoutes[index % nearestRoutes.length];
+      const row = Math.floor(index / nearestRoutes.length);
+      const side = (index + row) % 2 === 0 ? -1 : 1;
+      const distance = clamp(
+        candidate.distance + side * (6 + row * 5.5),
+        0,
+        candidate.route.total,
+      );
+      campusNpcs[index] = createCampusNpc(
+        index,
+        candidate.route,
+        distance,
+        npcTerrainAt,
+      );
+    }
+    return true;
+  };
+
+  const positionGuaranteedWalkways = (anchorX: number, anchorZ: number) => {
+    crowdAnchor.set(anchorX, anchorZ);
+    for (
+      let routeIndex = 0;
+      routeIndex < guaranteedPedestrianRouteCount;
+      routeIndex += 1
+    ) {
+      const route = pedestrianRoutes[routeIndex];
+      const basePoints = guaranteedWalkwayBases[routeIndex];
+      route.points.forEach((point, pointIndex) => {
+        point.set(
+          basePoints[pointIndex].x + anchorX,
+          campusGroundFallback,
+          basePoints[pointIndex].z + anchorZ,
+        );
+      });
+    }
+  };
+
   const collectPedestrianRoutes = () => {
     let added = addGuaranteedCampusWalkways();
-    const features = map.getSource(roadSourceId) && pedestrianRoutes.length < 80
-      ? map.querySourceFeatures(roadSourceId, { sourceLayer: 'transportation' }) as Array<{
-      properties?: Record<string, unknown>;
-      geometry: { type: string; coordinates: unknown };
-      }>
-      : [];
+    let npcAssignmentsChanged = false;
+    const features =
+      map.getSource(roadSourceId) && pedestrianRoutes.length < 80
+        ? (map.querySourceFeatures(roadSourceId, {
+            sourceLayer: 'transportation',
+          }) as Array<{
+            properties?: Record<string, unknown>;
+            geometry: { type: string; coordinates: unknown };
+          }>)
+        : [];
 
-    const acceptLine = (coordinates: number[][]) => {
+    const acceptLine = (
+      coordinates: number[][],
+      isDedicatedWalkway: boolean,
+    ) => {
       if (coordinates.length < 2 || pedestrianRoutes.length >= 80) return;
       const points = coordinates
         .filter((coordinate) => coordinate.length >= 2)
@@ -1676,34 +2954,64 @@ export function createGooseEngine(
       if (pedestrianRouteKeys.has(key)) return;
       const route = routeFromPoints(points);
       if (route.total < 14) return;
+      const crowdRoute: CrowdRoute = {
+        points: route.points,
+        cumulative: route.cumulative,
+        total: route.total,
+        sidewalkOffset: isDedicatedWalkway ? 0.16 : 1.7,
+        isMappedWalkway: isDedicatedWalkway,
+      };
+      if (crowdRouteTouchesMappedWater(crowdRoute)) return;
       pedestrianRouteKeys.add(key);
-      pedestrianRoutes.push(route);
+      pedestrianRoutes.push(crowdRoute);
+      dryMappedWalkwayCacheDirty = true;
       added += 1;
     };
 
+    const isDedicatedFeature = (feature: (typeof features)[number]) => {
+      const roadClass =
+        typeof feature.properties?.class === 'string'
+          ? feature.properties.class
+          : '';
+      const subclass =
+        typeof feature.properties?.subclass === 'string'
+          ? feature.properties.subclass
+          : '';
+      return (
+        DEDICATED_WALKWAY_CLASSES.has(roadClass) ||
+        DEDICATED_WALKWAY_CLASSES.has(subclass)
+      );
+    };
+    features.sort(
+      (a, b) => Number(isDedicatedFeature(b)) - Number(isDedicatedFeature(a)),
+    );
     features.forEach((feature) => {
-      const roadClass = typeof feature.properties?.class === 'string' ? feature.properties.class : '';
-      const subclass = typeof feature.properties?.subclass === 'string' ? feature.properties.subclass : '';
-      const pedestrianClass = new Set([
-        'primary',
-        'secondary',
-        'tertiary',
-        'minor',
-        'service',
-        'track',
-        'path',
-        'pedestrian',
-        'footway',
-        'steps',
-      ]);
+      const roadClass =
+        typeof feature.properties?.class === 'string'
+          ? feature.properties.class
+          : '';
+      const subclass =
+        typeof feature.properties?.subclass === 'string'
+          ? feature.properties.subclass
+          : '';
       if (
-        (!pedestrianClass.has(roadClass) && !pedestrianClass.has(subclass)) ||
+        (!PEDESTRIAN_ROUTE_CLASSES.has(roadClass) &&
+          !PEDESTRIAN_ROUTE_CLASSES.has(subclass)) ||
         feature.properties?.brunnel === 'tunnel' ||
         feature.properties?.brunnel === 'bridge'
-      ) return;
-      if (feature.geometry.type === 'LineString') acceptLine(feature.geometry.coordinates as number[][]);
+      )
+        return;
+      const isDedicatedWalkway = isDedicatedFeature(feature);
+      if (feature.geometry.type === 'LineString') {
+        acceptLine(
+          feature.geometry.coordinates as number[][],
+          isDedicatedWalkway,
+        );
+      }
       if (feature.geometry.type === 'MultiLineString') {
-        (feature.geometry.coordinates as number[][][]).forEach(acceptLine);
+        (feature.geometry.coordinates as number[][][]).forEach((line) =>
+          acceptLine(line, isDedicatedWalkway),
+        );
       }
     });
 
@@ -1711,74 +3019,176 @@ export function createGooseEngine(
       if (pedestrianRoutes.length >= 48) return;
       const key = `roadside:${index}:${route.points[0].x.toFixed(0)}:${route.points[0].z.toFixed(0)}`;
       if (pedestrianRouteKeys.has(key)) return;
-      pedestrianRouteKeys.add(key);
-      pedestrianRoutes.push({
+      const crowdRoute: CrowdRoute = {
         points: route.points,
         cumulative: route.cumulative,
         total: route.total,
         sidewalkOffset: route.laneWidth + 1.15,
-      });
+        isMappedWalkway: false,
+      };
+      if (crowdRouteTouchesMappedWater(crowdRoute)) return;
+      pedestrianRouteKeys.add(key);
+      pedestrianRoutes.push(crowdRoute);
+      dryMappedWalkwayCacheDirty = true;
       added += 1;
     });
 
-    const targetCount = guaranteedPedestrianRouteCount > 0 ? MAX_CAMPUS_NPCS : 0;
+    const targetCount =
+      guaranteedPedestrianRouteCount > 0 ? MAX_CAMPUS_NPCS : 0;
     while (campusNpcs.length < targetCount) {
       const index = campusNpcs.length;
-      const useNearbyRoute = index < NEAR_SPAWN_CROWD_COUNT || pedestrianRoutes.length === guaranteedPedestrianRouteCount;
+      const useNearbyRoute =
+        index < NEAR_SPAWN_CROWD_COUNT ||
+        pedestrianRoutes.length === guaranteedPedestrianRouteCount;
       const route = useNearbyRoute
         ? pedestrianRoutes[index % guaranteedPedestrianRouteCount]
         : pedestrianRoutes[
-          guaranteedPedestrianRouteCount +
-          ((index - NEAR_SPAWN_CROWD_COUNT) % (pedestrianRoutes.length - guaranteedPedestrianRouteCount))
-        ];
-      const routeFraction = index === 0
-        ? 0.5
-        : 0.06 + ((index * 0.61803398875 + 0.17) % 1) * 0.88;
-      campusNpcs.push(createCampusNpc(index, route, route.total * routeFraction, npcTerrainAt));
+            guaranteedPedestrianRouteCount +
+              ((index - NEAR_SPAWN_CROWD_COUNT) %
+                (pedestrianRoutes.length - guaranteedPedestrianRouteCount))
+          ];
+      const routeFraction =
+        index === 0 ? 0.5 : 0.06 + ((index * 0.61803398875 + 0.17) % 1) * 0.88;
+      campusNpcs.push(
+        createCampusNpc(
+          index,
+          route,
+          route.total * routeFraction,
+          npcTerrainAt,
+        ),
+      );
+      npcAssignmentsChanged = true;
     }
 
-    const mappedRouteCount = pedestrianRoutes.length - guaranteedPedestrianRouteCount;
-    if (mappedRouteCount > 0 && !mappedCrowdAssigned) {
-      for (let index = NEAR_SPAWN_CROWD_COUNT; index < campusNpcs.length; index += 1) {
-        const route = pedestrianRoutes[
-          guaranteedPedestrianRouteCount +
-          ((index - NEAR_SPAWN_CROWD_COUNT) % mappedRouteCount)
-        ];
-        const distance = route.total * (0.06 + ((index * 0.61803398875 + 0.17) % 1) * 0.88);
-        campusNpcs[index] = createCampusNpc(index, route, distance, npcTerrainAt);
+    const mappedWalkways = getMappedPedestrianWalkways();
+    const mappedWalkwaySignature = mappedWalkways
+      .map((route) => pedestrianRoutes.indexOf(route))
+      .join(':');
+    if (
+      mappedWalkways.length > 0 &&
+      mappedWalkwaySignature !== mappedCrowdWalkwaySignature
+    ) {
+      for (
+        let index = NEAR_SPAWN_CROWD_COUNT;
+        index < campusNpcs.length;
+        index += 1
+      ) {
+        const route =
+          mappedWalkways[
+            (index - NEAR_SPAWN_CROWD_COUNT) % mappedWalkways.length
+          ];
+        const distance =
+          route.total * (0.06 + ((index * 0.61803398875 + 0.17) % 1) * 0.88);
+        campusNpcs[index] = createCampusNpc(
+          index,
+          route,
+          distance,
+          npcTerrainAt,
+        );
       }
-      mappedCrowdAssigned = true;
-      added += 1;
+      const crowdFocusX = state.position.x + state.forward.x * 12;
+      const crowdFocusZ = state.position.z + state.forward.z * 12;
+      crowdAnchor.set(crowdFocusX, crowdFocusZ);
+      assignNearbyCrowdToMappedWalkways(
+        mappedWalkways,
+        crowdFocusX,
+        crowdFocusZ,
+      );
+      mappedCrowdWalkwaySignature = mappedWalkwaySignature;
+      npcAssignmentsChanged = true;
+    } else if (
+      mappedWalkways.length === 0 &&
+      mappedCrowdWalkwaySignature !== ''
+    ) {
+      campusNpcs.forEach((_, index) => {
+        const route = pedestrianRoutes[index % guaranteedPedestrianRouteCount];
+        const distance =
+          route.total * (0.06 + ((index * 0.61803398875 + 0.17) % 1) * 0.88);
+        campusNpcs[index] = createCampusNpc(
+          index,
+          route,
+          distance,
+          npcTerrainAt,
+        );
+      });
+      mappedCrowdWalkwaySignature = '';
+      npcAssignmentsChanged = true;
     }
-    if (added > 0 || campusNpcs.length > 0) updateCrowdVisuals(crowdFleet, campusNpcs, 1, elapsedTime);
-    return added > 0;
+    if (npcAssignmentsChanged)
+      updateCrowdVisuals(crowdFleet, campusNpcs, 1, elapsedTime);
+    return added > 0 || npcAssignmentsChanged;
   };
 
   const relocateNearbyCrowd = (force = false) => {
-    if (guaranteedPedestrianRouteCount === 0 || campusNpcs.length === 0) return false;
+    if (guaranteedPedestrianRouteCount === 0 || campusNpcs.length === 0)
+      return false;
     const crowdFocusX = state.position.x + state.forward.x * 12;
     const crowdFocusZ = state.position.z + state.forward.z * 12;
     const distanceFromAnchor = Math.hypot(
       crowdFocusX - crowdAnchor.x,
       crowdFocusZ - crowdAnchor.y,
     );
-    if (!force && distanceFromAnchor < 70) return false;
-    crowdAnchor.set(crowdFocusX, crowdFocusZ);
-    for (let routeIndex = 0; routeIndex < guaranteedPedestrianRouteCount; routeIndex += 1) {
-      const route = pedestrianRoutes[routeIndex];
-      const basePoints = guaranteedWalkwayBases[routeIndex];
-      route.points.forEach((point, pointIndex) => {
-        point.set(
-          basePoints[pointIndex].x + crowdAnchor.x,
-          campusGroundFallback,
-          basePoints[pointIndex].z + crowdAnchor.y,
-        );
-      });
-    }
+    const mappedWalkways = getMappedPedestrianWalkways();
     const nearbyCount = Math.min(NEAR_SPAWN_CROWD_COUNT, campusNpcs.length);
+    const needsMappedAssignment =
+      mappedWalkways.length > 0 &&
+      campusNpcs
+        .slice(0, nearbyCount)
+        .some((npc) => !npc.route.isMappedWalkway);
+    const fallbackNeedsDryRelocation =
+      mappedWalkways.length === 0 &&
+      pedestrianRoutes
+        .slice(0, guaranteedPedestrianRouteCount)
+        .some((route) => crowdRouteTouchesMappedWater(route));
+    if (
+      !force &&
+      !needsMappedAssignment &&
+      !fallbackNeedsDryRelocation &&
+      distanceFromAnchor < 70
+    )
+      return false;
+    if (mappedWalkways.length > 0) {
+      crowdAnchor.set(crowdFocusX, crowdFocusZ);
+      const changed = assignNearbyCrowdToMappedWalkways(
+        mappedWalkways,
+        crowdFocusX,
+        crowdFocusZ,
+      );
+      if (changed) updateCrowdVisuals(crowdFleet, campusNpcs, 1, elapsedTime);
+      return changed;
+    }
+
+    const previousAnchor = crowdAnchor.clone();
+    const candidateAnchors = [new THREE.Vector2(crowdFocusX, crowdFocusZ)];
+    for (let radius = 35; radius <= 175; radius += 35) {
+      for (let direction = 0; direction < 8; direction += 1) {
+        const angle = (direction * Math.PI) / 4;
+        candidateAnchors.push(
+          new THREE.Vector2(
+            crowdFocusX + Math.cos(angle) * radius,
+            crowdFocusZ + Math.sin(angle) * radius,
+          ),
+        );
+      }
+    }
+    candidateAnchors.push(new THREE.Vector2(0, 0));
+    const dryAnchor = candidateAnchors.find((candidate) => {
+      positionGuaranteedWalkways(candidate.x, candidate.y);
+      return pedestrianRoutes
+        .slice(0, guaranteedPedestrianRouteCount)
+        .every((route) => !crowdRouteTouchesMappedWater(route));
+    });
+    if (!dryAnchor)
+      positionGuaranteedWalkways(previousAnchor.x, previousAnchor.y);
+
     for (let index = 0; index < nearbyCount; index += 1) {
       const npc = campusNpcs[index];
-      let relocated = createCampusNpc(index, npc.route, npc.distance, npcTerrainAt);
+      let relocated = createCampusNpc(
+        index,
+        npc.route,
+        npc.distance,
+        npcTerrainAt,
+      );
       for (let attempt = 0; attempt < 3; attempt += 1) {
         const playerDistance = Math.hypot(
           relocated.position.x - state.position.x,
@@ -1790,7 +3200,12 @@ export function createGooseEngine(
           0,
           relocated.route.total,
         );
-        relocated = createCampusNpc(index, relocated.route, shiftedDistance, npcTerrainAt);
+        relocated = createCampusNpc(
+          index,
+          relocated.route,
+          shiftedDistance,
+          npcTerrainAt,
+        );
       }
       campusNpcs[index] = relocated;
     }
@@ -1813,17 +3228,28 @@ export function createGooseEngine(
       const toGooseZ = state.position.z - car.position.z;
       const rightX = car.direction.z;
       const rightZ = -car.direction.x;
-      const longitudinal = toGooseX * car.direction.x + toGooseZ * car.direction.z;
+      const longitudinal =
+        toGooseX * car.direction.x + toGooseZ * car.direction.z;
       const lateral = Math.abs(toGooseX * rightX + toGooseZ * rightZ);
       const stopDistance = 4.5 + 0.7 * car.speed + (car.speed * car.speed) / 10;
-      const shouldYield = gooseGrounded && longitudinal > -2 && longitudinal < stopDistance && lateral < 2.3;
+      const shouldYield =
+        gooseGrounded &&
+        longitudinal > -2 &&
+        longitudinal < stopDistance &&
+        lateral < 2.3;
 
-      let targetSpeed = car.reactionRemaining > 0 ? car.cruise * 0.18 : car.cruise;
+      let targetSpeed =
+        car.reactionRemaining > 0 ? car.cruise * 0.18 : car.cruise;
       if (shouldYield) targetSpeed = 0;
       let closestLeaderGap = Infinity;
       let leaderSpeed = targetSpeed;
       traffic.forEach((other) => {
-        if (other === car || other.route !== car.route || other.directionSign !== car.directionSign) return;
+        if (
+          other === car ||
+          other.route !== car.route ||
+          other.directionSign !== car.directionSign
+        )
+          return;
         const gap = (other.distance - car.distance) * car.directionSign;
         if (gap > 0 && gap < closestLeaderGap) {
           closestLeaderGap = gap;
@@ -1832,10 +3258,14 @@ export function createGooseEngine(
       });
       const desiredGap = 6.5 + 1.2 * car.speed;
       if (closestLeaderGap < desiredGap) {
-        targetSpeed = Math.min(targetSpeed, closestLeaderGap < 5 ? 0 : leaderSpeed * 0.82);
+        targetSpeed = Math.min(
+          targetSpeed,
+          closestLeaderGap < 5 ? 0 : leaderSpeed * 0.82,
+        );
       }
 
-      const acceleration = targetSpeed < car.speed ? (shouldYield ? 7 : 4.5) : 1.8;
+      const acceleration =
+        targetSpeed < car.speed ? (shouldYield ? 7 : 4.5) : 1.8;
       car.speed = moveToward(car.speed, targetSpeed, acceleration * dt);
       car.distance += car.speed * car.directionSign * dt;
       if (car.distance > car.route.total) {
@@ -1853,7 +3283,11 @@ export function createGooseEngine(
       car.elevationTimer -= dt;
       if (car.elevationTimer <= 0) {
         car.elevationTimer = 0.55 + index * 0.015;
-        car.targetGround = terrainAt(next.position.x, next.position.z, car.targetGround);
+        car.targetGround = terrainAt(
+          next.position.x,
+          next.position.z,
+          car.targetGround,
+        );
       }
       car.ground = lerp(car.ground, car.targetGround, 1 - Math.exp(-8 * dt));
       car.position.set(next.position.x, car.ground + 0.04, next.position.z);
@@ -1882,9 +3316,14 @@ export function createGooseEngine(
 
     traffic.forEach((car) => {
       position.lerpVectors(car.previousPosition, car.position, blend);
-      direction.lerpVectors(car.previousDirection, car.direction, blend).normalize();
+      direction
+        .lerpVectors(car.previousDirection, car.direction, blend)
+        .normalize();
       const heading = Math.atan2(direction.x, direction.z);
-      const wobble = Math.sin(elapsedTime * 17 + car.index * 1.9) * 0.065 * clamp(car.wobbleRemaining, 0, 1);
+      const wobble =
+        Math.sin(elapsedTime * 17 + car.index * 1.9) *
+        0.065 *
+        clamp(car.wobbleRemaining, 0, 1);
       quaternion.setFromEuler(new THREE.Euler(0, heading, wobble, 'YXZ'));
       world.compose(position, quaternion, scale);
 
@@ -1909,13 +3348,17 @@ export function createGooseEngine(
     const nearby = campusNpcs
       .map((npc) => ({
         npc,
-        distance: Math.hypot(npc.position.x - state.position.x, npc.position.z - state.position.z),
+        distance: Math.hypot(
+          npc.position.x - state.position.x,
+          npc.position.z - state.position.z,
+        ),
       }))
-      .filter(({ npc, distance }) =>
-        distance <= radius &&
-        Math.abs(state.position.y - npc.ground) < 20 &&
-        npc.mode !== 'ragdoll' &&
-        npc.honkCooldown <= 0,
+      .filter(
+        ({ npc, distance }) =>
+          distance <= radius &&
+          Math.abs(state.position.y - npc.ground) < 20 &&
+          npc.mode !== 'ragdoll' &&
+          npc.honkCooldown <= 0,
       )
       .sort((a, b) => a.distance - b.distance)
       .slice(0, megaHonkRemaining > 0 ? 22 : 12);
@@ -1939,19 +3382,30 @@ export function createGooseEngine(
     const segmentLengthSquared = segmentX * segmentX + segmentZ * segmentZ;
 
     for (const npc of campusNpcs) {
-      if (npc.mode === 'ragdoll' || npc.mode === 'recover' || npc.collisionCooldown > 0) continue;
+      if (
+        npc.mode === 'ragdoll' ||
+        npc.mode === 'recover' ||
+        npc.collisionCooldown > 0
+      )
+        continue;
       const pointX = npc.position.x - startX;
       const pointZ = npc.position.z - startZ;
-      const t = segmentLengthSquared > 0.0001
-        ? clamp((pointX * segmentX + pointZ * segmentZ) / segmentLengthSquared, 0, 1)
-        : 1;
+      const t =
+        segmentLengthSquared > 0.0001
+          ? clamp(
+              (pointX * segmentX + pointZ * segmentZ) / segmentLengthSquared,
+              0,
+              1,
+            )
+          : 1;
       const closestX = startX + segmentX * t;
       const closestZ = startZ + segmentZ * t;
       const dx = npc.position.x - closestX;
       const dz = npc.position.z - closestZ;
       const horizontalDistance = Math.hypot(dx, dz);
       const vertical = state.position.y - npc.ground;
-      if (horizontalDistance > 0.78 || vertical < -0.25 || vertical > 1.85) continue;
+      if (horizontalDistance > 0.78 || vertical < -0.25 || vertical > 1.85)
+        continue;
 
       const npcVelocity = npc.direction.clone().multiplyScalar(npc.speed);
       const relativeSpeed = state.velocity.clone().sub(npcVelocity).length();
@@ -1963,7 +3417,8 @@ export function createGooseEngine(
 
       const severity = clamp((relativeSpeed - 2) / 10, 0.2, 1);
       const outward = new THREE.Vector3(dx, 0, dz);
-      if (outward.lengthSq() < 0.01) outward.set(npc.direction.z, 0, -npc.direction.x);
+      if (outward.lengthSq() < 0.01)
+        outward.set(npc.direction.z, 0, -npc.direction.x);
       outward.normalize();
       const impulse = state.velocity
         .clone()
@@ -1973,10 +3428,18 @@ export function createGooseEngine(
       if (!knockDownCampusNpc(npc, impulse)) continue;
       state.velocity.addScaledVector(outward, -0.55 * severity);
       state.velocity.y = Math.max(state.velocity.y, 0.5 + severity);
-      cameraShakeRemaining = Math.max(cameraShakeRemaining, 0.12 + severity * 0.12);
+      cameraShakeRemaining = Math.max(
+        cameraShakeRemaining,
+        0.12 + severity * 0.12,
+      );
       if (npc.scoreCooldown <= 0) {
         npc.scoreCooldown = 7;
-        awardChaos(state.mode === 'flying' ? 260 : 180, state.mode === 'flying' ? 'AIRBORNE CAMPUS BOWLING' : 'CAMPUS BOWLING');
+        awardChaos(
+          state.mode === 'flying' ? 260 : 180,
+          state.mode === 'flying'
+            ? 'AIRBORNE CAMPUS BOWLING'
+            : 'CAMPUS BOWLING',
+        );
       }
       break;
     }
@@ -1988,12 +3451,15 @@ export function createGooseEngine(
     chaosComboRemaining = CHAOS_COMBO_SECONDS;
     const points = basePoints * chaosCombo;
     chaosScore += points;
-    hooks.onToast(`${label} · +${points}${chaosCombo > 1 ? ` · x${chaosCombo}` : ''}`);
+    hooks.onToast(
+      `${label} · +${points}${chaosCombo > 1 ? ` · x${chaosCombo}` : ''}`,
+    );
   };
 
   const launchGoose = (verticalSpeed: number, forwardBoost: number) => {
     const horizontal = new THREE.Vector3(state.forward.x, 0, state.forward.z);
-    if (horizontal.lengthSq() < 0.01) horizontal.set(Math.sin(state.heading), 0, Math.cos(state.heading));
+    if (horizontal.lengthSq() < 0.01)
+      horizontal.set(Math.sin(state.heading), 0, Math.cos(state.heading));
     horizontal.normalize();
     state.mode = 'flying';
     state.position.y = Math.max(state.position.y, state.ground + 0.7);
@@ -2008,29 +3474,46 @@ export function createGooseEngine(
     peakAgl = 0;
   };
 
-  const discoverSecret = (secret: CampusSecret, points: number, label: string) => {
+  const discoverSecret = (
+    secret: CampusSecret,
+    points: number,
+    label: string,
+  ) => {
     if (secret.found) return;
     secret.found = true;
     secret.activation = 0;
     secretsFound += 1;
     secret.group.traverse((object) => {
-      if (object instanceof THREE.Mesh && object.material instanceof THREE.MeshStandardMaterial) {
+      if (
+        object instanceof THREE.Mesh &&
+        object.material instanceof THREE.MeshStandardMaterial
+      ) {
         object.material.emissive.setHex(0x5a3000);
-        object.material.emissiveIntensity = Math.max(object.material.emissiveIntensity, 0.62);
+        object.material.emissiveIntensity = Math.max(
+          object.material.emissiveIntensity,
+          0.62,
+        );
       }
     });
-    awardChaos(points, `${label} · SECRET ${secretsFound}/${campusSecrets.length}`);
+    awardChaos(
+      points,
+      `${label} · SECRET ${secretsFound}/${campusSecrets.length}`,
+    );
   };
 
   const unleashBonusEffect = (secret: CampusSecret) => {
     const definition = secret.definition;
     if (!definition) return;
     const horizontal = new THREE.Vector3(state.forward.x, 0, state.forward.z);
-    if (horizontal.lengthSq() < 0.01) horizontal.set(Math.sin(state.heading), 0, Math.cos(state.heading));
+    if (horizontal.lengthSq() < 0.01)
+      horizontal.set(Math.sin(state.heading), 0, Math.cos(state.heading));
     horizontal.normalize();
 
     if (definition.effect === 'launch') {
-      launchGoose(definition.id === 'bench-catapult' ? 17 : 12, definition.id === 'bench-catapult' ? 12 : 5);
+      launchGoose(
+        definition.id === 'bench-catapult' ? 17 : 12,
+        definition.id === 'bench-catapult' ? 12 : 5,
+      );
       cameraShakeRemaining = 0.28;
     } else if (definition.effect === 'boost') {
       if (state.mode !== 'flying') launchGoose(7, 4);
@@ -2068,7 +3551,11 @@ export function createGooseEngine(
 
   const activateBonusSecret = (secret: CampusSecret) => {
     if (!secret.definition || secret.found) return;
-    discoverSecret(secret, secret.definition.points, secret.definition.label.toUpperCase());
+    discoverSecret(
+      secret,
+      secret.definition.points,
+      secret.definition.label.toUpperCase(),
+    );
     unleashBonusEffect(secret);
   };
 
@@ -2076,30 +3563,49 @@ export function createGooseEngine(
     campusSecrets.forEach((secret) => {
       if (secret.found) return;
       const distance = state.position.distanceTo(secret.position);
-      if (secret.kind === 'chaos-bonus' && secret.definition && distance < secret.radius) {
+      if (
+        secret.kind === 'chaos-bonus' &&
+        secret.definition &&
+        distance < secret.radius
+      ) {
         const { definition } = secret;
-        if (definition.trigger !== 'honk' && definition.trigger !== 'multi-honk') return;
+        if (
+          definition.trigger !== 'honk' &&
+          definition.trigger !== 'multi-honk'
+        )
+          return;
         if (secret.honkWindow <= 0) secret.honkCount = 0;
         secret.honkCount += 1;
         secret.honkWindow = definition.id === 'student-megaphone' ? 7 : 4;
         if (secret.honkCount < definition.requiredHonks) {
-          hooks.onToast(`${definition.label} · honk ${secret.honkCount}/${definition.requiredHonks}`);
+          hooks.onToast(
+            `${definition.label} · honk ${secret.honkCount}/${definition.requiredHonks}`,
+          );
           return;
         }
         activateBonusSecret(secret);
         return;
       }
-      if (secret.kind === 'duck-council' && distance < secret.radius && state.onWater) {
+      if (
+        secret.kind === 'duck-council' &&
+        distance < secret.radius &&
+        state.onWater
+      ) {
         discoverSecret(secret, 900, 'CHOSEN OF THE POND');
         cameraShakeRemaining = 0.14;
         return;
       }
-      if ((secret.kind === 'radio' || secret.kind === 'dean-ufo') && distance < secret.radius) {
+      if (
+        (secret.kind === 'radio' || secret.kind === 'dean-ufo') &&
+        distance < secret.radius
+      ) {
         if (secret.honkWindow <= 0) secret.honkCount = 0;
         secret.honkCount += 1;
         secret.honkWindow = 4;
         if (secret.honkCount < 3) {
-          hooks.onToast(`${secret.kind === 'radio' ? 'The dish is listening' : 'The cones are humming'} · honk ${secret.honkCount}/3`);
+          hooks.onToast(
+            `${secret.kind === 'radio' ? 'The dish is listening' : 'The cones are humming'} · honk ${secret.honkCount}/3`,
+          );
           return;
         }
         if (secret.kind === 'radio') {
@@ -2117,8 +3623,16 @@ export function createGooseEngine(
 
   const updateCampusSecrets = (dt: number) => {
     campusSecrets.forEach((secret, secretIndex) => {
-      if (!secret.terrainResolved && Math.hypot(secret.position.x - state.position.x, secret.position.z - state.position.z) < 750) {
-        const elevation = map.queryTerrainElevation(localToLngLat(secret.position.x, secret.position.z));
+      if (
+        !secret.terrainResolved &&
+        Math.hypot(
+          secret.position.x - state.position.x,
+          secret.position.z - state.position.z,
+        ) < 750
+      ) {
+        const elevation = map.queryTerrainElevation(
+          localToLngLat(secret.position.x, secret.position.z),
+        );
         if (typeof elevation === 'number' && Number.isFinite(elevation)) {
           secret.terrainResolved = true;
           secret.position.y = elevation + secret.altitude;
@@ -2136,38 +3650,173 @@ export function createGooseEngine(
         const beacon = secret.group.getObjectByName('bonus-pulse');
         if (spinner) {
           spinner.rotation.z += dt * (secret.found ? 2.8 : 0.35);
-          if (secret.definition?.visual !== 'air-gate') spinner.rotation.y += dt * (secret.found ? 3.4 : 0.24);
+          if (secret.definition?.visual !== 'air-gate')
+            spinner.rotation.y += dt * (secret.found ? 3.4 : 0.24);
         }
-        if (beacon) beacon.scale.setScalar(secret.found ? 1.18 + Math.sin(elapsedTime * 8) * 0.15 : pulse);
+        if (beacon)
+          beacon.scale.setScalar(
+            secret.found ? 1.18 + Math.sin(elapsedTime * 8) * 0.15 : pulse,
+          );
         if (secret.found) {
-          secret.group.position.y = secret.group.userData.baseY + Math.sin(elapsedTime * 3.7 + secretIndex) * 0.16;
+          secret.group.position.y =
+            secret.group.userData.baseY +
+            Math.sin(elapsedTime * 3.7 + secretIndex) * 0.16;
         }
       } else if (secret.kind === 'radio') {
         const beacon = secret.group.getObjectByName('secret-beacon');
         if (beacon) {
           beacon.rotation.z += dt * (secret.found ? 4.5 : 0.75);
-          beacon.scale.setScalar(secret.found ? 1.25 + Math.sin(elapsedTime * 7) * 0.18 : pulse);
+          beacon.scale.setScalar(
+            secret.found ? 1.25 + Math.sin(elapsedTime * 7) * 0.18 : pulse,
+          );
         }
-        if (secret.found) secret.group.position.y = secret.group.userData.baseY + Math.sin(elapsedTime * 4) * 0.08;
+        if (secret.found)
+          secret.group.position.y =
+            secret.group.userData.baseY + Math.sin(elapsedTime * 4) * 0.08;
       } else if (secret.kind === 'duck-council') {
         secret.group.rotation.y += dt * (secret.found ? 1.8 : 0.18);
+        const beacon = secret.group.getObjectByName('secret-beacon');
+        if (beacon) {
+          beacon.rotation.z += dt * (secret.found ? 2.4 : 0.35);
+          beacon.scale.setScalar(
+            secret.found ? 1.18 + Math.sin(elapsedTime * 7) * 0.12 : pulse,
+          );
+        }
+        secret.group.children.forEach((child, index) => {
+          if (child.name === 'duck-ripple') {
+            child.scale.setScalar(
+              1 + Math.sin(elapsedTime * 2.4 + index) * 0.07,
+            );
+          }
+        });
         const elder = secret.group.getObjectByName('duck-elder');
-        if (elder) elder.position.y = lerp(-3.2, 0.15, smoothstep(0, 1.3, secret.activation));
+        if (elder)
+          elder.position.y = lerp(
+            -3.2,
+            0.15,
+            smoothstep(0, 1.3, secret.activation),
+          );
+      } else if (secret.kind === 'bronco-horse') {
+        broncoTurnRemaining -= dt;
+        broncoObstacleRemaining -= dt;
+        broncoTerrainRemaining -= dt;
+        const homeX = broncoHome.x - secret.group.position.x;
+        const homeZ = broncoHome.y - secret.group.position.z;
+        const homeDistance = Math.hypot(homeX, homeZ);
+        if (homeDistance > 68) {
+          const homeHeading = Math.atan2(homeX, homeZ);
+          const headingDelta = Math.atan2(
+            Math.sin(homeHeading - broncoHeading),
+            Math.cos(homeHeading - broncoHeading),
+          );
+          broncoHeading += headingDelta * Math.min(1, dt * 2.2);
+        } else if (broncoTurnRemaining <= 0) {
+          broncoTurnRemaining = 1.8 + (Math.sin(elapsedTime * 0.61) + 1) * 0.8;
+          broncoHeading += Math.sin(elapsedTime * 1.37 + secretIndex) * 0.82;
+        } else {
+          broncoHeading +=
+            Math.sin(elapsedTime * 0.43 + secretIndex) * 0.045 * dt;
+        }
+
+        if (broncoObstacleRemaining <= 0) {
+          broncoObstacleRemaining = 0.22;
+          const horseX = secret.group.position.x;
+          const horseZ = secret.group.position.z;
+          const containingBuilding = buildingColliders.find(
+            (building) =>
+              horseX >= building.minX &&
+              horseX <= building.maxX &&
+              horseZ >= building.minZ &&
+              horseZ <= building.maxZ &&
+              pointInBuilding(horseX, horseZ, building),
+          );
+          if (containingBuilding) {
+            const boundary = closestBuildingBoundary(
+              horseX,
+              horseZ,
+              containingBuilding,
+            );
+            let outwardX = boundary.x - horseX;
+            let outwardZ = boundary.z - horseZ;
+            const length = Math.hypot(outwardX, outwardZ) || 1;
+            outwardX /= length;
+            outwardZ /= length;
+            secret.group.position.x = boundary.x + outwardX * 0.9;
+            secret.group.position.z = boundary.z + outwardZ * 0.9;
+            broncoHeading += Math.PI * 0.72;
+          } else {
+            const probeDistance = 2.6;
+            const probeX = horseX + Math.sin(broncoHeading) * probeDistance;
+            const probeZ = horseZ + Math.cos(broncoHeading) * probeDistance;
+            const blocked = buildingColliders.some(
+              (building) =>
+                probeX >= building.minX &&
+                probeX <= building.maxX &&
+                probeZ >= building.minZ &&
+                probeZ <= building.maxZ &&
+                pointInBuilding(probeX, probeZ, building),
+            );
+            if (blocked)
+              broncoHeading += Math.PI * (0.56 + 0.12 * Math.sin(elapsedTime));
+          }
+        }
+
+        const horseSpeed = secret.found ? 4.8 : 3.15;
+        secret.group.position.x += Math.sin(broncoHeading) * horseSpeed * dt;
+        secret.group.position.z += Math.cos(broncoHeading) * horseSpeed * dt;
+        if (broncoTerrainRemaining <= 0) {
+          broncoTerrainRemaining = 0.28;
+          broncoGround = terrainAt(
+            secret.group.position.x,
+            secret.group.position.z,
+            broncoGround || campusGroundFallback,
+          );
+          secret.terrainResolved = true;
+        }
+        secret.group.position.y = broncoGround + secret.altitude;
+        secret.group.userData.baseY = secret.group.position.y;
+        secret.group.rotation.y = broncoHeading;
+        secret.position.copy(secret.group.position);
+        let legIndex = 0;
+        secret.group.children.forEach((child) => {
+          if (child.name.startsWith('bronco-leg-')) {
+            child.rotation.x =
+              Math.sin(
+                elapsedTime * horseSpeed * 3.2 + (legIndex % 2) * Math.PI,
+              ) * 0.42;
+            legIndex += 1;
+          }
+        });
+        const tail = secret.group.getObjectByName('bronco-tail');
+        if (tail) tail.rotation.z = Math.sin(elapsedTime * 5.1) * 0.28;
+        const beacon = secret.group.getObjectByName('bronco-beacon');
+        if (beacon) {
+          beacon.rotation.z += dt * (secret.found ? 3.2 : 0.7);
+          beacon.scale.setScalar(
+            secret.found ? 1.2 + Math.sin(elapsedTime * 8) * 0.12 : pulse,
+          );
+        }
       } else if (secret.kind === 'diploma-tornado') {
         secret.group.rotation.y += dt * (secret.found ? 4.2 : 0.34);
         secret.group.children.forEach((paper, index) => {
-          paper.rotation.x += dt * (0.25 + index * 0.025) * (secret.found ? 4 : 1);
+          paper.rotation.x +=
+            dt * (0.25 + index * 0.025) * (secret.found ? 4 : 1);
           if (secret.found) paper.position.y += dt * 0.55;
         });
       } else if (secret.kind === 'sky-ring') {
         secret.group.rotation.z += dt * (secret.found ? 1.8 : 0.22);
-        secret.group.scale.setScalar(secret.found ? 1.08 + Math.sin(elapsedTime * 8) * 0.09 : pulse);
+        secret.group.scale.setScalar(
+          secret.found ? 1.08 + Math.sin(elapsedTime * 8) * 0.09 : pulse,
+        );
       } else if (secret.kind === 'dean-ufo') {
         secret.group.rotation.y += dt * (secret.found ? 1.3 : 0.12);
         const saucer = secret.group.getObjectByName('secret-saucer');
         if (saucer) {
           saucer.visible = secret.found;
-          saucer.position.y = 8 + Math.sin(elapsedTime * 2.7) * 0.75 + Math.min(9, secret.activation * 3.5);
+          saucer.position.y =
+            8 +
+            Math.sin(elapsedTime * 2.7) * 0.75 +
+            Math.min(9, secret.activation * 3.5);
         }
       }
 
@@ -2175,17 +3824,40 @@ export function createGooseEngine(
       const distance = state.position.distanceTo(secret.position);
       if (secret.kind === 'chaos-bonus' && secret.definition) {
         const { definition } = secret;
-        const contactRadius = definition.visual === 'bonk-cluster'
-          ? Math.min(definition.radius, 3.2)
-          : Math.min(definition.radius, 2.6);
-        const touched = definition.trigger === 'touch' && distance < contactRadius;
-        const flewThrough = definition.trigger === 'air' && state.mode === 'flying' && distance < definition.radius;
+        const contactRadius =
+          definition.visual === 'bonk-cluster'
+            ? Math.min(definition.radius, 3.2)
+            : Math.min(definition.radius, 2.6);
+        const touched =
+          definition.trigger === 'touch' && distance < contactRadius;
+        const flewThrough =
+          definition.trigger === 'air' &&
+          state.mode === 'flying' &&
+          distance < definition.radius;
         if (touched || flewThrough) activateBonusSecret(secret);
-      } else if (secret.kind === 'diploma-tornado' && distance < secret.radius) {
+      } else if (
+        secret.kind === 'bronco-horse' &&
+        distance < secret.radius &&
+        state.velocity.length() > 2.35
+      ) {
+        discoverSecret(secret, 1_100, 'BRONCO BUSTER');
+        broncoHeading += Math.PI;
+        launchGoose(8.5, 4.5);
+        tumbleRemaining = Math.max(tumbleRemaining, 0.72);
+        tumbleAngularSpeed = 11;
+        cameraShakeRemaining = 0.3;
+      } else if (
+        secret.kind === 'diploma-tornado' &&
+        distance < secret.radius
+      ) {
         discoverSecret(secret, 600, 'ACADEMIC MENACE');
         launchGoose(7.5, 2.5);
         cameraShakeRemaining = 0.18;
-      } else if (secret.kind === 'sky-ring' && state.mode === 'flying' && distance < secret.radius) {
+      } else if (
+        secret.kind === 'sky-ring' &&
+        state.mode === 'flying' &&
+        distance < secret.radius
+      ) {
         discoverSecret(secret, 850, 'STANDING OVATION');
         state.velocity.addScaledVector(state.forward, 8);
         state.velocity.y += 4.5;
@@ -2243,9 +3915,16 @@ export function createGooseEngine(
       depthWrite: false,
       side: THREE.DoubleSide,
     });
-    const mesh = new THREE.Mesh(new THREE.TorusGeometry(0.75, 0.045, 6, 34), material);
+    const mesh = new THREE.Mesh(
+      new THREE.TorusGeometry(0.75, 0.045, 6, 34),
+      material,
+    );
     mesh.rotation.x = Math.PI / 2;
-    mesh.position.set(state.position.x, state.position.y + 0.2, state.position.z);
+    mesh.position.set(
+      state.position.x,
+      state.position.y + 0.2,
+      state.position.z,
+    );
     mesh.frustumCulled = false;
     scene.add(mesh);
     honkWaves.push({ mesh, age: 0, life: 0.48 });
@@ -2278,14 +3957,20 @@ export function createGooseEngine(
     const nearby = traffic
       .map((car) => ({
         car,
-        distance: Math.hypot(car.position.x - state.position.x, car.position.z - state.position.z),
+        distance: Math.hypot(
+          car.position.x - state.position.x,
+          car.position.z - state.position.z,
+        ),
       }))
       .filter(({ distance }) => distance <= radius)
       .sort((a, b) => a.distance - b.distance)
       .slice(0, 3);
     let scoredCars = 0;
     nearby.forEach(({ car, distance }) => {
-      car.reactionRemaining = Math.max(car.reactionRemaining, distance < 10 ? 1.55 : 2.1);
+      car.reactionRemaining = Math.max(
+        car.reactionRemaining,
+        distance < 10 ? 1.55 : 2.1,
+      );
       car.wobbleRemaining = Math.max(car.wobbleRemaining, 1.25);
       if (car.honkScoreCooldown <= 0 && car.speed > 0.8) {
         car.honkScoreCooldown = 6;
@@ -2293,19 +3978,21 @@ export function createGooseEngine(
       }
     });
     const crowdReaction = terrorizeCampusCrowd(radius, true);
+    const recruitedGeese = recruitNearbyFlock(true);
     if (scoredCars > 0 || crowdReaction.scored > 0) {
       const totalTargets = scoredCars + crowdReaction.scored;
-      const label = scoredCars > 0 && crowdReaction.scored > 0
-        ? `CAMPUS PANIC ×${totalTargets}`
-        : crowdReaction.scored > 0
-          ? `HONK PANIC ×${crowdReaction.scored}`
-          : scoredCars >= 2
-            ? `HONK CHAIN ×${scoredCars}`
-            : 'HONK IF YOU YIELD';
+      const label =
+        scoredCars > 0 && crowdReaction.scored > 0
+          ? `CAMPUS PANIC ×${totalTargets}`
+          : crowdReaction.scored > 0
+            ? `HONK PANIC ×${crowdReaction.scored}`
+            : scoredCars >= 2
+              ? `HONK CHAIN ×${scoredCars}`
+              : 'HONK IF YOU YIELD';
       awardChaos(50 * scoredCars + 35 * crowdReaction.scored, label);
     } else if (crowdReaction.panicked > 0) {
       hooks.onToast(`HONK! · ${crowdReaction.panicked} students scattered`);
-    } else {
+    } else if (recruitedGeese === 0) {
       hooks.onToast('HONK!');
     }
     registerSecretHonk();
@@ -2330,7 +4017,10 @@ export function createGooseEngine(
         campusNpcs.forEach((npc) => {
           if (
             npc.mode === 'walk' &&
-            Math.hypot(npc.position.x - state.position.x, npc.position.z - state.position.z) < 95
+            Math.hypot(
+              npc.position.x - state.position.x,
+              npc.position.z - state.position.z,
+            ) < 95
           ) {
             panicCampusNpc(npc, state.position);
           }
@@ -2378,7 +4068,8 @@ export function createGooseEngine(
         state.alpha = FLIGHT.trimAlpha;
         return;
       } else {
-        state.velocity.y = Math.abs(state.velocity.y) > 1 ? -state.velocity.y * 0.22 : 0;
+        state.velocity.y =
+          Math.abs(state.velocity.y) > 1 ? -state.velocity.y * 0.22 : 0;
         state.velocity.x *= Math.exp(-2.5 * dt);
         state.velocity.z *= Math.exp(-2.5 * dt);
         state.mode = 'waddling';
@@ -2399,19 +4090,30 @@ export function createGooseEngine(
   };
 
   const resolveBuildingInteractions = () => {
-    if (buildingColliders.length === 0) return;
+    refreshActiveBuildingColliders();
+    if (activeBuildingColliders.length === 0) return;
     // Use the visible body/inner-wing envelope, not just the goose's center point.
     // This prevents the wings and neck from visibly entering walls first.
     const radius = state.mode === 'flying' ? 0.68 : 0.58;
     const gooseHeight = 0.92;
 
-    let roofLanding: { roof: number; east: number; north: number; time: number } | null = null;
+    let roofLanding: {
+      roof: number;
+      east: number;
+      north: number;
+      time: number;
+    } | null = null;
     const downwardTravel = previousState.position.y - state.position.y;
-    if (state.mode === 'flying' && downwardTravel > 1e-5 && state.velocity.y <= 0) {
-      for (const building of buildingColliders) {
+    if (
+      state.mode === 'flying' &&
+      downwardTravel > 1e-5 &&
+      state.velocity.y <= 0
+    ) {
+      for (const building of activeBuildingColliders) {
         const roof = building.ground + building.height;
         const contactY = roof + 0.04;
-        if (previousState.position.y <= contactY || state.position.y > contactY) continue;
+        if (previousState.position.y <= contactY || state.position.y > contactY)
+          continue;
         const time = (previousState.position.y - contactY) / downwardTravel;
         const east = lerp(previousState.position.x, state.position.x, time);
         const north = lerp(previousState.position.z, state.position.z, time);
@@ -2422,14 +4124,19 @@ export function createGooseEngine(
           north > building.maxZ ||
           !pointInBuilding(east, north, building) ||
           (roofLanding !== null && time >= roofLanding.time)
-        ) continue;
+        )
+          continue;
         roofLanding = { roof, east, north, time };
       }
     }
 
     if (roofLanding !== null) {
       const impact = Math.max(0, -state.velocity.y);
-      state.position.set(roofLanding.east, roofLanding.roof + 0.04, roofLanding.north);
+      state.position.set(
+        roofLanding.east,
+        roofLanding.roof + 0.04,
+        roofLanding.north,
+      );
       state.ground = roofLanding.roof;
       state.onWater = false;
       state.mode = 'waddling';
@@ -2453,13 +4160,18 @@ export function createGooseEngine(
       }
     }
 
-    for (const building of buildingColliders) {
+    for (const building of activeBuildingColliders) {
       if (
-        Math.max(previousState.position.x, state.position.x) < building.minX - radius ||
-        Math.min(previousState.position.x, state.position.x) > building.maxX + radius ||
-        Math.max(previousState.position.z, state.position.z) < building.minZ - radius ||
-        Math.min(previousState.position.z, state.position.z) > building.maxZ + radius
-      ) continue;
+        Math.max(previousState.position.x, state.position.x) <
+          building.minX - radius ||
+        Math.min(previousState.position.x, state.position.x) >
+          building.maxX + radius ||
+        Math.max(previousState.position.z, state.position.z) <
+          building.minZ - radius ||
+        Math.min(previousState.position.z, state.position.z) >
+          building.maxZ + radius
+      )
+        continue;
       const roof = building.ground + building.height;
       const crossing = firstBuildingCrossing(
         previousState.position.x,
@@ -2469,18 +4181,31 @@ export function createGooseEngine(
         building,
         radius,
       );
-      const crossingY = crossing === null
-        ? state.position.y
-        : lerp(previousState.position.y, state.position.y, crossing.t);
-      const lowestBodyY = Math.min(previousState.position.y, state.position.y, crossingY);
-      const highestBodyY = Math.max(previousState.position.y, state.position.y) + gooseHeight;
+      const crossingY =
+        crossing === null
+          ? state.position.y
+          : lerp(previousState.position.y, state.position.y, crossing.t);
+      const lowestBodyY = Math.min(
+        previousState.position.y,
+        state.position.y,
+        crossingY,
+      );
+      const highestBodyY =
+        Math.max(previousState.position.y, state.position.y) + gooseHeight;
       const verticallyOverlaps =
-        lowestBodyY < roof - 0.015 &&
-        highestBodyY > building.ground;
+        lowestBodyY < roof - 0.015 && highestBodyY > building.ground;
       if (!verticallyOverlaps) continue;
 
-      const inside = pointInBuilding(state.position.x, state.position.z, building);
-      const boundary = closestBuildingBoundary(state.position.x, state.position.z, building);
+      const inside = pointInBuilding(
+        state.position.x,
+        state.position.z,
+        building,
+      );
+      const boundary = closestBuildingBoundary(
+        state.position.x,
+        state.position.z,
+        building,
+      );
       const nearWall = boundary.distanceSquared < radius * radius;
       const startedInside = pointInBuilding(
         previousState.position.x,
@@ -2492,8 +4217,12 @@ export function createGooseEngine(
 
       let contactX = boundary.x;
       let contactZ = boundary.z;
-      let normalX = inside ? boundary.x - state.position.x : state.position.x - boundary.x;
-      let normalZ = inside ? boundary.z - state.position.z : state.position.z - boundary.z;
+      let normalX = inside
+        ? boundary.x - state.position.x
+        : state.position.x - boundary.x;
+      let normalZ = inside
+        ? boundary.z - state.position.z
+        : state.position.z - boundary.z;
       if (sweptHit) {
         contactX = crossing.x;
         contactZ = crossing.z;
@@ -2516,7 +4245,10 @@ export function createGooseEngine(
       state.position.x = contactX + normalX * (radius + 0.025);
       state.position.z = contactZ + normalZ * (radius + 0.025);
 
-      const inwardSpeed = -(state.velocity.x * normalX + state.velocity.z * normalZ);
+      const inwardSpeed = -(
+        state.velocity.x * normalX +
+        state.velocity.z * normalZ
+      );
       if (inwardSpeed > 0) {
         const rebound = state.mode === 'flying' ? 1.28 : 1;
         state.velocity.x += normalX * inwardSpeed * rebound;
@@ -2526,31 +4258,49 @@ export function createGooseEngine(
         const severity = clamp((inwardSpeed - 1.5) / 10, 0.18, 1);
         state.velocity.x *= lerp(0.88, 0.62, severity);
         state.velocity.z *= lerp(0.88, 0.62, severity);
-        state.velocity.y = Math.min(state.velocity.y, lerp(-0.4, -2.4, severity));
+        state.velocity.y = Math.min(
+          state.velocity.y,
+          lerp(-0.4, -2.4, severity),
+        );
         tumbleRemaining = Math.max(tumbleRemaining, lerp(0.45, 1.15, severity));
         tumbleAngularSpeed = lerp(7, 15, severity) * (normalX >= 0 ? 1 : -1);
-        cameraShakeRemaining = Math.max(cameraShakeRemaining, lerp(0.1, 0.3, severity));
+        cameraShakeRemaining = Math.max(
+          cameraShakeRemaining,
+          lerp(0.1, 0.3, severity),
+        );
         queuedFlaps = 0;
         if (buildingHitCooldown <= 0) {
           buildingHitCooldown = 1.5;
           awardChaos(200, 'ARCHITECTURAL CRITIQUE');
         }
       }
-      const horizontal = new THREE.Vector3(state.velocity.x, 0, state.velocity.z);
-      if (horizontal.lengthSq() > 0.04) state.forward.lerp(horizontal.normalize(), 0.5).normalize();
+      const horizontal = new THREE.Vector3(
+        state.velocity.x,
+        0,
+        state.velocity.z,
+      );
+      if (horizontal.lengthSq() > 0.04)
+        state.forward.lerp(horizontal.normalize(), 0.5).normalize();
     }
   };
 
   const refreshBuildingSupport = () => {
     if (state.mode !== 'waddling') return;
-    const roof = highestRoofAt(state.position.x, state.position.z, state.position.y + 0.12);
+    const roof = highestRoofAt(
+      state.position.x,
+      state.position.z,
+      state.position.y + 0.12,
+    );
     if (roof !== null) {
       state.ground = roof;
       state.position.y = Math.max(state.position.y, roof + 0.04);
       state.onWater = false;
       return;
     }
-    if (state.ground - terrainSurfaceY > 0.8 && state.position.y > terrainSurfaceY + 0.8) {
+    if (
+      state.ground - terrainSurfaceY > 0.8 &&
+      state.position.y > terrainSurfaceY + 0.8
+    ) {
       state.ground = terrainSurfaceY;
       state.mode = 'flying';
       state.velocity.y = Math.min(state.velocity.y, -0.5);
@@ -2569,7 +4319,11 @@ export function createGooseEngine(
       const localX = dx * rightX + dz * rightZ;
       const localZ = dx * car.direction.x + dz * car.direction.z;
       const vertical = state.position.y - car.ground;
-      const overlaps = Math.abs(localX) < 1.25 && Math.abs(localZ) < 2.45 && vertical > -0.2 && vertical < 1.65;
+      const overlaps =
+        Math.abs(localX) < 1.25 &&
+        Math.abs(localZ) < 2.45 &&
+        vertical > -0.2 &&
+        vertical < 1.65;
 
       if (overlaps && hitCooldown <= 0 && car.collisionCooldown <= 0) {
         const carVelocity = car.direction.clone().multiplyScalar(car.speed);
@@ -2588,7 +4342,10 @@ export function createGooseEngine(
         car.collisionCooldown = 5;
         car.reactionRemaining = Math.max(car.reactionRemaining, 1.8);
         car.wobbleRemaining = Math.max(car.wobbleRemaining, 1.4);
-        awardChaos(state.mode === 'flying' ? 225 : 200, state.mode === 'flying' ? 'AIRBORNE CAR BOP' : 'INSURANCE FRAUD');
+        awardChaos(
+          state.mode === 'flying' ? 225 : 200,
+          state.mode === 'flying' ? 'AIRBORNE CAR BOP' : 'INSURANCE FRAUD',
+        );
         break;
       }
 
@@ -2609,7 +4366,8 @@ export function createGooseEngine(
   const beginFlapIfNeeded = () => {
     if (tumbleRemaining > 0) return;
     const spaceHeld = keys.has('Space');
-    const wantsWingbeat = queuedFlaps > 0 || (spaceHeld && state.mode === 'flying');
+    const wantsWingbeat =
+      queuedFlaps > 0 || (spaceHeld && state.mode === 'flying');
     if (!wantsWingbeat || state.flapRemaining > 0) return;
     if (state.mode !== 'flying' && queuedFlaps === 0) return;
 
@@ -2617,11 +4375,21 @@ export function createGooseEngine(
     state.flapRemaining = FLAP_PERIOD;
     state.stamina = Math.max(0, state.stamina - FLAP_STAMINA_COST);
     if (state.mode !== 'flying') {
-      const forward = new THREE.Vector3(Math.sin(state.heading), 0, Math.cos(state.heading));
-      const launchSpeed = Math.max(10.5, Math.hypot(state.velocity.x, state.velocity.z));
+      const forward = new THREE.Vector3(
+        Math.sin(state.heading),
+        0,
+        Math.cos(state.heading),
+      );
+      const launchSpeed = Math.max(
+        10.5,
+        Math.hypot(state.velocity.x, state.velocity.z),
+      );
       state.mode = 'flying';
       state.position.y = state.ground + 0.45;
-      state.velocity.copy(forward).multiplyScalar(launchSpeed).addScaledVector(UP, 5.8);
+      state.velocity
+        .copy(forward)
+        .multiplyScalar(launchSpeed)
+        .addScaledVector(UP, 5.8);
       state.forward.copy(forward);
       waterPlaningElapsed = 0;
       waterDryTime = 0;
@@ -2635,22 +4403,30 @@ export function createGooseEngine(
   const simulateWaterPlaning = (dt: number) => {
     waterPlaningElapsed += dt;
     waterDryTime = state.onWater ? 0 : waterDryTime + dt;
-    if (state.onWater) waterSurfaceY = lerp(waterSurfaceY, state.ground, 1 - Math.exp(-3 * dt));
+    if (state.onWater)
+      waterSurfaceY = lerp(waterSurfaceY, state.ground, 1 - Math.exp(-3 * dt));
 
     const turnInput = Number(keys.has('KeyD')) - Number(keys.has('KeyA'));
     const brake = keys.has('ShiftLeft') || keys.has('ShiftRight') ? 1 : 0;
     const horizontal = new THREE.Vector3(state.velocity.x, 0, state.velocity.z);
     const speed = horizontal.length();
-    if (horizontal.lengthSq() < 0.01) horizontal.set(Math.sin(state.heading), 0, Math.cos(state.heading));
+    if (horizontal.lengthSq() < 0.01)
+      horizontal.set(Math.sin(state.heading), 0, Math.cos(state.heading));
     horizontal.normalize();
     state.heading = Math.atan2(horizontal.x, horizontal.z);
     const yawRate = lerp(0.75, 0.16, smoothstep(3, 15, speed));
     state.heading += turnInput * yawRate * dt;
-    const steered = new THREE.Vector3(Math.sin(state.heading), 0, Math.cos(state.heading));
+    const steered = new THREE.Vector3(
+      Math.sin(state.heading),
+      0,
+      Math.cos(state.heading),
+    );
     horizontal.lerp(steered, 1 - Math.exp(-2.4 * dt)).normalize();
 
-    const impactDrag = 4 * waterTouchdownSeverity * Math.exp(-6 * waterPlaningElapsed);
-    const drag = 0.18 * speed + 0.025 * speed * speed + impactDrag + brake * 2.6;
+    const impactDrag =
+      4 * waterTouchdownSeverity * Math.exp(-6 * waterPlaningElapsed);
+    const drag =
+      0.18 * speed + 0.025 * speed * speed + impactDrag + brake * 2.6;
     const nextSpeed = Math.max(0, speed - drag * dt);
     state.velocity.x = horizontal.x * nextSpeed;
     state.velocity.z = horizontal.z * nextSpeed;
@@ -2659,7 +4435,9 @@ export function createGooseEngine(
     const rideHeight = 0.055 + 0.105 * plane;
     const targetY = waterSurfaceY + rideHeight;
     const omega = nextSpeed >= 3 ? 8 : 10;
-    const accelerationY = omega * omega * (targetY - state.position.y) - 2 * 0.9 * omega * state.velocity.y;
+    const accelerationY =
+      omega * omega * (targetY - state.position.y) -
+      2 * 0.9 * omega * state.velocity.y;
     state.velocity.y = clamp(state.velocity.y + accelerationY * dt, -2.2, 2.2);
     state.position.addScaledVector(state.velocity, dt);
     state.position.y = Math.max(waterSurfaceY + 0.02, state.position.y);
@@ -2686,7 +4464,10 @@ export function createGooseEngine(
       return;
     }
 
-    if ((nextSpeed < 2.8 && waterPlaningElapsed > 0.38) || waterPlaningElapsed > 8) {
+    if (
+      (nextSpeed < 2.8 && waterPlaningElapsed > 0.38) ||
+      waterPlaningElapsed > 8
+    ) {
       state.mode = 'swimming';
       state.position.y = waterSurfaceY + 0.04;
       state.velocity.y = 0;
@@ -2711,11 +4492,19 @@ export function createGooseEngine(
     }
     const turnInput = Number(keys.has('KeyD')) - Number(keys.has('KeyA'));
     const moveInput = Number(keys.has('KeyW')) - Number(keys.has('KeyS'));
-    const topSpeed = state.mode === 'swimming' ? 2.4 : slipperyRemaining > 0 ? 7.2 : 3.8;
+    const topSpeed =
+      state.mode === 'swimming' ? 2.4 : slipperyRemaining > 0 ? 7.2 : 3.8;
     state.heading += turnInput * (1.7 + Math.abs(moveInput) * 0.45) * dt;
-    const forward = new THREE.Vector3(Math.sin(state.heading), 0, Math.cos(state.heading));
-    const desired = forward.multiplyScalar(moveInput >= 0 ? moveInput * topSpeed : moveInput * 1.25);
-    const response = state.mode === 'swimming' ? 1.2 : slipperyRemaining > 0 ? 0.6 : 2.5;
+    const forward = new THREE.Vector3(
+      Math.sin(state.heading),
+      0,
+      Math.cos(state.heading),
+    );
+    const desired = forward.multiplyScalar(
+      moveInput >= 0 ? moveInput * topSpeed : moveInput * 1.25,
+    );
+    const response =
+      state.mode === 'swimming' ? 1.2 : slipperyRemaining > 0 ? 0.6 : 2.5;
     state.velocity.lerp(desired, 1 - Math.exp(-response * dt));
     state.position.addScaledVector(state.velocity, dt);
     state.position.y = state.ground + 0.04;
@@ -2733,18 +4522,43 @@ export function createGooseEngine(
     const speed = Math.max(state.velocity.length(), 0.1);
     const authority = lerp(0.3, 1, smoothstep(5, 11, speed));
     const bankTarget = bankInput * FLIGHT.maxBank * (1 - 0.55 * brake);
-    state.bank = moveToward(state.bank, bankTarget, FLIGHT.maxRollRate * authority * dt);
+    state.bank = moveToward(
+      state.bank,
+      bankTarget,
+      FLIGHT.maxRollRate * authority * dt,
+    );
 
     const agl = state.position.y - state.ground;
-    const flare = brake * clamp((8 - agl) / 7, 0, 1) * clamp((-state.velocity.y - 0.2) / 2, 0, 1);
+    if (agl > ALTITUDE_BOOST_HEIGHT && !altitudeBoostActive) {
+      altitudeBoostActive = true;
+      hooks.onToast('JETSTREAM · 100m altitude speed boost engaged');
+    } else if (agl < ALTITUDE_BOOST_RELEASE_HEIGHT) {
+      altitudeBoostActive = false;
+    }
+    const altitudeBoost = altitudeBoostActive
+      ? lerp(
+          0.35,
+          1,
+          smoothstep(ALTITUDE_BOOST_HEIGHT, ALTITUDE_BOOST_FULL_HEIGHT, agl),
+        )
+      : 0;
+    const flare =
+      brake *
+      clamp((8 - agl) / 7, 0, 1) *
+      clamp((-state.velocity.y - 0.2) / 2, 0, 1);
     const alphaTarget = clamp(
-      FLIGHT.trimAlpha + 14 * DEG * pullInput + 3 * DEG * brake + 4 * DEG * flare + 2 * DEG * Math.sin(state.bank) ** 2,
+      FLIGHT.trimAlpha +
+        14 * DEG * pullInput +
+        3 * DEG * brake +
+        4 * DEG * flare +
+        2 * DEG * Math.sin(state.bank) ** 2,
       -6 * DEG,
       24 * DEG,
     );
     state.alpha += (alphaTarget - state.alpha) * (1 - Math.exp(-dt / 0.2));
 
-    const forward = speed > 2 ? state.velocity.clone().normalize() : state.forward.clone();
+    const forward =
+      speed > 2 ? state.velocity.clone().normalize() : state.forward.clone();
     state.forward.lerp(forward, 1 - Math.exp(-9 * dt)).normalize();
     const liftBase = UP.clone().addScaledVector(forward, -UP.dot(forward));
     if (liftBase.lengthSq() < 0.0001) liftBase.set(0, 0, 1);
@@ -2757,7 +4571,11 @@ export function createGooseEngine(
       lerp(FLIGHT.clMax, 1.7, brake),
     );
     const stallStart = state.alpha >= 0 ? FLIGHT.alphaStall : 13 * DEG;
-    state.stall = smoothstep(stallStart, FLIGHT.alphaDeepStall, Math.abs(state.alpha));
+    state.stall = smoothstep(
+      stallStart,
+      FLIGHT.alphaDeepStall,
+      Math.abs(state.alpha),
+    );
     const cl = lerp(attachedCl, Math.sign(attachedCl || 1) * 0.55, state.stall);
     const cd =
       FLIGHT.cd0 +
@@ -2766,25 +4584,69 @@ export function createGooseEngine(
       0.12 * brake;
     const dynamicPressure = 0.5 * FLIGHT.rho * speed * speed;
     const gravityScale = lowGravityRemaining > 0 ? 0.42 : 1;
-    const force = new THREE.Vector3(0, -FLIGHT.mass * FLIGHT.gravity * gravityScale, 0);
-    force.addScaledVector(liftDirection, dynamicPressure * FLIGHT.wingArea * cl);
-    force.addScaledVector(forward, -dynamicPressure * FLIGHT.wingArea * cd);
+    const force = new THREE.Vector3(
+      0,
+      -FLIGHT.mass * FLIGHT.gravity * gravityScale,
+      0,
+    );
+    force.addScaledVector(
+      liftDirection,
+      dynamicPressure * FLIGHT.wingArea * cl * lerp(1, 0.32, altitudeBoost),
+    );
+    force.addScaledVector(
+      forward,
+      -dynamicPressure * FLIGHT.wingArea * cd * lerp(1, 0.74, altitudeBoost),
+    );
+    const tailwindDirection = new THREE.Vector3(forward.x, 0, forward.z);
+    if (tailwindDirection.lengthSq() < 0.001) {
+      tailwindDirection.set(
+        Math.sin(state.heading),
+        0,
+        Math.cos(state.heading),
+      );
+    }
+    tailwindDirection.normalize();
+    force.addScaledVector(tailwindDirection, 54 * altitudeBoost);
 
     if (state.flapRemaining > 0) {
       const elapsed = FLAP_PERIOD - state.flapRemaining;
-      const pulse = elapsed < DOWNSTROKE ? Math.sin((Math.PI * elapsed) / DOWNSTROKE) : 0;
+      const pulse =
+        elapsed < DOWNSTROKE ? Math.sin((Math.PI * elapsed) / DOWNSTROKE) : 0;
       // Tired wings lose climb performance, but never silently discard an accepted input.
       const staminaScale = lerp(0.48, 1, smoothstep(0, 0.28, state.stamina));
       const lowSpeedLift = lerp(155, 58, smoothstep(2, 10, speed));
       const highSpeedThrustScale = clamp((26 - speed) / 10, 0.2, 1);
-      force.addScaledVector(forward, 36 * pulse * staminaScale * highSpeedThrustScale);
+      force.addScaledVector(
+        forward,
+        36 * pulse * staminaScale * highSpeedThrustScale,
+      );
       force.addScaledVector(liftDirection, lowSpeedLift * pulse * staminaScale);
     } else {
       state.stamina = Math.min(1, state.stamina + 0.055 * dt);
     }
 
     state.velocity.addScaledVector(force, dt / FLIGHT.mass);
-    if (state.velocity.length() > 38) state.velocity.setLength(38);
+    if (altitudeBoost > 0) {
+      const horizontalSpeed = Math.hypot(state.velocity.x, state.velocity.z);
+      const boostedCruise = lerp(23, 35, altitudeBoost);
+      if (horizontalSpeed < boostedCruise) {
+        const addedSpeed = Math.min(
+          boostedCruise - horizontalSpeed,
+          9 * altitudeBoost * dt,
+        );
+        state.velocity.x += tailwindDirection.x * addedSpeed;
+        state.velocity.z += tailwindDirection.z * addedSpeed;
+      }
+      if (pullInput <= 0) {
+        state.velocity.y = Math.min(
+          state.velocity.y,
+          lerp(4.2, 2.2, altitudeBoost),
+        );
+      }
+    }
+    const maximumSpeed = lerp(38, 56, altitudeBoost);
+    if (state.velocity.length() > maximumSpeed)
+      state.velocity.setLength(maximumSpeed);
     state.position.addScaledVector(state.velocity, dt);
 
     if (state.position.y <= state.ground + 0.05) {
@@ -2794,10 +4656,16 @@ export function createGooseEngine(
       const landingCounts = airborneTime > 1.5 && peakAgl > 3;
       state.position.y = state.ground + 0.05;
       const waterRun = state.onWater && landingSpeed >= 3;
-      state.mode = state.onWater ? (waterRun ? 'planing' : 'swimming') : 'waddling';
+      state.mode = state.onWater
+        ? waterRun
+          ? 'planing'
+          : 'swimming'
+        : 'waddling';
       state.heading = Math.atan2(state.forward.x, state.forward.z);
       const waterSeverity = clamp(impact / 7 + bankDegrees / 90, 0, 1);
-      const retainedMomentum = state.onWater ? lerp(0.98, 0.8, waterSeverity) : 0.65;
+      const retainedMomentum = state.onWater
+        ? lerp(0.98, 0.8, waterSeverity)
+        : 0.65;
       state.velocity.set(
         state.velocity.x * retainedMomentum,
         waterRun ? clamp(impact * 0.08, 0, 0.5) : 0,
@@ -2817,14 +4685,24 @@ export function createGooseEngine(
         waterContactReleaseTime = 0;
         if (landingCounts) {
           if (impact > 4.5 || bankDegrees > 35) awardChaos(350, 'BELLY FLOP');
-          else if (impact >= 0.7 && impact < 2.3 && bankDegrees < 20) awardChaos(300, 'PERFECT SPLASHDOWN');
+          else if (impact >= 0.7 && impact < 2.3 && bankDegrees < 20)
+            awardChaos(300, 'PERFECT SPLASHDOWN');
           else awardChaos(140, 'SPLASHDOWN-ISH');
         } else {
-          hooks.onToast(impact < 2.4 ? 'Clean water landing — splash!' : 'Big splash — hold Shift to flare');
+          hooks.onToast(
+            impact < 2.4
+              ? 'Clean water landing — splash!'
+              : 'Big splash — hold Shift to flare',
+          );
         }
       } else {
         if (landingCounts) {
-          if (impact < 2 && bankDegrees < 15 && landingSpeed >= 8 && landingSpeed <= 17) {
+          if (
+            impact < 2 &&
+            bankDegrees < 15 &&
+            landingSpeed >= 8 &&
+            landingSpeed <= 17
+          ) {
             awardChaos(250, 'GREASED LANDING');
           } else if (impact > 4.5) {
             awardChaos(300, 'LAWN DART');
@@ -2832,7 +4710,11 @@ export function createGooseEngine(
             awardChaos(100, 'TOUCHDOWN-ISH');
           }
         } else {
-          hooks.onToast(impact < 2.4 ? 'Touchdown — now waddle' : 'Bumpy landing — flare with Shift');
+          hooks.onToast(
+            impact < 2.4
+              ? 'Touchdown — now waddle'
+              : 'Bumpy landing — flare with Shift',
+          );
         }
       }
       if (!state.onWater && impact > 4.5) {
@@ -2849,7 +4731,11 @@ export function createGooseEngine(
     const touchingWater =
       state.onWater &&
       state.position.y <= state.ground + 0.2 &&
-      highestRoofAt(state.position.x, state.position.z, state.position.y + 0.12) === null;
+      highestRoofAt(
+        state.position.x,
+        state.position.z,
+        state.position.y + 0.12,
+      ) === null;
     if (!touchingWater) {
       waterContactReleaseTime += dt;
       if (waterContactReleaseTime >= 0.18) waterContactLatched = false;
@@ -2882,12 +4768,15 @@ export function createGooseEngine(
     beginFlapIfNeeded();
     surfaceClock -= dt;
     if (surfaceClock <= 0) {
-      surfaceClock = state.mode === 'planing'
-        ? 0.035
-        : tumbleRemaining > 0 ||
-            (state.mode === 'flying' && state.position.y - state.ground < 3 && state.velocity.y < 0)
-          ? fixedStep
-        : 0.12;
+      surfaceClock =
+        state.mode === 'planing'
+          ? 0.035
+          : tumbleRemaining > 0 ||
+              (state.mode === 'flying' &&
+                state.position.y - state.ground < 3 &&
+                state.velocity.y < 0)
+            ? fixedStep
+            : 0.12;
       sampleSurface();
     }
     simulateTraffic(dt);
@@ -2896,7 +4785,9 @@ export function createGooseEngine(
       crowdRelocationClock = 0.65;
       relocateNearbyCrowd();
     }
-    campusNpcs.forEach((npc) => simulateCampusNpc(npc, dt, elapsedTime, npcTerrainAt));
+    campusNpcs.forEach((npc) =>
+      simulateCampusNpc(npc, dt, elapsedTime, npcTerrainAt),
+    );
     if (tumbleRemaining > 0) simulateTumble(dt);
     else if (state.mode === 'planing') simulateWaterPlaning(dt);
     else if (state.mode === 'flying') simulateFlight(dt);
@@ -2906,6 +4797,7 @@ export function createGooseEngine(
     ensureWaterEntrySplash(dt);
     resolveTrafficInteractions();
     resolveCrowdInteractions();
+    recruitNearbyFlock();
     updateCampusSecrets(dt);
     if (state.flapRemaining > 0) {
       state.flapRemaining = Math.max(0, state.flapRemaining - dt);
@@ -2915,12 +4807,15 @@ export function createGooseEngine(
   const updateGoosePose = (pose: SimState) => {
     goose.root.position.copy(pose.position);
     const speed = pose.velocity.length();
-    const waddle = pose.mode === 'waddling' ? Math.sin(elapsedTime * (6 + speed * 1.3)) : 0;
+    const waddle =
+      pose.mode === 'waddling' ? Math.sin(elapsedTime * (6 + speed * 1.3)) : 0;
     goose.root.position.y += Math.abs(waddle) * 0.055;
 
     if (pose.mode === 'flying' || pose.mode === 'planing') {
       const forward = pose.forward.clone().normalize();
-      const liftBase = UP.clone().addScaledVector(forward, -UP.dot(forward)).normalize();
+      const liftBase = UP.clone()
+        .addScaledVector(forward, -UP.dot(forward))
+        .normalize();
       const liftDirection = liftBase.applyAxisAngle(forward, -pose.bank);
       const bodyForward = forward
         .clone()
@@ -2932,8 +4827,12 @@ export function createGooseEngine(
         .multiplyScalar(Math.cos(pose.alpha))
         .addScaledVector(forward, -Math.sin(pose.alpha))
         .normalize();
-      const bodyRight = new THREE.Vector3().crossVectors(bodyUp, bodyForward).normalize();
-      goose.root.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(bodyRight, bodyUp, bodyForward));
+      const bodyRight = new THREE.Vector3()
+        .crossVectors(bodyUp, bodyForward)
+        .normalize();
+      goose.root.quaternion.setFromRotationMatrix(
+        new THREE.Matrix4().makeBasis(bodyRight, bodyUp, bodyForward),
+      );
       goose.legs.visible = false;
       goose.leftWing.scale.set(1, 1, 1);
       goose.rightWing.scale.set(1, 1, 1);
@@ -2957,7 +4856,12 @@ export function createGooseEngine(
 
     if (tumbleRemaining > 0) {
       const tumble = new THREE.Quaternion().setFromEuler(
-        new THREE.Euler(tumbleAngle * 0.72, tumbleAngle, tumbleAngle * 0.48, 'YXZ'),
+        new THREE.Euler(
+          tumbleAngle * 0.72,
+          tumbleAngle,
+          tumbleAngle * 0.48,
+          'YXZ',
+        ),
       );
       goose.root.quaternion.multiply(tumble).normalize();
     }
@@ -2965,22 +4869,35 @@ export function createGooseEngine(
 
   const updateCamera = (dt: number, pose: SimState, immediate = false) => {
     const inputBlend = immediate ? 1 : 1 - Math.exp(-12 * dt);
-    cameraDistanceScale = lerp(cameraDistanceScale, cameraDistanceTarget, inputBlend);
+    cameraDistanceScale = lerp(
+      cameraDistanceScale,
+      cameraDistanceTarget,
+      inputBlend,
+    );
     const yawDelta = Math.atan2(
       Math.sin(cameraOrbitYawTarget - cameraOrbitYaw),
       Math.cos(cameraOrbitYawTarget - cameraOrbitYaw),
     );
     cameraOrbitYaw += yawDelta * inputBlend;
-    cameraOrbitPitch = lerp(cameraOrbitPitch, cameraOrbitPitchTarget, inputBlend);
+    cameraOrbitPitch = lerp(
+      cameraOrbitPitch,
+      cameraOrbitPitchTarget,
+      inputBlend,
+    );
 
     const horizontal = new THREE.Vector3(pose.forward.x, 0, pose.forward.z);
-    if (horizontal.lengthSq() < 0.01) horizontal.set(Math.sin(pose.heading), 0, Math.cos(pose.heading));
+    if (horizontal.lengthSq() < 0.01)
+      horizontal.set(Math.sin(pose.heading), 0, Math.cos(pose.heading));
     horizontal.normalize();
     const speed = clamp(pose.velocity.length(), 8, 26);
     const isFlying = pose.mode === 'flying' || pose.mode === 'planing';
     const orbitOrigin = pose.position.clone().addScaledVector(UP, 0.65);
-    const radial = horizontal.clone().multiplyScalar(-1).applyAxisAngle(UP, cameraOrbitYaw);
-    const distance = (isFlying ? 7.25 + 0.025 * speed : 5.65) * cameraDistanceScale;
+    const radial = horizontal
+      .clone()
+      .multiplyScalar(-1)
+      .applyAxisAngle(UP, cameraOrbitYaw);
+    const distance =
+      (isFlying ? 8.7 + 0.035 * speed : 5.65) * cameraDistanceScale;
     const desiredPosition = orbitOrigin
       .clone()
       .addScaledVector(radial, distance * Math.cos(cameraOrbitPitch))
@@ -2990,13 +4907,15 @@ export function createGooseEngine(
     // Raising it to the roof (the old behavior) changed the real camera distance
     // and made zoom clicks appear to do nothing beside large buildings.
     let obstructionTime = 1;
-    for (const building of buildingColliders) {
+    refreshActiveBuildingColliders();
+    for (const building of activeBuildingColliders) {
       if (
         Math.max(orbitOrigin.x, desiredPosition.x) < building.minX - 0.3 ||
         Math.min(orbitOrigin.x, desiredPosition.x) > building.maxX + 0.3 ||
         Math.max(orbitOrigin.z, desiredPosition.z) < building.minZ - 0.3 ||
         Math.min(orbitOrigin.z, desiredPosition.z) > building.maxZ + 0.3
-      ) continue;
+      )
+        continue;
       const crossing = firstBuildingCrossing(
         orbitOrigin.x,
         orbitOrigin.z,
@@ -3031,8 +4950,15 @@ export function createGooseEngine(
       desiredPosition.y += Math.sin(elapsedTime * 117 + 0.6) * 0.3 * shake;
       desiredPosition.z += Math.cos(elapsedTime * 83) * 0.48 * shake;
     }
-    const lookAhead = (isFlying ? 1.8 : 0.7) * Math.max(0, Math.cos(cameraOrbitYaw));
-    const desiredTarget = orbitOrigin.clone().addScaledVector(horizontal, lookAhead);
+    const lookAhead =
+      (isFlying ? 1.2 : 0.7) * Math.max(0, Math.cos(cameraOrbitYaw));
+    const terrainLookDown = isFlying
+      ? lerp(0.35, 1.2, smoothstep(6, 78, pose.position.y - pose.ground))
+      : 0;
+    const desiredTarget = orbitOrigin
+      .clone()
+      .addScaledVector(horizontal, lookAhead)
+      .addScaledVector(UP, -terrainLookDown);
     const positionBlend = immediate ? 1 : 1 - Math.exp(-5 * dt);
     const targetBlend = immediate ? 1 : 1 - Math.exp(-7 * dt);
     cameraPosition.lerp(desiredPosition, positionBlend);
@@ -3070,19 +4996,70 @@ export function createGooseEngine(
   const emitTelemetry = () => {
     const horizontalSpeed = Math.hypot(state.velocity.x, state.velocity.z);
     const sink = -state.velocity.y;
-    const nearestNpc = campusNpcs.reduce<{ distance: number; npc: CampusNpc } | null>((nearest, npc) => {
+    const nearestNpc = campusNpcs.reduce<{
+      distance: number;
+      npc: CampusNpc;
+    } | null>((nearest, npc) => {
       const distance = Math.hypot(
         npc.position.x - state.position.x,
         npc.position.z - state.position.z,
       );
-      return nearest === null || distance < nearest.distance ? { distance, npc } : nearest;
+      return nearest === null || distance < nearest.distance
+        ? { distance, npc }
+        : nearest;
     }, null);
-    const studentsNearby = campusNpcs.reduce((count, npc) => (
-      Math.hypot(npc.position.x - state.position.x, npc.position.z - state.position.z) <= 55
-        ? count + 1
-        : count
-    ), 0);
-    const insideBuilding = buildingColliders.some((building) => {
+    const studentsNearby = campusNpcs.reduce(
+      (count, npc) =>
+        Math.hypot(
+          npc.position.x - state.position.x,
+          npc.position.z - state.position.z,
+        ) <= 55
+          ? count + 1
+          : count,
+      0,
+    );
+    const studentsOnMappedWalkways = campusNpcs.reduce(
+      (count, npc) => count + (npc.route.isMappedWalkway ? 1 : 0),
+      0,
+    );
+    const nearestSecret = campusSecrets.reduce<{
+      secret: CampusSecret;
+      distance: number;
+    } | null>((nearest, secret) => {
+      if (secret.found) return nearest;
+      const distance = Math.hypot(
+        secret.position.x - state.position.x,
+        secret.position.z - state.position.z,
+      );
+      return nearest === null || distance < nearest.distance
+        ? { secret, distance }
+        : nearest;
+    }, null);
+    const duckCouncil = campusSecrets.find(
+      (secret) => secret.id === 'duck-council',
+    );
+    const cameraBearing = state.heading + cameraOrbitYaw;
+    const secretBearing = nearestSecret
+      ? Math.atan2(
+          nearestSecret.secret.position.x - state.position.x,
+          nearestSecret.secret.position.z - state.position.z,
+        )
+      : cameraBearing;
+    const nearestSecretDirection =
+      Math.atan2(
+        Math.sin(secretBearing - cameraBearing),
+        Math.cos(secretBearing - cameraBearing),
+      ) / DEG;
+    const agl = Math.max(0, state.position.y - state.ground);
+    const altitudeBoost = altitudeBoostActive
+      ? lerp(
+          0.35,
+          1,
+          smoothstep(ALTITUDE_BOOST_HEIGHT, ALTITUDE_BOOST_FULL_HEIGHT, agl),
+        )
+      : 0;
+    refreshActiveBuildingColliders();
+    const insideBuilding = activeBuildingColliders.some((building) => {
       const roof = building.ground + building.height;
       return (
         state.position.y < roof - 0.015 &&
@@ -3090,11 +5067,21 @@ export function createGooseEngine(
         pointInBuilding(state.position.x, state.position.z, building)
       );
     });
+    const projectedGoose = state.position
+      .clone()
+      .applyMatrix4(camera.projectionMatrix);
+    const mapCanvas = map.getCanvas();
     hooks.onTelemetry({
-      speed: state.mode === 'flying' || state.mode === 'planing' ? state.velocity.length() : horizontalSpeed,
-      agl: Math.max(0, state.position.y - state.ground),
+      speed:
+        state.mode === 'flying' || state.mode === 'planing'
+          ? state.velocity.length()
+          : horizontalSpeed,
+      agl,
       sink,
-      glideRatio: state.mode === 'flying' && sink > 0.2 ? clamp(horizontalSpeed / sink, 0, 99) : null,
+      glideRatio:
+        state.mode === 'flying' && sink > 0.2
+          ? clamp(horizontalSpeed / sink, 0, 99)
+          : null,
       stamina: state.stamina,
       stall: state.stall,
       mode: state.mode,
@@ -3102,10 +5089,24 @@ export function createGooseEngine(
       combo: chaosCombo,
       secretsFound,
       secretsTotal: campusSecrets.length,
+      secretVisuals: campusSecrets.filter((secret) => secret.group.visible)
+        .length,
+      nearestSecretLabel: nearestSecret?.secret.group.name ?? null,
+      nearestSecretDistance: nearestSecret?.distance ?? null,
+      nearestSecretDirection,
+      nearestSecretBearing: secretBearing / DEG,
       students: campusNpcs.length,
       studentsNearby,
+      studentsOnMappedWalkways,
       nearestStudent: nearestNpc?.distance ?? null,
-      nearestStudentVertical: nearestNpc ? nearestNpc.npc.position.y - state.ground : null,
+      nearestStudentVertical: nearestNpc
+        ? nearestNpc.npc.position.y - state.ground
+        : null,
+      trees: WMU_TREE_POINTS.length,
+      treesResolved: WMU_TREE_POINTS.length - unresolvedTreeCount,
+      flockSize: recruitedFlockCount,
+      flockTotal: flockGeese.length,
+      altitudeBoost,
       groundElevation: state.ground,
       east: state.position.x,
       north: state.position.z,
@@ -3114,17 +5115,28 @@ export function createGooseEngine(
       cameraZoom: map.getZoom(),
       cameraScale: cameraDistanceScale,
       insideBuilding,
+      renderCalls: lastRenderCalls,
+      gooseVisible: goose.root.visible,
+      gooseScreenX: (projectedGoose.x * 0.5 + 0.5) * mapCanvas.clientWidth,
+      gooseScreenY: (-projectedGoose.y * 0.5 + 0.5) * mapCanvas.clientHeight,
+      duckCouncilEast: duckCouncil?.position.x ?? 0,
+      duckCouncilNorth: duckCouncil?.position.z ?? 0,
+      duckCouncilVisible: duckCouncil?.group.visible ?? false,
     });
   };
 
-  const resetState = (clearProgress = false) => {
+  const resetState = (clearProgress = false, updateView = true) => {
     const spawnPoint = new THREE.Vector2(0, 0);
     for (let attempt = 0; attempt < 6; attempt += 1) {
       const containingBuilding = buildingColliders.find((building) =>
         pointInBuilding(spawnPoint.x, spawnPoint.y, building),
       );
       if (!containingBuilding) break;
-      const boundary = closestBuildingBoundary(spawnPoint.x, spawnPoint.y, containingBuilding);
+      const boundary = closestBuildingBoundary(
+        spawnPoint.x,
+        spawnPoint.y,
+        containingBuilding,
+      );
       let outwardX = boundary.x - spawnPoint.x;
       let outwardZ = boundary.z - spawnPoint.y;
       const outwardLength = Math.hypot(outwardX, outwardZ) || 1;
@@ -3135,7 +5147,11 @@ export function createGooseEngine(
     const spawnGround = terrainAt(spawnPoint.x, spawnPoint.y, state.ground);
     campusGroundFallback = spawnGround;
     state.ground = spawnGround;
-    state.position.set(spawnPoint.x, spawnGround + SPAWN_ALTITUDE, spawnPoint.y);
+    state.position.set(
+      spawnPoint.x,
+      spawnGround + SPAWN_ALTITUDE,
+      spawnPoint.y,
+    );
     state.velocity.set(0, -0.4, 16.2);
     state.forward.set(0, 0, 1);
     state.heading = 0;
@@ -3176,6 +5192,7 @@ export function createGooseEngine(
     waterSprayClock = 0;
     waterContactLatched = false;
     waterContactReleaseTime = 0;
+    altitudeBoostActive = false;
     cameraDistanceScale = 1;
     cameraDistanceTarget = 1;
     cameraOrbitYaw = 0;
@@ -3186,7 +5203,12 @@ export function createGooseEngine(
     accumulator = 0;
     relocateNearbyCrowd(true);
     campusNpcs.forEach((npc, index) => {
-      campusNpcs[index] = createCampusNpc(index, npc.route, npc.distance, npcTerrainAt);
+      campusNpcs[index] = createCampusNpc(
+        index,
+        npc.route,
+        npc.distance,
+        npcTerrainAt,
+      );
     });
     for (const wave of honkWaves.splice(0)) {
       scene.remove(wave.mesh);
@@ -3196,10 +5218,29 @@ export function createGooseEngine(
     cameraPosition.set(spawnPoint.x, state.position.y + 2.8, spawnPoint.y - 5);
     cameraTarget.set(spawnPoint.x, state.position.y + 0.65, spawnPoint.y + 1.8);
     sampleSurface();
+    refreshActiveBuildingColliders(true);
+    settleFlockRoosts();
+    updateTrees(false);
+    campusSecrets.forEach((secret) => {
+      if (!secret.terrainResolved) {
+        secret.position.y = campusGroundFallback + secret.altitude;
+        secret.group.position.y = secret.position.y;
+        secret.group.userData.baseY = secret.position.y;
+      }
+    });
+    if (clearProgress) {
+      recruitedFlockCount = 0;
+      flockGeese.forEach((member) => {
+        member.recruited = false;
+        member.position.set(member.home.x, member.ground + 0.04, member.home.y);
+      });
+    }
     copyState(previousState, state);
     copyState(renderState, state);
     updateGoosePose(renderState);
-    updateCamera(1 / 60, renderState, true);
+    updateFlockVisuals(0, renderState);
+    setGameplayVisibility(playing);
+    if (updateView) updateCamera(1 / 60, renderState, true);
     emitTelemetry();
   };
 
@@ -3218,10 +5259,13 @@ export function createGooseEngine(
     render(_gl, args) {
       if (!renderer) return;
       camera.projectionMatrix
-        .copy(new THREE.Matrix4().fromArray(args.defaultProjectionData.mainMatrix))
+        .copy(
+          new THREE.Matrix4().fromArray(args.defaultProjectionData.mainMatrix),
+        )
         .multiply(localToMap);
       renderer.resetState();
       renderer.render(scene, camera);
+      lastRenderCalls = renderer.info.render.calls;
     },
     onRemove() {
       renderer?.dispose();
@@ -3232,16 +5276,28 @@ export function createGooseEngine(
   map.addLayer(customLayer, customLayerBeforeId);
 
   const onIdle = () => {
+    collectMappedWaterAreas();
     const hadTraffic = trafficBuilt;
     buildTraffic();
     const crowdChanged = collectPedestrianRoutes();
-    const buildingsChanged = buildTexturedBuildings();
+    const buildingsChanged =
+      buildingColliders.length === 0 ? buildTexturedBuildings() : false;
     const treesChanged = unresolvedTreeCount > 0 ? updateTrees(true) : false;
     if (!hadTraffic && trafficBuilt) updateTrafficVisuals(1);
-    if ((!hadTraffic && trafficBuilt) || crowdChanged || buildingsChanged || treesChanged) map.triggerRepaint();
+    if (
+      (!hadTraffic && trafficBuilt) ||
+      crowdChanged ||
+      buildingsChanged ||
+      treesChanged
+    )
+      map.triggerRepaint();
   };
   const onSourceData = (event: MapSourceDataEvent) => {
-    if (event.sourceId !== buildingSourceId) return;
+    if (
+      event.sourceId !== buildingSourceId ||
+      event.sourceDataType !== 'content'
+    )
+      return;
     buildingRefreshRequested = true;
   };
   map.on('idle', onIdle);
@@ -3256,22 +5312,28 @@ export function createGooseEngine(
     buildingRefreshClock = Math.max(0, buildingRefreshClock - frameDt);
     if (buildingRefreshRequested && buildingRefreshClock <= 0) {
       buildingRefreshRequested = false;
-      buildingRefreshClock = 0.45;
+      buildingRefreshClock = 0.85;
       if (buildTexturedBuildings()) map.triggerRepaint();
     }
     if (playing) {
       accumulator += frameDt;
       let steps = 0;
-      while (accumulator >= fixedStep && steps < 8) {
+      while (accumulator >= fixedStep && steps < 5) {
         copyState(previousState, state);
         simulate(fixedStep);
         accumulator -= fixedStep;
         steps += 1;
       }
-      if (steps >= 8) accumulator = 0;
+      if (steps >= 5) accumulator = 0;
       interpolateState(accumulator / fixedStep);
       if (trafficBuilt) updateTrafficVisuals(accumulator / fixedStep);
-      if (campusNpcs.length > 0) updateCrowdVisuals(crowdFleet, campusNpcs, accumulator / fixedStep, elapsedTime);
+      if (campusNpcs.length > 0)
+        updateCrowdVisuals(
+          crowdFleet,
+          campusNpcs,
+          accumulator / fixedStep,
+          elapsedTime,
+        );
       treeRefreshClock -= frameDt;
       if (unresolvedTreeCount > 0 && treeRefreshClock <= 0) {
         treeRefreshClock = 1.25;
@@ -3281,32 +5343,43 @@ export function createGooseEngine(
     updateSplashes(frameDt);
     updateHonkWaves(frameDt);
     updateGoosePose(renderState);
-    if (playing) updateCamera(frameDt, renderState);
+    if (playing) {
+      updateFlockVisuals(frameDt, renderState);
+      updateCamera(frameDt, renderState);
+    }
     telemetryClock -= frameDt;
     if (telemetryClock <= 0) {
       telemetryClock = 0.1;
       emitTelemetry();
     }
-    if (playing || splashes.length > 0 || honkWaves.length > 0) map.triggerRepaint();
+    if (playing || splashes.length > 0 || honkWaves.length > 0)
+      map.triggerRepaint();
     animationFrame = requestAnimationFrame(frame);
   };
 
-  resetState(true);
+  resetState(true, false);
   animationFrame = requestAnimationFrame(frame);
 
   return {
     start() {
       unlockAudio();
       playing = true;
+      setGameplayVisibility(true);
       previousTime = performance.now();
-      hooks.onToast('Twenty-five campus secrets are out there — honk, bonk, and terrorize the crowds');
+      updateCamera(1 / 60, renderState, true);
+      hooks.onToast(
+        'Twenty-six campus secrets are live — find the runaway WMU Bronco and build your flock',
+      );
     },
     reset() {
       unlockAudio();
-      resetState();
       playing = true;
+      resetState();
+      setGameplayVisibility(true);
       previousTime = performance.now();
-      hooks.onToast('Respawned above WMU — your secret discoveries and score are safe');
+      hooks.onToast(
+        'Respawned above WMU — your secret discoveries and score are safe',
+      );
     },
     setKey(code, pressed) {
       if (pressed) {
@@ -3323,14 +5396,24 @@ export function createGooseEngine(
       }
     },
     scaleCameraZoom(multiplier) {
-      cameraDistanceTarget = clamp(cameraDistanceTarget * multiplier, 0.28, 3.4);
+      cameraDistanceTarget = clamp(
+        cameraDistanceTarget * multiplier,
+        0.28,
+        3.4,
+      );
       cameraDistanceScale = cameraDistanceTarget;
       updateCamera(1 / 60, renderState, true);
       map.triggerRepaint();
     },
     orbitCamera(yawDelta, pitchDelta) {
-      cameraOrbitYawTarget = (cameraOrbitYawTarget + yawDelta + Math.PI * 3) % (Math.PI * 2) - Math.PI;
-      cameraOrbitPitchTarget = clamp(cameraOrbitPitchTarget + pitchDelta, 10 * DEG, 72 * DEG);
+      cameraOrbitYawTarget =
+        ((cameraOrbitYawTarget + yawDelta + Math.PI * 3) % (Math.PI * 2)) -
+        Math.PI;
+      cameraOrbitPitchTarget = clamp(
+        cameraOrbitPitchTarget + pitchDelta,
+        10 * DEG,
+        72 * DEG,
+      );
       map.triggerRepaint();
     },
     resetCamera() {
@@ -3354,9 +5437,14 @@ export function createGooseEngine(
         audioContext = null;
       }
       scene.traverse((object) => {
-        if (object instanceof THREE.Mesh || object instanceof THREE.InstancedMesh) {
+        if (
+          object instanceof THREE.Mesh ||
+          object instanceof THREE.InstancedMesh
+        ) {
           object.geometry.dispose();
-          const materials = Array.isArray(object.material) ? object.material : [object.material];
+          const materials = Array.isArray(object.material)
+            ? object.material
+            : [object.material];
           materials.forEach((material) => material.dispose());
         }
       });

@@ -7,11 +7,16 @@ export type CrowdRoute = {
   cumulative: number[];
   total: number;
   sidewalkOffset?: number;
+  isMappedWalkway?: boolean;
 };
 
 export type CampusNpcMode = 'walk' | 'flee' | 'ragdoll' | 'recover';
 
-export type GroundSampler = (east: number, north: number, fallback: number) => number;
+export type GroundSampler = (
+  east: number,
+  north: number,
+  fallback: number,
+) => number;
 
 export type CampusNpc = {
   index: number;
@@ -68,17 +73,15 @@ const RECOVERY_DURATION = 0.9;
 const TWO_PI = Math.PI * 2;
 
 const SHIRT_COLORS = [
-  0x7b3f93,
-  0xd29a2e,
-  0x3f7295,
-  0x4f7a55,
-  0xa94e45,
-  0xd6d1c5,
-  0x313940,
+  0x7b3f93, 0xd29a2e, 0x3f7295, 0x4f7a55, 0xa94e45, 0xd6d1c5, 0x313940,
   0x835d42,
 ];
-const TROUSERS_COLORS = [0x24313a, 0x3f4548, 0x43536b, 0x675c4e, 0x202326, 0x6d6a61];
-const SKIN_COLORS = [0xf2c7a2, 0xd99f76, 0xb97952, 0x865236, 0x5f3828, 0xe8b991];
+const TROUSERS_COLORS = [
+  0x24313a, 0x3f4548, 0x43536b, 0x675c4e, 0x202326, 0x6d6a61,
+];
+const SKIN_COLORS = [
+  0xf2c7a2, 0xd99f76, 0xb97952, 0x865236, 0x5f3828, 0xe8b991,
+];
 
 const samplePosition = new THREE.Vector3();
 const sampleDirection = new THREE.Vector3();
@@ -104,7 +107,8 @@ function smoothstep(value: number) {
 }
 
 function random01(index: number, salt: number) {
-  let value = Math.imul(index + 1, 0x45d9f3b) ^ Math.imul(salt + 11, 0x27d4eb2d);
+  let value =
+    Math.imul(index + 1, 0x45d9f3b) ^ Math.imul(salt + 11, 0x27d4eb2d);
   value = Math.imul(value ^ (value >>> 16), 0x45d9f3b);
   value ^= value >>> 16;
   return (value >>> 0) / 4_294_967_296;
@@ -136,7 +140,10 @@ function sampleCrowdRoute(
   }
   const index = clamp(low, 1, route.points.length - 1);
   const startDistance = route.cumulative[index - 1];
-  const segmentLength = Math.max(route.cumulative[index] - startDistance, 0.001);
+  const segmentLength = Math.max(
+    route.cumulative[index] - startDistance,
+    0.001,
+  );
   const t = clamp((routeDistance - startDistance) / segmentLength, 0, 1);
   position.lerpVectors(route.points[index - 1], route.points[index], t);
   direction.copy(route.points[index]).sub(route.points[index - 1]);
@@ -148,7 +155,10 @@ function sampleCrowdRoute(
 function advanceNpcDistance(npc: CampusNpc, amount: number) {
   npc.distance += amount * npc.directionSign;
   let reflections = 0;
-  while ((npc.distance < 0 || npc.distance > npc.route.total) && reflections < 4) {
+  while (
+    (npc.distance < 0 || npc.distance > npc.route.total) &&
+    reflections < 4
+  ) {
     if (npc.distance > npc.route.total) {
       npc.distance = npc.route.total * 2 - npc.distance;
       npc.directionSign = -1;
@@ -172,7 +182,9 @@ function updateRoutePosition(
   sampleRight.set(npc.direction.z, 0, -npc.direction.x);
   const panicAmount = npc.mode === 'flee' ? 1 : 0;
   const lateralWeave =
-    Math.sin(elapsed * (7.5 + random01(npc.index, 7) * 2.5) + npc.index * 1.31) *
+    Math.sin(
+      elapsed * (7.5 + random01(npc.index, 7) * 2.5) + npc.index * 1.31,
+    ) *
     (0.035 + panicAmount * 0.3);
   samplePosition.addScaledVector(sampleRight, npc.laneOffset + lateralWeave);
 
@@ -188,7 +200,8 @@ function updateRoutePosition(
     );
   }
   npc.ground +=
-    (npc.targetGround - npc.ground) * (1 - Math.exp(-(npc.mode === 'flee' ? 12 : 8) * dt));
+    (npc.targetGround - npc.ground) *
+    (1 - Math.exp(-(npc.mode === 'flee' ? 12 : 8) * dt));
   npc.position.set(samplePosition.x, npc.ground, samplePosition.z);
 }
 
@@ -197,7 +210,12 @@ function beginRecovery(npc: CampusNpc, groundAt: GroundSampler) {
   sampleDirection.multiplyScalar(npc.directionSign);
   sampleRight.set(sampleDirection.z, 0, -sampleDirection.x);
   samplePosition.addScaledVector(sampleRight, npc.laneOffset);
-  npc.ground = safeGround(groundAt, samplePosition.x, samplePosition.z, npc.ground);
+  npc.ground = safeGround(
+    groundAt,
+    samplePosition.x,
+    samplePosition.z,
+    npc.ground,
+  );
   npc.targetGround = npc.ground;
   npc.recoveryStart.copy(npc.position);
   npc.recoveryTarget.set(
@@ -207,7 +225,12 @@ function beginRecovery(npc: CampusNpc, groundAt: GroundSampler) {
   );
   npc.recoveryStartRotation.copy(npc.ragdollRotation);
   npc.direction.copy(sampleDirection);
-  uprightEuler.set(0, Math.atan2(sampleDirection.x, sampleDirection.z), 0, 'YXZ');
+  uprightEuler.set(
+    0,
+    Math.atan2(sampleDirection.x, sampleDirection.z),
+    0,
+    'YXZ',
+  );
   uprightRotation.setFromEuler(uprightEuler);
   npc.mode = 'recover';
   npc.modeTime = 0;
@@ -236,12 +259,36 @@ export function createCrowdFleet(capacity: number): CrowdFleet {
   const torsoGeometry = new THREE.BoxGeometry(0.38, 0.62, 0.24);
   const armGeometry = new THREE.CylinderGeometry(0.045, 0.055, 0.6, 6);
   const legGeometry = new THREE.CylinderGeometry(0.06, 0.075, 0.76, 6);
-  const heads = new THREE.InstancedMesh(headGeometry, skinMaterial, safeCapacity);
-  const torsos = new THREE.InstancedMesh(torsoGeometry, shirtMaterial, safeCapacity);
-  const leftArms = new THREE.InstancedMesh(armGeometry, shirtMaterial, safeCapacity);
-  const rightArms = new THREE.InstancedMesh(armGeometry, shirtMaterial, safeCapacity);
-  const leftLegs = new THREE.InstancedMesh(legGeometry, trousersMaterial, safeCapacity);
-  const rightLegs = new THREE.InstancedMesh(legGeometry, trousersMaterial, safeCapacity);
+  const heads = new THREE.InstancedMesh(
+    headGeometry,
+    skinMaterial,
+    safeCapacity,
+  );
+  const torsos = new THREE.InstancedMesh(
+    torsoGeometry,
+    shirtMaterial,
+    safeCapacity,
+  );
+  const leftArms = new THREE.InstancedMesh(
+    armGeometry,
+    shirtMaterial,
+    safeCapacity,
+  );
+  const rightArms = new THREE.InstancedMesh(
+    armGeometry,
+    shirtMaterial,
+    safeCapacity,
+  );
+  const leftLegs = new THREE.InstancedMesh(
+    legGeometry,
+    trousersMaterial,
+    safeCapacity,
+  );
+  const rightLegs = new THREE.InstancedMesh(
+    legGeometry,
+    trousersMaterial,
+    safeCapacity,
+  );
 
   const meshes = [heads, torsos, leftArms, rightArms, leftLegs, rightLegs];
   meshes.forEach((mesh) => {
@@ -278,18 +325,27 @@ export function createCampusNpc(
     !Number.isFinite(route.total) ||
     route.total <= 0.1
   ) {
-    throw new Error('Campus NPC routes need at least two points and a positive length.');
+    throw new Error(
+      'Campus NPC routes need at least two points and a positive length.',
+    );
   }
 
   const routeDistance = clamp(distance, 0, route.total);
   const directionSign = (index % 2 === 0 ? 1 : -1) as -1 | 1;
   const sidewalkSide = random01(index, 2) < 0.5 ? -1 : 1;
-  const laneOffset = sidewalkSide * (route.sidewalkOffset ?? 0) + (random01(index, 1) - 0.5) * 1.1;
+  const laneOffset =
+    sidewalkSide * (route.sidewalkOffset ?? 0) +
+    (random01(index, 1) - 0.5) * 1.1;
   sampleCrowdRoute(route, routeDistance, samplePosition, sampleDirection);
   sampleDirection.multiplyScalar(directionSign);
   sampleRight.set(sampleDirection.z, 0, -sampleDirection.x);
   samplePosition.addScaledVector(sampleRight, laneOffset);
-  const ground = safeGround(groundAt, samplePosition.x, samplePosition.z, samplePosition.y);
+  const ground = safeGround(
+    groundAt,
+    samplePosition.x,
+    samplePosition.z,
+    samplePosition.y,
+  );
   const heading = Math.atan2(sampleDirection.x, sampleDirection.z);
   const initialRotation = new THREE.Quaternion().setFromEuler(
     new THREE.Euler(0, heading, 0, 'YXZ'),
@@ -298,7 +354,11 @@ export function createCampusNpc(
   const trousersIndex = Math.floor(random01(index, 5) * TROUSERS_COLORS.length);
   const skinIndex = Math.floor(random01(index, 9) * SKIN_COLORS.length);
   const paletteKey = shirtIndex * 100 + trousersIndex * 10 + skinIndex;
-  const position = new THREE.Vector3(samplePosition.x, ground, samplePosition.z);
+  const position = new THREE.Vector3(
+    samplePosition.x,
+    ground,
+    samplePosition.z,
+  );
 
   return {
     index,
@@ -372,7 +432,8 @@ export function knockDownCampusNpc(npc: CampusNpc, impulse: THREE.Vector3) {
     .multiplyScalar(npc.speed * 0.55)
     .add(impulse);
   const side = impulse.x * npc.direction.z - impulse.z * npc.direction.x;
-  const spinSign = side === 0 ? (npc.index % 2 === 0 ? 1 : -1) : Math.sign(side);
+  const spinSign =
+    side === 0 ? (npc.index % 2 === 0 ? 1 : -1) : Math.sign(side);
   npc.ragdollAngularVelocity.set(
     (3.8 + random01(npc.index, 41) * 3.4) * spinSign,
     (2.2 + random01(npc.index, 43) * 3.1) * -spinSign,
@@ -407,7 +468,12 @@ export function simulateCampusNpc(
     npc.groundRefreshRemaining -= step;
     if (npc.groundRefreshRemaining <= 0) {
       npc.groundRefreshRemaining = 0.06;
-      npc.ground = safeGround(groundAt, npc.position.x, npc.position.z, npc.ground);
+      npc.ground = safeGround(
+        groundAt,
+        npc.position.x,
+        npc.position.z,
+        npc.ground,
+      );
       npc.targetGround = npc.ground;
     }
     npc.ragdollVelocity.y -= RAGDOLL_GRAVITY * step;
@@ -418,7 +484,9 @@ export function simulateCampusNpc(
 
     const angularSpeed = npc.ragdollAngularVelocity.length();
     if (angularSpeed > 0.001) {
-      rotationAxis.copy(npc.ragdollAngularVelocity).multiplyScalar(1 / angularSpeed);
+      rotationAxis
+        .copy(npc.ragdollAngularVelocity)
+        .multiplyScalar(1 / angularSpeed);
       rotationDelta.setFromAxisAngle(rotationAxis, angularSpeed * step);
       npc.ragdollRotation.premultiply(rotationDelta).normalize();
     }
@@ -436,7 +504,10 @@ export function simulateCampusNpc(
       npc.ragdollAngularVelocity.multiplyScalar(Math.exp(-0.55 * step));
     }
 
-    const horizontalSpeed = Math.hypot(npc.ragdollVelocity.x, npc.ragdollVelocity.z);
+    const horizontalSpeed = Math.hypot(
+      npc.ragdollVelocity.x,
+      npc.ragdollVelocity.z,
+    );
     if (
       npc.position.y <= npc.ground + bodyRadius + 0.02 &&
       horizontalSpeed < 0.42 &&
@@ -454,7 +525,11 @@ export function simulateCampusNpc(
 
   if (npc.mode === 'recover') {
     const recoveryBlend = smoothstep(npc.modeTime / RECOVERY_DURATION);
-    npc.position.lerpVectors(npc.recoveryStart, npc.recoveryTarget, recoveryBlend);
+    npc.position.lerpVectors(
+      npc.recoveryStart,
+      npc.recoveryTarget,
+      recoveryBlend,
+    );
     uprightEuler.set(0, Math.atan2(npc.direction.x, npc.direction.z), 0, 'YXZ');
     uprightRotation.setFromEuler(uprightEuler);
     npc.ragdollRotation.slerpQuaternions(
@@ -488,7 +563,8 @@ export function simulateCampusNpc(
   );
   advanceNpcDistance(npc, npc.speed * step);
   updateRoutePosition(npc, elapsed, groundAt, step);
-  npc.gaitPhase = (npc.gaitPhase + npc.speed * step * (fleeing ? 6.8 : 5.2)) % TWO_PI;
+  npc.gaitPhase =
+    (npc.gaitPhase + npc.speed * step * (fleeing ? 6.8 : 5.2)) % TWO_PI;
 }
 
 export function updateCrowdVisuals(
@@ -560,11 +636,22 @@ export function updateCrowdVisuals(
       );
       worldMatrix.compose(rootPosition, rootRotation, rootScale);
       const ragdollAmount =
-        npc.mode === 'ragdoll' ? 1 : 1 - smoothstep(npc.modeTime / RECOVERY_DURATION);
+        npc.mode === 'ragdoll'
+          ? 1
+          : 1 - smoothstep(npc.modeTime / RECOVERY_DURATION);
       const flail =
         Math.sin(elapsed * 11 + npc.index * 1.73) * 0.46 * ragdollAmount;
       placePart(fleet.torsos, index, 0, 0, 0, flail * 0.14);
-      placePart(fleet.heads, index, 0, 0.46, 0.01, flail * 0.2, 0, flail * 0.16);
+      placePart(
+        fleet.heads,
+        index,
+        0,
+        0.46,
+        0.01,
+        flail * 0.2,
+        0,
+        flail * 0.16,
+      );
       placePart(
         fleet.leftArms,
         index,
@@ -608,7 +695,11 @@ export function updateCrowdVisuals(
       continue;
     }
 
-    rootDirection.lerpVectors(npc.previousDirection, npc.direction, interpolation);
+    rootDirection.lerpVectors(
+      npc.previousDirection,
+      npc.direction,
+      interpolation,
+    );
     rootDirection.y = 0;
     if (rootDirection.lengthSq() < 0.0001) rootDirection.copy(npc.direction);
     rootDirection.normalize();
@@ -617,12 +708,26 @@ export function updateCrowdVisuals(
     const gait = Math.sin(npc.gaitPhase + interpolation * npc.speed * 0.08);
     const bob = Math.abs(gait) * (fleeing ? 0.035 : 0.018) * npc.heightScale;
     rootPosition.y += bob;
-    rootEuler.set(fleeing ? 0.09 : 0.015, heading, gait * (fleeing ? 0.035 : 0.012), 'YXZ');
+    rootEuler.set(
+      fleeing ? 0.09 : 0.015,
+      heading,
+      gait * (fleeing ? 0.035 : 0.012),
+      'YXZ',
+    );
     rootRotation.setFromEuler(rootEuler);
     worldMatrix.compose(rootPosition, rootRotation, rootScale);
     const limbSwing = gait * (fleeing ? 0.72 : 0.42);
     placePart(fleet.torsos, index, 0, 1.1, 0);
-    placePart(fleet.heads, index, 0, 1.58, 0.015, 0, fleeing ? gait * 0.08 : 0, 0);
+    placePart(
+      fleet.heads,
+      index,
+      0,
+      1.58,
+      0.015,
+      0,
+      fleeing ? gait * 0.08 : 0,
+      0,
+    );
     placePart(fleet.leftArms, index, -0.25, 1.11, 0, limbSwing, 0, 0.08);
     placePart(fleet.rightArms, index, 0.25, 1.11, 0, -limbSwing, 0, -0.08);
     placePart(fleet.leftLegs, index, -0.11, 0.42, 0, -limbSwing, 0, 0.025);
@@ -645,12 +750,17 @@ export function updateCrowdVisuals(
     fleet.heads.instanceColor.needsUpdate = true;
   }
   if (shirtColorsChanged) {
-    if (fleet.torsos.instanceColor) fleet.torsos.instanceColor.needsUpdate = true;
-    if (fleet.leftArms.instanceColor) fleet.leftArms.instanceColor.needsUpdate = true;
-    if (fleet.rightArms.instanceColor) fleet.rightArms.instanceColor.needsUpdate = true;
+    if (fleet.torsos.instanceColor)
+      fleet.torsos.instanceColor.needsUpdate = true;
+    if (fleet.leftArms.instanceColor)
+      fleet.leftArms.instanceColor.needsUpdate = true;
+    if (fleet.rightArms.instanceColor)
+      fleet.rightArms.instanceColor.needsUpdate = true;
   }
   if (trousersColorsChanged) {
-    if (fleet.leftLegs.instanceColor) fleet.leftLegs.instanceColor.needsUpdate = true;
-    if (fleet.rightLegs.instanceColor) fleet.rightLegs.instanceColor.needsUpdate = true;
+    if (fleet.leftLegs.instanceColor)
+      fleet.leftLegs.instanceColor.needsUpdate = true;
+    if (fleet.rightLegs.instanceColor)
+      fleet.rightLegs.instanceColor.needsUpdate = true;
   }
 }
