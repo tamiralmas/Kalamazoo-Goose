@@ -1,6 +1,7 @@
 'use client';
 
 import {
+  useCallback,
   useEffect,
   useRef,
   useState,
@@ -32,7 +33,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
-import type { Map as MapLibreMap } from 'maplibre-gl';
+import type { Map as MapLibreMap, MapSourceDataEvent } from 'maplibre-gl';
 import type {
   FillExtrusionLayerSpecification,
   FilterSpecification,
@@ -44,6 +45,7 @@ import type { FlightMode, GameTelemetry, GooseEngine } from '@/app/game-engine';
 import { WMU_SPAWN } from '@/app/world-config';
 import {
   AERIAL_ATTRIBUTION,
+  AERIAL_BOUNDS,
   AERIAL_INFORMATION_URL,
   AERIAL_TILE_TEMPLATE,
   getAerialTileUrl,
@@ -173,6 +175,12 @@ type CameraPointer = {
   downAt: number;
 };
 
+type TouchControlPointer = {
+  code: string | null;
+  group: 'direction' | 'action';
+  button: HTMLButtonElement | null;
+};
+
 export function GooseGame() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
@@ -180,25 +188,86 @@ export function GooseGame() {
   const playingRef = useRef(false);
   const toastTimerRef = useRef<number | null>(null);
   const cameraPointersRef = useRef(new Map<number, CameraPointer>());
+  const keyboardCodesRef = useRef(new Set<string>());
+  const touchPointersRef = useRef(new Map<number, TouchControlPointer>());
+  const touchCodesRef = useRef(new Set<string>());
+  const touchPressedButtonsRef = useRef(new Set<HTMLButtonElement>());
   const lastCameraTapRef = useRef(0);
   const [mapReady, setMapReady] = useState(false);
   const [terrainReady, setTerrainReady] = useState(false);
   const [mapError, setMapError] = useState(false);
   const [playing, setPlaying] = useState(false);
   const [minimapOpen, setMinimapOpen] = useState(false);
+  const [minimapTilesEnabled, setMinimapTilesEnabled] = useState(false);
   const [telemetry, setTelemetry] = useState(INITIAL_TELEMETRY);
   const [toast, setToast] = useState<string | null>(null);
+
+  const syncTouchControls = useCallback(() => {
+    const nextCodes = new Set<string>();
+    const nextButtons = new Set<HTMLButtonElement>();
+    touchPointersRef.current.forEach((pointer) => {
+      if (pointer.code) nextCodes.add(pointer.code);
+      if (pointer.button) nextButtons.add(pointer.button);
+    });
+
+    const changedCodes = new Set([...touchCodesRef.current, ...nextCodes]);
+    changedCodes.forEach((code) => {
+      if (touchCodesRef.current.has(code) === nextCodes.has(code)) return;
+      engineRef.current?.setKey(
+        code,
+        nextCodes.has(code) || keyboardCodesRef.current.has(code),
+      );
+    });
+
+    touchPressedButtonsRef.current.forEach((button) => {
+      if (nextButtons.has(button)) return;
+      button.dataset.pressed = 'false';
+      button.setAttribute('aria-pressed', 'false');
+    });
+    nextButtons.forEach((button) => {
+      button.dataset.pressed = 'true';
+      button.setAttribute('aria-pressed', 'true');
+    });
+
+    touchCodesRef.current = nextCodes;
+    touchPressedButtonsRef.current = nextButtons;
+  }, []);
+
+  const releaseTouchPointer = useCallback(
+    (pointerId: number) => {
+      if (!touchPointersRef.current.delete(pointerId)) return;
+      syncTouchControls();
+    },
+    [syncTouchControls],
+  );
+
+  const clearAllControlInputs = useCallback(() => {
+    CONTROL_CODES.forEach((code) => engineRef.current?.setKey(code, false));
+    keyboardCodesRef.current.clear();
+    touchPointersRef.current.clear();
+    touchCodesRef.current.clear();
+    touchPressedButtonsRef.current.forEach((button) => {
+      button.dataset.pressed = 'false';
+      button.setAttribute('aria-pressed', 'false');
+    });
+    touchPressedButtonsRef.current.clear();
+    cameraPointersRef.current.clear();
+  }, []);
 
   useEffect(() => {
     const container = mapContainerRef.current;
     if (!container) return;
-    const cameraPointers = cameraPointersRef.current;
 
     let cancelled = false;
     let loaded = false;
     let terrainTimer: number | null = null;
     let mapCanvas: HTMLCanvasElement | null = null;
     const coarsePointer = window.matchMedia('(any-pointer: coarse)').matches;
+    if (!coarsePointer) {
+      window.requestAnimationFrame(() => {
+        if (!cancelled) setMinimapTilesEnabled(true);
+      });
+    }
     const pixelRatio = Math.min(
       window.devicePixelRatio || 1,
       coarsePointer ? 1.5 : 2,
@@ -213,8 +282,7 @@ export function GooseGame() {
     };
     const onWebglContextLost = (event: Event) => {
       event.preventDefault();
-      CONTROL_CODES.forEach((code) => engineRef.current?.setKey(code, false));
-      cameraPointers.clear();
+      clearAllControlInputs();
       showToast('Graphics paused — restoring the 3D campus…');
     };
 
@@ -253,24 +321,36 @@ export function GooseGame() {
           'bottom-right',
         );
 
-        const installAerialImagery = () => {
-          if (map.getSource('wmug-aerial-imagery')) return;
-          const firstMapLayer = map
+        const previewSourceId = 'wmug-aerial-preview';
+        const fullSourceId = 'wmug-aerial-imagery';
+        let fullAerialTileSeen = false;
+
+        const firstBaseLayerId = () =>
+          map
             .getStyle()
-            .layers?.find((layer) => layer.type !== 'background')?.id;
-          map.addSource('wmug-aerial-imagery', {
+            .layers?.find(
+              (layer) =>
+                layer.type !== 'background' &&
+                layer.id !== previewSourceId &&
+                layer.id !== fullSourceId,
+            )?.id;
+
+        const installAerialLayer = (sourceId: string, tileSize: 256 | 512) => {
+          if (map.getSource(sourceId)) return;
+          map.addSource(sourceId, {
             type: 'raster',
             tiles: [AERIAL_TILE_TEMPLATE],
-            tileSize: 256,
+            tileSize,
             minzoom: 1,
             maxzoom: 19,
+            bounds: AERIAL_BOUNDS,
             attribution: AERIAL_ATTRIBUTION,
           });
           map.addLayer(
             {
-              id: 'wmug-aerial-imagery',
+              id: sourceId,
               type: 'raster',
-              source: 'wmug-aerial-imagery',
+              source: sourceId,
               paint: {
                 'raster-opacity': 1,
                 'raster-saturation': -0.06,
@@ -278,16 +358,35 @@ export function GooseGame() {
                 'raster-brightness-min': 0.04,
                 'raster-brightness-max': 0.98,
                 'raster-fade-duration': 0,
+                'raster-resampling': 'linear',
               },
             },
-            firstMapLayer,
+            firstBaseLayerId(),
           );
         };
 
-        // Add aerial tiles as soon as the style is parsed. MapLibre can then fetch
-        // the ground in parallel with roads and buildings instead of starting the
-        // imagery only after every initial base-map tile has finished.
-        map.on('style.load', installAerialImagery);
+        const installAerialPreview = () =>
+          installAerialLayer(previewSourceId, 512);
+        const installAerialImagery = () =>
+          installAerialLayer(fullSourceId, 256);
+        const retireAerialPreview = (event: MapSourceDataEvent) => {
+          if (!coarsePointer || cancelled || event.sourceId !== fullSourceId)
+            return;
+          if (event.coord) fullAerialTileSeen = true;
+          if (!fullAerialTileSeen || !map.isSourceLoaded(fullSourceId)) return;
+          if (map.getLayer(previewSourceId)) map.removeLayer(previewSourceId);
+          if (map.getSource(previewSourceId)) map.removeSource(previewSourceId);
+          map.off('sourcedata', retireAerialPreview);
+        };
+
+        // Phones first request a one-zoom-lower MiSAIL preview, reducing the
+        // visible startup tile count by roughly 75%. The full original imagery
+        // then streams above it and replaces the preview once the viewport is ready.
+        map.on('style.load', () => {
+          if (coarsePointer) installAerialPreview();
+          else installAerialImagery();
+        });
+        map.on('sourcedata', retireAerialPreview);
 
         map.on('error', () => {
           if (!loaded && !cancelled) setMapError(true);
@@ -536,16 +635,20 @@ export function GooseGame() {
     const onKeyDown = (event: KeyboardEvent) => {
       if (!CONTROL_CODES.includes(event.code)) return;
       if (playingRef.current) event.preventDefault();
+      keyboardCodesRef.current.add(event.code);
       engineRef.current?.setKey(event.code, true);
     };
     const onKeyUp = (event: KeyboardEvent) => {
       if (!CONTROL_CODES.includes(event.code)) return;
-      engineRef.current?.setKey(event.code, false);
+      keyboardCodesRef.current.delete(event.code);
+      engineRef.current?.setKey(
+        event.code,
+        touchCodesRef.current.has(event.code),
+      );
     };
-    const clearControls = () => {
-      CONTROL_CODES.forEach((code) => engineRef.current?.setKey(code, false));
-      cameraPointers.clear();
-    };
+    const clearControls = () => clearAllControlInputs();
+    const onGlobalPointerRelease = (event: PointerEvent) =>
+      releaseTouchPointer(event.pointerId);
     const preventContextMenu = (event: Event) => event.preventDefault();
     const onVisibilityChange = () => {
       if (document.hidden) clearControls();
@@ -567,6 +670,8 @@ export function GooseGame() {
     window.addEventListener('blur', clearControls);
     window.addEventListener('pagehide', clearControls);
     window.addEventListener('orientationchange', clearControls);
+    window.addEventListener('pointerup', onGlobalPointerRelease, true);
+    window.addEventListener('pointercancel', onGlobalPointerRelease, true);
     document.addEventListener('visibilitychange', onVisibilityChange);
     container.addEventListener('contextmenu', preventContextMenu);
     container.addEventListener('wheel', onCameraWheel, { passive: false });
@@ -578,10 +683,12 @@ export function GooseGame() {
       window.removeEventListener('blur', clearControls);
       window.removeEventListener('pagehide', clearControls);
       window.removeEventListener('orientationchange', clearControls);
+      window.removeEventListener('pointerup', onGlobalPointerRelease, true);
+      window.removeEventListener('pointercancel', onGlobalPointerRelease, true);
       document.removeEventListener('visibilitychange', onVisibilityChange);
       container.removeEventListener('contextmenu', preventContextMenu);
       container.removeEventListener('wheel', onCameraWheel);
-      cameraPointers.clear();
+      clearAllControlInputs();
       if (toastTimerRef.current !== null)
         window.clearTimeout(toastTimerRef.current);
       if (terrainTimer !== null) window.clearTimeout(terrainTimer);
@@ -591,11 +698,11 @@ export function GooseGame() {
       mapRef.current?.remove();
       mapRef.current = null;
     };
-  }, []);
+  }, [clearAllControlInputs, releaseTouchPointer]);
 
   const startGame = () => {
     if (!engineRef.current) return;
-    cameraPointersRef.current.clear();
+    clearAllControlInputs();
     playingRef.current = true;
     setPlaying(true);
     engineRef.current.start();
@@ -604,7 +711,7 @@ export function GooseGame() {
 
   const resetGame = () => {
     if (!engineRef.current) return;
-    cameraPointersRef.current.clear();
+    clearAllControlInputs();
     playingRef.current = true;
     setPlaying(true);
     engineRef.current.reset();
@@ -614,17 +721,48 @@ export function GooseGame() {
   const setTouchKey = (
     event: ReactPointerEvent<HTMLButtonElement>,
     code: string,
+    group: TouchControlPointer['group'],
     pressed: boolean,
   ) => {
     event.preventDefault();
-    engineRef.current?.setKey(code, pressed);
+    event.stopPropagation();
     if (pressed) {
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+      touchPointersRef.current.set(event.pointerId, {
+        code,
+        group,
+        button: event.currentTarget,
+      });
+      syncTouchControls();
       try {
         event.currentTarget.setPointerCapture(event.pointerId);
       } catch {
         // The input was already recorded; capture only helps guarantee release cleanup.
       }
+      return;
     }
+    releaseTouchPointer(event.pointerId);
+  };
+
+  const moveTouchDirection = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const pointer = touchPointersRef.current.get(event.pointerId);
+    if (!pointer || pointer.group !== 'direction') return;
+    event.preventDefault();
+    event.stopPropagation();
+    const target = document.elementFromPoint(event.clientX, event.clientY);
+    const candidate = target?.closest<HTMLButtonElement>(
+      'button[data-control-group="direction"]',
+    );
+    const nextButton =
+      candidate && event.currentTarget.contains(candidate) ? candidate : null;
+    const nextCode = nextButton?.dataset.controlCode ?? null;
+    if (pointer.code === nextCode && pointer.button === nextButton) return;
+    touchPointersRef.current.set(event.pointerId, {
+      ...pointer,
+      code: nextCode,
+      button: nextButton,
+    });
+    syncTouchControls();
   };
 
   const setCameraPointer = (
@@ -636,7 +774,9 @@ export function GooseGame() {
       const target = event.target;
       if (
         target instanceof Element &&
-        target.closest('.maplibregl-control-container')
+        target.closest(
+          '.maplibregl-control-container, .mobile-controls, .camera-toolbar, .campus-minimap',
+        )
       )
         return;
       if (event.pointerType === 'mouse' && event.button !== 0) return;
@@ -685,14 +825,16 @@ export function GooseGame() {
     if (!previous) return;
     event.preventDefault();
     if (cameraPointersRef.current.size === 1) {
+      const yawSensitivity = event.pointerType === 'touch' ? 0.0036 : 0.0045;
+      const pitchSensitivity = event.pointerType === 'touch' ? 0.0028 : 0.0035;
       cameraPointersRef.current.set(event.pointerId, {
         ...previous,
         x: event.clientX,
         y: event.clientY,
       });
       engineRef.current?.orbitCamera(
-        -(event.clientX - previous.x) * 0.0045,
-        -(event.clientY - previous.y) * 0.0035,
+        -(event.clientX - previous.x) * yawSensitivity,
+        -(event.clientY - previous.y) * pitchSensitivity,
       );
       return;
     }
@@ -722,6 +864,12 @@ export function GooseGame() {
     if (oldDistance > 1 && newDistance > 1) {
       engineRef.current?.scaleCameraZoom(oldDistance / newDistance);
     }
+  };
+
+  const toggleMinimap = () => {
+    const nextOpen = !minimapOpen;
+    setMinimapOpen(nextOpen);
+    if (nextOpen) setMinimapTilesEnabled(true);
   };
 
   const mode = modeCopy[telemetry.mode];
@@ -1083,7 +1231,7 @@ export function GooseGame() {
               className="minimap-mobile-toggle"
               aria-expanded={minimapOpen}
               aria-controls="campus-minimap-panel"
-              onClick={() => setMinimapOpen((open) => !open)}
+              onClick={toggleMinimap}
             >
               <MapPin />
               <span>
@@ -1102,14 +1250,15 @@ export function GooseGame() {
                   style={minimapTileStyle}
                   aria-hidden="true"
                 >
-                  {MINIMAP_TILES.map((tile) => (
-                    <span
-                      key={tile.key}
-                      className="minimap-tile"
-                      aria-hidden="true"
-                      style={tile.style}
-                    />
-                  ))}
+                  {minimapTilesEnabled &&
+                    MINIMAP_TILES.map((tile) => (
+                      <span
+                        key={tile.key}
+                        className="minimap-tile"
+                        aria-hidden="true"
+                        style={tile.style}
+                      />
+                    ))}
                 </div>
                 <span className="minimap-north" aria-hidden="true">
                   N
@@ -1139,14 +1288,14 @@ export function GooseGame() {
                 target="_blank"
                 rel="noreferrer"
               >
-                Esri World Imagery (Clarity) · contributors
+                MiSAIL imagery · State of Michigan
               </a>
             </div>
           </aside>
 
           {telemetry.altitudeBoost > 0 && (
             <div className="jetstream-indicator">
-              <Wind /> JETSTREAM · +{Math.round(telemetry.altitudeBoost * 16)}%
+              <Wind /> JETSTREAM · +{Math.round(telemetry.altitudeBoost * 21)}%
               TOP SPEED
             </div>
           )}
@@ -1206,47 +1355,91 @@ export function GooseGame() {
           </div>
 
           <div className="mobile-controls" aria-label="Touch flight controls">
-            <div className="touch-pad">
+            <div className="touch-pad" onPointerMove={moveTouchDirection}>
               <button
+                type="button"
                 aria-label="Dive"
-                onPointerDown={(event) => setTouchKey(event, 'KeyW', true)}
-                onPointerUp={(event) => setTouchKey(event, 'KeyW', false)}
-                onPointerCancel={(event) => setTouchKey(event, 'KeyW', false)}
+                aria-pressed="false"
+                data-control-code="KeyW"
+                data-control-group="direction"
+                data-pressed="false"
+                onPointerDown={(event) =>
+                  setTouchKey(event, 'KeyW', 'direction', true)
+                }
+                onPointerUp={(event) =>
+                  setTouchKey(event, 'KeyW', 'direction', false)
+                }
+                onPointerCancel={(event) =>
+                  setTouchKey(event, 'KeyW', 'direction', false)
+                }
                 onLostPointerCapture={(event) =>
-                  setTouchKey(event, 'KeyW', false)
+                  setTouchKey(event, 'KeyW', 'direction', false)
                 }
               >
                 <ChevronUp />
               </button>
               <button
+                type="button"
                 aria-label="Bank left"
-                onPointerDown={(event) => setTouchKey(event, 'KeyA', true)}
-                onPointerUp={(event) => setTouchKey(event, 'KeyA', false)}
-                onPointerCancel={(event) => setTouchKey(event, 'KeyA', false)}
+                aria-pressed="false"
+                data-control-code="KeyA"
+                data-control-group="direction"
+                data-pressed="false"
+                onPointerDown={(event) =>
+                  setTouchKey(event, 'KeyA', 'direction', true)
+                }
+                onPointerUp={(event) =>
+                  setTouchKey(event, 'KeyA', 'direction', false)
+                }
+                onPointerCancel={(event) =>
+                  setTouchKey(event, 'KeyA', 'direction', false)
+                }
                 onLostPointerCapture={(event) =>
-                  setTouchKey(event, 'KeyA', false)
+                  setTouchKey(event, 'KeyA', 'direction', false)
                 }
               >
                 <ChevronLeft />
               </button>
               <button
+                type="button"
                 aria-label="Pull up"
-                onPointerDown={(event) => setTouchKey(event, 'KeyS', true)}
-                onPointerUp={(event) => setTouchKey(event, 'KeyS', false)}
-                onPointerCancel={(event) => setTouchKey(event, 'KeyS', false)}
+                aria-pressed="false"
+                data-control-code="KeyS"
+                data-control-group="direction"
+                data-pressed="false"
+                onPointerDown={(event) =>
+                  setTouchKey(event, 'KeyS', 'direction', true)
+                }
+                onPointerUp={(event) =>
+                  setTouchKey(event, 'KeyS', 'direction', false)
+                }
+                onPointerCancel={(event) =>
+                  setTouchKey(event, 'KeyS', 'direction', false)
+                }
                 onLostPointerCapture={(event) =>
-                  setTouchKey(event, 'KeyS', false)
+                  setTouchKey(event, 'KeyS', 'direction', false)
                 }
               >
                 <ChevronDown />
               </button>
               <button
+                type="button"
                 aria-label="Bank right"
-                onPointerDown={(event) => setTouchKey(event, 'KeyD', true)}
-                onPointerUp={(event) => setTouchKey(event, 'KeyD', false)}
-                onPointerCancel={(event) => setTouchKey(event, 'KeyD', false)}
+                aria-pressed="false"
+                data-control-code="KeyD"
+                data-control-group="direction"
+                data-pressed="false"
+                onPointerDown={(event) =>
+                  setTouchKey(event, 'KeyD', 'direction', true)
+                }
+                onPointerUp={(event) =>
+                  setTouchKey(event, 'KeyD', 'direction', false)
+                }
+                onPointerCancel={(event) =>
+                  setTouchKey(event, 'KeyD', 'direction', false)
+                }
                 onLostPointerCapture={(event) =>
-                  setTouchKey(event, 'KeyD', false)
+                  setTouchKey(event, 'KeyD', 'direction', false)
                 }
               >
                 <ChevronRight />
@@ -1254,40 +1447,71 @@ export function GooseGame() {
             </div>
             <div className="touch-actions">
               <button
+                type="button"
                 className="honk-action"
                 aria-label="Honk"
-                onPointerDown={(event) => setTouchKey(event, 'KeyE', true)}
-                onPointerUp={(event) => setTouchKey(event, 'KeyE', false)}
-                onPointerCancel={(event) => setTouchKey(event, 'KeyE', false)}
+                aria-pressed="false"
+                data-control-code="KeyE"
+                data-control-group="action"
+                data-pressed="false"
+                onPointerDown={(event) =>
+                  setTouchKey(event, 'KeyE', 'action', true)
+                }
+                onPointerUp={(event) =>
+                  setTouchKey(event, 'KeyE', 'action', false)
+                }
+                onPointerCancel={(event) =>
+                  setTouchKey(event, 'KeyE', 'action', false)
+                }
                 onLostPointerCapture={(event) =>
-                  setTouchKey(event, 'KeyE', false)
+                  setTouchKey(event, 'KeyE', 'action', false)
                 }
               >
                 <Volume2 />
                 <span>Honk</span>
               </button>
               <button
+                type="button"
                 aria-label="Flare and airbrake"
-                onPointerDown={(event) => setTouchKey(event, 'ShiftLeft', true)}
-                onPointerUp={(event) => setTouchKey(event, 'ShiftLeft', false)}
+                aria-pressed="false"
+                data-control-code="ShiftLeft"
+                data-control-group="action"
+                data-pressed="false"
+                onPointerDown={(event) =>
+                  setTouchKey(event, 'ShiftLeft', 'action', true)
+                }
+                onPointerUp={(event) =>
+                  setTouchKey(event, 'ShiftLeft', 'action', false)
+                }
                 onPointerCancel={(event) =>
-                  setTouchKey(event, 'ShiftLeft', false)
+                  setTouchKey(event, 'ShiftLeft', 'action', false)
                 }
                 onLostPointerCapture={(event) =>
-                  setTouchKey(event, 'ShiftLeft', false)
+                  setTouchKey(event, 'ShiftLeft', 'action', false)
                 }
               >
                 <Wind />
                 <span>Flare</span>
               </button>
               <button
+                type="button"
                 className="flap-action"
                 aria-label="Flap wings"
-                onPointerDown={(event) => setTouchKey(event, 'Space', true)}
-                onPointerUp={(event) => setTouchKey(event, 'Space', false)}
-                onPointerCancel={(event) => setTouchKey(event, 'Space', false)}
+                aria-pressed="false"
+                data-control-code="Space"
+                data-control-group="action"
+                data-pressed="false"
+                onPointerDown={(event) =>
+                  setTouchKey(event, 'Space', 'action', true)
+                }
+                onPointerUp={(event) =>
+                  setTouchKey(event, 'Space', 'action', false)
+                }
+                onPointerCancel={(event) =>
+                  setTouchKey(event, 'Space', 'action', false)
+                }
                 onLostPointerCapture={(event) =>
-                  setTouchKey(event, 'Space', false)
+                  setTouchKey(event, 'Space', 'action', false)
                 }
               >
                 <Feather />
@@ -1332,7 +1556,7 @@ export function GooseGame() {
         <span className="map-credit">
           ©{' '}
           <a href={AERIAL_INFORMATION_URL} target="_blank" rel="noreferrer">
-            Esri World Imagery (Clarity) contributors
+            State of Michigan MiSAIL
           </a>{' '}
           ·{' '}
           <a

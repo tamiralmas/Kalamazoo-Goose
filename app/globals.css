@@ -1523,9 +1523,9 @@ kbd {
 
   .touch-pad {
     display: grid;
-    width: 138px;
-    grid-template-columns: repeat(3, 44px);
-    grid-template-rows: repeat(2, 44px);
+    width: 150px;
+    grid-template-columns: repeat(3, 48px);
+    grid-template-rows: repeat(2, 48px);
     gap: 3px;
     pointer-events: auto;
   }
@@ -1539,10 +1539,13 @@ kbd {
     color: #fff;
     box-shadow: 0 7px 18px rgba(4, 24, 21, 0.16);
     touch-action: none;
+    -webkit-tap-highlight-color: transparent;
   }
 
   .touch-pad button:active,
-  .touch-actions button:active {
+  .touch-actions button:active,
+  .touch-pad button[data-pressed='true'],
+  .touch-actions button[data-pressed='true'] {
     background: rgba(239, 170, 73, 0.94);
     color: #173028;
     transform: scale(0.96);
@@ -1575,13 +1578,13 @@ kbd {
   }
 
   .touch-actions button {
-    width: 52px;
-    height: 52px;
+    width: 54px;
+    height: 54px;
     border-radius: 50%;
   }
   .touch-actions .flap-action {
-    width: 68px;
-    height: 68px;
+    width: 70px;
+    height: 70px;
     background: rgba(239, 170, 73, 0.95);
     color: #173028;
   }
@@ -1902,9 +1905,14 @@ kbd {
   .touch-actions {
     gap: 3px;
   }
+  .touch-pad {
+    width: 138px;
+    grid-template-columns: repeat(3, 44px);
+    grid-template-rows: repeat(2, 44px);
+  }
   .touch-actions button {
-    width: 44px;
-    height: 44px;
+    width: 48px;
+    height: 48px;
   }
   .touch-actions .flap-action {
     width: 56px;

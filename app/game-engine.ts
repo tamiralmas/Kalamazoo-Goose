@@ -262,6 +262,10 @@ const NEAR_SPAWN_CROWD_COUNT = 12;
 const ALTITUDE_BOOST_HEIGHT = 50;
 const ALTITUDE_BOOST_FULL_HEIGHT = 100;
 const ALTITUDE_BOOST_RELEASE_HEIGHT = 47;
+const ALTITUDE_BOOST_CRUISE_SPEED = 27;
+const ALTITUDE_BOOST_ACCELERATION = 2.7;
+const BASE_MAX_FLIGHT_SPEED = 38;
+const ALTITUDE_BOOST_MAX_SPEED = 46;
 const BUILDING_ACTIVE_RADIUS = 150;
 const TEXTURED_ROOF_RADIUS = 760;
 const BUILDING_TEXTURE_MAX_ZOOM = 18;
@@ -323,6 +327,11 @@ const smoothstep = (low: number, high: number, value: number) => {
   const t = clamp((value - low) / Math.max(high - low, 1e-6), 0, 1);
   return t * t * (3 - 2 * t);
 };
+
+const altitudeBoostStrength = (agl: number, active: boolean) =>
+  active
+    ? smoothstep(ALTITUDE_BOOST_HEIGHT, ALTITUDE_BOOST_FULL_HEIGHT, agl)
+    : 0;
 
 const neutralFlightAlpha = (speed: number, liftScale: number) => {
   const dynamicPressure =
@@ -793,6 +802,7 @@ export function createGooseEngine(
   const coarsePointer = window.matchMedia('(any-pointer: coarse)').matches;
   const fixedStep = coarsePointer ? 1 / 60 : FIXED_DT;
   const texturedRoofLimit = coarsePointer ? 180 : 320;
+  const buildingTextureMaxZoom = coarsePointer ? 16 : BUILDING_TEXTURE_MAX_ZOOM;
   const scene = new THREE.Scene();
   const camera = new THREE.Camera();
   const goose = createGooseRig();
@@ -1382,7 +1392,7 @@ export function createGooseEngine(
       maplibre.MercatorCoordinate.fromLngLat([longitude, latitude], 0),
     );
     for (
-      let zoom = BUILDING_TEXTURE_MAX_ZOOM;
+      let zoom = buildingTextureMaxZoom;
       zoom >= BUILDING_TEXTURE_MIN_ZOOM;
       zoom -= 1
     ) {
@@ -1479,6 +1489,8 @@ export function createGooseEngine(
 
   const buildTexturedBuildings = () => {
     if (!map.getSource(buildingSourceId)) return false;
+    const aerialGroundReady =
+      !coarsePointer || map.isSourceLoaded('wmug-aerial-imagery');
     const features = map.querySourceFeatures(buildingSourceId, {
       sourceLayer: 'building',
     }) as Array<{
@@ -1546,6 +1558,7 @@ export function createGooseEngine(
           renderMinHeight.toFixed(1),
         ].join(':');
         const wantsTexturedRoof =
+          aerialGroundReady &&
           !texturedBuildingKeys.has(footprintKey) &&
           texturedBuildingKeys.size < texturedRoofLimit &&
           Math.hypot(centerX, centerZ) <= TEXTURED_ROOF_RADIUS;
@@ -1742,7 +1755,7 @@ export function createGooseEngine(
         geometry.translate(0, renderHeight + 0.08, 0);
         geometry.computeVertexNormals();
         const mesh = new THREE.Mesh(geometry, materials.roof);
-        mesh.name = 'World Imagery aerial roof overlay';
+        mesh.name = 'MiSAIL aerial roof overlay';
         mesh.position.y = centerGround;
         mesh.frustumCulled = true;
         mesh.renderOrder = 1;
@@ -5321,9 +5334,7 @@ export function createGooseEngine(
     } else if (agl < ALTITUDE_BOOST_RELEASE_HEIGHT) {
       altitudeBoostActive = false;
     }
-    const altitudeBoost = altitudeBoostActive
-      ? smoothstep(ALTITUDE_BOOST_HEIGHT, ALTITUDE_BOOST_FULL_HEIGHT, agl)
-      : 0;
+    const altitudeBoost = altitudeBoostStrength(agl, altitudeBoostActive);
     const flare =
       brake *
       clamp((8 - agl) / 7, 0, 1) *
@@ -5418,11 +5429,15 @@ export function createGooseEngine(
     state.velocity.addScaledVector(force, dt / FLIGHT.mass);
     if (altitudeBoost > 0) {
       const horizontalSpeed = Math.hypot(state.velocity.x, state.velocity.z);
-      const boostedCruise = lerp(18.5, 25.5, altitudeBoost);
+      const boostedCruise = lerp(
+        18.5,
+        ALTITUDE_BOOST_CRUISE_SPEED,
+        altitudeBoost,
+      );
       if (horizontalSpeed < boostedCruise) {
         const addedSpeed = Math.min(
           boostedCruise - horizontalSpeed,
-          2.1 * altitudeBoost * dt,
+          ALTITUDE_BOOST_ACCELERATION * altitudeBoost * dt,
         );
         state.velocity.x += tailwindDirection.x * addedSpeed;
         state.velocity.z += tailwindDirection.z * addedSpeed;
@@ -5434,7 +5449,11 @@ export function createGooseEngine(
         );
       }
     }
-    const maximumSpeed = lerp(38, 44, altitudeBoost);
+    const maximumSpeed = lerp(
+      BASE_MAX_FLIGHT_SPEED,
+      ALTITUDE_BOOST_MAX_SPEED,
+      altitudeBoost,
+    );
     if (state.velocity.length() > maximumSpeed)
       state.velocity.setLength(maximumSpeed);
     state.position.addScaledVector(state.velocity, dt);
@@ -5868,9 +5887,7 @@ export function createGooseEngine(
         Math.cos(secretBearing - cameraBearing),
       ) / DEG;
     const agl = Math.max(0, state.position.y - state.ground);
-    const altitudeBoost = altitudeBoostActive
-      ? smoothstep(ALTITUDE_BOOST_HEIGHT, ALTITUDE_BOOST_FULL_HEIGHT, agl)
-      : 0;
+    const altitudeBoost = altitudeBoostStrength(agl, altitudeBoostActive);
     const recruitableGooseInRange = flockGeese.some((member) => {
       if (member.recruited || !member.terrainResolved) return false;
       return (
@@ -5949,6 +5966,7 @@ export function createGooseEngine(
   };
 
   const resetState = (clearProgress = false, updateView = true) => {
+    keys.clear();
     const spawnPoint = new THREE.Vector2(0, 0);
     for (let attempt = 0; attempt < 6; attempt += 1) {
       const containingBuilding = buildingColliders.find((building) =>
@@ -6133,6 +6151,13 @@ export function createGooseEngine(
       map.triggerRepaint();
   };
   const onSourceData = (event: MapSourceDataEvent) => {
+    if (
+      event.sourceId === 'wmug-aerial-imagery' &&
+      map.isSourceLoaded('wmug-aerial-imagery')
+    ) {
+      buildingRefreshRequested = true;
+      buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
+    }
     if (event.sourceDataType !== 'content') return;
     if (event.sourceId === buildingSourceId) {
       buildingRefreshRequested = true;
