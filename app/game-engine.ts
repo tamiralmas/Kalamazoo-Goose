@@ -27,6 +27,14 @@ const WMU_CONTENT_ANCHOR: [number, number] = [-85.61771, 42.284996];
 
 export type FlightMode = 'flying' | 'planing' | 'waddling' | 'swimming';
 
+export type SecretMarkerTelemetry = {
+  id: string;
+  label: string;
+  east: number;
+  north: number;
+  found: boolean;
+};
+
 export type GameTelemetry = {
   speed: number;
   agl: number;
@@ -44,6 +52,7 @@ export type GameTelemetry = {
   nearestSecretDistance: number | null;
   nearestSecretDirection: number;
   nearestSecretBearing: number;
+  secretMarkers: SecretMarkerTelemetry[];
   students: number;
   studentsNearby: number;
   studentsOnMappedWalkways: number;
@@ -187,7 +196,6 @@ type BuildingCollider = {
   renderHeight: number;
   renderMinHeight: number;
   terrainResolved: boolean;
-  terrainRefreshAt: number;
   outer: THREE.Vector2[];
   holes: THREE.Vector2[][];
 };
@@ -256,7 +264,13 @@ const DOWNSTROKE = 0.2;
 const FLAP_STAMINA_COST = 0.014;
 const SPAWN_ALTITUDE = 42;
 const SPAWN_SPEED = 13.8;
-const MAX_TRAFFIC = 32;
+const DEFAULT_CAMERA_SCALE = 10 / 7;
+const MAX_TRAFFIC = 40;
+const TRAFFIC_ROUTE_RADIUS = 1_100;
+const TRAFFIC_REANCHOR_DISTANCE = 650;
+const WATER_INGEST_RADIUS = 1_600;
+const WOODLAND_INGEST_RADIUS = 1_400;
+const WOODLAND_REANCHOR_DISTANCE = 650;
 const MAX_TREE_COUNT = 560;
 const NEAR_SPAWN_CROWD_COUNT = 12;
 const ALTITUDE_BOOST_HEIGHT = 50;
@@ -267,6 +281,9 @@ const ALTITUDE_BOOST_ACCELERATION = 2.7;
 const BASE_MAX_FLIGHT_SPEED = 38;
 const ALTITUDE_BOOST_MAX_SPEED = 46;
 const BUILDING_ACTIVE_RADIUS = 150;
+const BUILDING_INGEST_RADIUS = 950;
+const BUILDING_RETENTION_RADIUS = 1_800;
+const BUILDING_RESCAN_DISTANCE = 240;
 const TEXTURED_ROOF_RADIUS = 760;
 const BUILDING_TEXTURE_MAX_ZOOM = 18;
 const BUILDING_TEXTURE_MIN_ZOOM = 15;
@@ -1013,7 +1030,10 @@ export function createGooseEngine(
   let telemetryClock = 0;
   let buildingRefreshClock = 0;
   let buildingRefreshRequested = true;
+  let trafficRefreshClock = 0;
   let trafficBuilt = false;
+  let trafficRefreshRequested = true;
+  let trafficRouteQuality = 0;
   const terrainSpecification = map.getTerrain();
   const terrainSourceId = terrainSpecification?.source ?? null;
   const terrainEnabled = Boolean(terrainSpecification);
@@ -1062,6 +1082,7 @@ export function createGooseEngine(
   texturedBuildingGroup.visible = false;
   scene.add(texturedBuildingGroup);
   const buildingColliderByKey = new Map<string, BuildingCollider>();
+  let buildingCollectionGeneration = 0;
   const buildingMaterials = new Map<
     string,
     {
@@ -1075,13 +1096,26 @@ export function createGooseEngine(
     Number.POSITIVE_INFINITY,
     Number.POSITIVE_INFINITY,
   );
+  const buildingIngestAnchor = new THREE.Vector2(
+    Number.POSITIVE_INFINITY,
+    Number.POSITIVE_INFINITY,
+  );
   let activeColliderSourceCount = -1;
   const traffic: TrafficCar[] = [];
   const trafficRoutes: Route[] = [];
+  const trafficAnchor = new THREE.Vector2(
+    Number.POSITIVE_INFINITY,
+    Number.POSITIVE_INFINITY,
+  );
   const campusNpcs: CampusNpc[] = [];
   const pedestrianRoutes: CrowdRoute[] = [];
   const pedestrianRouteKeys = new Set<string>();
+  let pedestrianRouteGeneration = 0;
+  let pedestrianWaterGeneration = -1;
+  let npcRouteGeneration = -1;
   const mappedWaterAreas: WaterArea[] = [];
+  let mappedWaterSignature = '';
+  let mappedWaterGeneration = 0;
   let dryMappedWalkwayCache: CrowdRoute[] = [];
   let dryMappedWalkwayCacheDirty = true;
   const guaranteedWalkwayBases: THREE.Vector3[][] = [];
@@ -1097,8 +1131,8 @@ export function createGooseEngine(
   let recruitedFlockCount = 0;
   const cameraPosition = new THREE.Vector3(0, state.position.y + 15, -18);
   const cameraTarget = new THREE.Vector3(0, state.position.y + 1, 8);
-  let cameraDistanceScale = 1;
-  let cameraDistanceTarget = 1;
+  let cameraDistanceScale = DEFAULT_CAMERA_SCALE;
+  let cameraDistanceTarget = DEFAULT_CAMERA_SCALE;
   let cameraOrbitYaw = 0;
   let cameraOrbitYawTarget = 0;
   let cameraOrbitPitch = 24 * DEG;
@@ -1289,7 +1323,13 @@ export function createGooseEngine(
         const maxX = Math.max(...outer.map((point) => point.x));
         const minZ = Math.min(...outer.map((point) => point.y));
         const maxZ = Math.max(...outer.map((point) => point.y));
-        if (maxX < -1400 || minX > 1400 || maxZ < -1400 || minZ > 1400) return;
+        if (
+          maxX < state.position.x - WATER_INGEST_RADIUS ||
+          minX > state.position.x + WATER_INGEST_RADIUS ||
+          maxZ < state.position.z - WATER_INGEST_RADIUS ||
+          minZ > state.position.z + WATER_INGEST_RADIUS
+        )
+          return;
         const holes = rings
           .slice(1)
           .map((ring) =>
@@ -1303,9 +1343,19 @@ export function createGooseEngine(
         nextAreas.push({ minX, maxX, minZ, maxZ, outer, holes });
       });
     });
+    const nextSignature = nextAreas
+      .map(
+        (area) =>
+          `${area.minX.toFixed(1)}:${area.minZ.toFixed(1)}:${area.maxX.toFixed(1)}:${area.maxZ.toFixed(1)}`,
+      )
+      .sort()
+      .join('|');
+    if (nextSignature === mappedWaterSignature) return false;
+    mappedWaterSignature = nextSignature;
+    mappedWaterGeneration += 1;
     mappedWaterAreas.splice(0, mappedWaterAreas.length, ...nextAreas);
     dryMappedWalkwayCacheDirty = true;
-    return nextAreas.length > 0;
+    return true;
   };
 
   const isPointInMappedWater = (east: number, north: number) =>
@@ -1427,7 +1477,7 @@ export function createGooseEngine(
     if (cached) return cached;
 
     const roof = new THREE.MeshBasicMaterial({
-      color: 0xffffff,
+      color: 0xc7c1b5,
       side: THREE.DoubleSide,
       depthTest: true,
       depthWrite: true,
@@ -1441,6 +1491,10 @@ export function createGooseEngine(
     const texture = loader.load(
       url,
       (loadedTexture) => {
+        if (buildingMaterials.get(key)?.roof !== roof) {
+          loadedTexture.dispose();
+          return;
+        }
         loadedTexture.colorSpace = THREE.SRGBColorSpace;
         loadedTexture.wrapS = THREE.ClampToEdgeWrapping;
         loadedTexture.wrapT = THREE.ClampToEdgeWrapping;
@@ -1451,20 +1505,62 @@ export function createGooseEngine(
           renderer?.capabilities.getMaxAnisotropy() ?? 4,
         );
         loadedTexture.needsUpdate = true;
+        roof.map = loadedTexture;
+        roof.color.setHex(0xffffff);
+        roof.needsUpdate = true;
         map.triggerRepaint();
       },
       undefined,
       () => {
+        if (buildingMaterials.get(key)?.roof !== roof) return;
         roof.map = null;
         roof.color.setHex(0xc7c1b5);
         roof.needsUpdate = true;
       },
     );
     texture.colorSpace = THREE.SRGBColorSpace;
-    roof.map = texture;
     const materialSet = { texture, roof };
     buildingMaterials.set(key, materialSet);
     return materialSet;
+  };
+
+  const pruneDistantBuildings = () => {
+    const maximumDistanceSquared = BUILDING_RETENTION_RADIUS ** 2;
+    let changed = false;
+    for (let index = buildingColliders.length - 1; index >= 0; index -= 1) {
+      const building = buildingColliders[index];
+      const centerX = (building.minX + building.maxX) * 0.5;
+      const centerZ = (building.minZ + building.maxZ) * 0.5;
+      const dx = centerX - state.position.x;
+      const dz = centerZ - state.position.z;
+      if (dx * dx + dz * dz <= maximumDistanceSquared) continue;
+
+      buildingColliders.splice(index, 1);
+      buildingColliderByKey.delete(building.sourceKey);
+      const roofMesh = texturedBuildingMeshByKey.get(building.sourceKey);
+      if (roofMesh) {
+        texturedBuildingGroup.remove(roofMesh);
+        roofMesh.geometry.dispose();
+        texturedBuildingMeshByKey.delete(building.sourceKey);
+        texturedBuildingKeys.delete(building.sourceKey);
+      }
+      changed = true;
+    }
+    if (!changed) return false;
+
+    buildingCollectionGeneration += 1;
+    activeColliderSourceCount = -1;
+    refreshActiveBuildingColliders(true);
+    const usedRoofMaterials = new Set(
+      [...texturedBuildingMeshByKey.values()].map((mesh) => mesh.material),
+    );
+    buildingMaterials.forEach((materials, key) => {
+      if (usedRoofMaterials.has(materials.roof)) return;
+      materials.texture.dispose();
+      materials.roof.dispose();
+      buildingMaterials.delete(key);
+    });
+    return true;
   };
 
   const applyBuildingRoofUvs = (
@@ -1488,7 +1584,9 @@ export function createGooseEngine(
   };
 
   const buildTexturedBuildings = () => {
-    if (!map.getSource(buildingSourceId)) return false;
+    const prunedDistantBuildings = pruneDistantBuildings();
+    if (!map.getSource(buildingSourceId)) return prunedDistantBuildings;
+    buildingIngestAnchor.set(state.position.x, state.position.z);
     const aerialGroundReady =
       !coarsePointer || map.isSourceLoaded('wmug-aerial-imagery');
     const features = map.querySourceFeatures(buildingSourceId, {
@@ -1498,7 +1596,7 @@ export function createGooseEngine(
       properties?: Record<string, unknown>;
       geometry: { type: string; coordinates: unknown };
     }>;
-    let changed = false;
+    let changed = prunedDistantBuildings;
     let terrainQueryBudget = coarsePointer ? 7 : 12;
 
     features.forEach((feature) => {
@@ -1538,8 +1636,12 @@ export function createGooseEngine(
         const centerZ = (minZ + maxZ) * 0.5;
         const spanX = maxX - minX;
         const spanZ = maxZ - minZ;
+        const distanceFromPlayer = Math.hypot(
+          centerX - state.position.x,
+          centerZ - state.position.z,
+        );
         if (
-          Math.hypot(centerX, centerZ) > 1800 ||
+          distanceFromPlayer > BUILDING_INGEST_RADIUS ||
           spanX < 0.8 ||
           spanZ < 0.8 ||
           spanX > 500 ||
@@ -1561,7 +1663,7 @@ export function createGooseEngine(
           aerialGroundReady &&
           !texturedBuildingKeys.has(footprintKey) &&
           texturedBuildingKeys.size < texturedRoofLimit &&
-          Math.hypot(centerX, centerZ) <= TEXTURED_ROOF_RADIUS;
+          distanceFromPlayer <= TEXTURED_ROOF_RADIUS;
         const existingCollider = buildingColliderByKey.get(footprintKey);
         const nearPlayer =
           Math.hypot(centerX - state.position.x, centerZ - state.position.z) <=
@@ -1575,9 +1677,7 @@ export function createGooseEngine(
           terrainQueryBudget > 0 &&
           (!existingCollider ||
             (nearPlayer &&
-              (!existingCollider.terrainResolved ||
-                staleAgainstCampus ||
-                elapsedTime >= existingCollider.terrainRefreshAt)));
+              (!existingCollider.terrainResolved || staleAgainstCampus)));
 
         if (existingCollider && !wantsTexturedRoof && !needsTerrainRefresh)
           return;
@@ -1589,8 +1689,6 @@ export function createGooseEngine(
         let colliderHeight = existingCollider?.height ?? renderHeight;
         let colliderTerrainResolved =
           existingCollider?.terrainResolved ?? !terrainEnabled;
-        let colliderTerrainRefreshAt =
-          existingCollider?.terrainRefreshAt ?? elapsedTime + 0.3;
         if (needsTerrainRefresh) {
           terrainQueryBudget -= 1;
           const terrainLocations: ReadonlyArray<readonly [number, number]> =
@@ -1640,11 +1738,6 @@ export function createGooseEngine(
               highestTerrain + renderHeight - colliderGround,
             );
           }
-          const refreshJitter =
-            Math.abs(Math.sin(centerX * 0.013 + centerZ * 0.017)) * 0.85;
-          colliderTerrainRefreshAt =
-            elapsedTime +
-            (colliderTerrainResolved ? 2.35 + refreshJitter : 0.42);
           if (existingCollider) {
             const previousRoof =
               existingCollider.ground + existingCollider.height;
@@ -1669,7 +1762,6 @@ export function createGooseEngine(
             existingCollider.renderHeight = renderHeight;
             existingCollider.renderMinHeight = renderMinHeight;
             existingCollider.terrainResolved = colliderTerrainResolved;
-            existingCollider.terrainRefreshAt = colliderTerrainRefreshAt;
             if (supportsGoose && Math.abs(roofDelta) < 30) {
               state.position.y += roofDelta;
               previousState.position.y += roofDelta;
@@ -1716,12 +1808,12 @@ export function createGooseEngine(
             renderHeight,
             renderMinHeight,
             terrainResolved: colliderTerrainResolved,
-            terrainRefreshAt: colliderTerrainRefreshAt,
             outer: colliderOuter,
             holes: colliderHoles,
           };
           buildingColliderByKey.set(footprintKey, collider);
           buildingColliders.push(collider);
+          buildingCollectionGeneration += 1;
           changed = true;
         }
 
@@ -2666,6 +2758,11 @@ export function createGooseEngine(
   let treeRefreshCursor = 0;
   let treeMatricesInitialized = false;
   let treeBlockerSignature = '';
+  const woodlandAnchor = new THREE.Vector2(
+    Number.POSITIVE_INFINITY,
+    Number.POSITIVE_INFINITY,
+  );
+  let woodlandGeneration = 0;
 
   const distanceSquaredToRoute = (
     points: THREE.Vector3[],
@@ -2850,15 +2947,43 @@ export function createGooseEngine(
   };
 
   const woodlandTreeKeys = new Set<string>();
+  const clearSupplementalTrees = () => {
+    woodlandTreeKeys.clear();
+    if (campusTreePoints.length <= mappedTreeCount) return false;
+    campusTreePoints.length = mappedTreeCount;
+    treeGrounds.length = mappedTreeCount;
+    treeTerrainRefreshAt.length = mappedTreeCount;
+    treeCount = mappedTreeCount;
+    treeTrunks.count = treeCount;
+    treeCrowns.count = treeCount * 3;
+    treeRefreshCursor = 0;
+    unresolvedTreeCount = treeGrounds.reduce<number>(
+      (count, ground) => count + (ground === null ? 1 : 0),
+      0,
+    );
+    woodlandGeneration += 1;
+    return true;
+  };
+
   const collectMappedWoodlandTrees = () => {
     if (
       !landcoverSourceId ||
       !map.getSource(landcoverSourceId) ||
       trafficRoutes.length === 0 ||
-      pedestrianRoutes.length === 0 ||
-      treeCount >= MAX_TREE_COUNT
+      pedestrianRoutes.length === 0
     )
       return false;
+    let changed = false;
+    if (
+      Math.hypot(
+        state.position.x - woodlandAnchor.x,
+        state.position.z - woodlandAnchor.y,
+      ) > WOODLAND_REANCHOR_DISTANCE
+    ) {
+      woodlandAnchor.set(state.position.x, state.position.z);
+      changed = clearSupplementalTrees();
+    }
+    if (treeCount >= MAX_TREE_COUNT) return changed;
     const features = map.querySourceFeatures(landcoverSourceId, {
       sourceLayer: 'landcover',
     }) as Array<{
@@ -2895,15 +3020,21 @@ export function createGooseEngine(
           )
           .filter((ring) => ring.length >= 3);
         const minX = Math.max(
-          -1400,
+          state.position.x - WOODLAND_INGEST_RADIUS,
           Math.min(...outer.map((point) => point.x)),
         );
-        const maxX = Math.min(1400, Math.max(...outer.map((point) => point.x)));
+        const maxX = Math.min(
+          state.position.x + WOODLAND_INGEST_RADIUS,
+          Math.max(...outer.map((point) => point.x)),
+        );
         const minZ = Math.max(
-          -1400,
+          state.position.z - WOODLAND_INGEST_RADIUS,
           Math.min(...outer.map((point) => point.y)),
         );
-        const maxZ = Math.min(1400, Math.max(...outer.map((point) => point.y)));
+        const maxZ = Math.min(
+          state.position.z + WOODLAND_INGEST_RADIUS,
+          Math.max(...outer.map((point) => point.y)),
+        );
         if (maxX <= minX || maxZ <= minZ) return;
         const firstCellX = Math.floor(minX / spacing);
         const lastCellX = Math.ceil(maxX / spacing);
@@ -2956,8 +3087,9 @@ export function createGooseEngine(
       treeGrounds.push(terrainEnabled ? null : campusGroundFallback);
       treeTerrainRefreshAt.push(0);
     }
-    if (campusTreePoints.length === firstNewIndex) return false;
+    if (campusTreePoints.length === firstNewIndex) return changed;
     treeCount = campusTreePoints.length;
+    woodlandGeneration += 1;
     treeTrunks.count = treeCount;
     treeCrowns.count = treeCount * 3;
     for (let index = firstNewIndex; index < treeCount; index += 1) {
@@ -2971,7 +3103,7 @@ export function createGooseEngine(
   };
 
   const refreshTreePlacementMask = () => {
-    const signature = `${mappedWaterAreas.length}:${buildingColliders.length}:${trafficRoutes.length}:${pedestrianRoutes.length}:${treeCount}`;
+    const signature = `${mappedWaterGeneration}:${buildingCollectionGeneration}:${trafficRoutes.length}:${pedestrianRoutes.length}:${pedestrianRouteGeneration}:${woodlandGeneration}:${treeCount}`;
     if (signature === treeBlockerSignature) return false;
     treeBlockerSignature = signature;
     if (!treeMatricesInitialized) return false;
@@ -3242,7 +3374,18 @@ export function createGooseEngine(
   };
 
   const buildTraffic = () => {
-    if (trafficBuilt || !map.getSource(roadSourceId)) return;
+    const movedFromTrafficAnchor =
+      !trafficBuilt ||
+      Math.hypot(
+        state.position.x - trafficAnchor.x,
+        state.position.z - trafficAnchor.y,
+      ) > TRAFFIC_REANCHOR_DISTANCE;
+    if (
+      !map.getSource(roadSourceId) ||
+      (trafficBuilt && !movedFromTrafficAnchor && !trafficRefreshRequested)
+    )
+      return false;
+    trafficRefreshRequested = false;
     const allowed = new Set([
       'motorway',
       'trunk',
@@ -3275,7 +3418,11 @@ export function createGooseEngine(
       const points = coordinates
         .filter((coordinate) => coordinate.length >= 2)
         .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
-        .filter((point) => Math.hypot(point.x, point.z) < 1400);
+        .filter(
+          (point) =>
+            Math.hypot(point.x - state.position.x, point.z - state.position.z) <
+            TRAFFIC_ROUTE_RADIUS,
+        );
       if (points.length < 2) return;
       const endpoints = [
         `${points[0].x.toFixed(0)}:${points[0].z.toFixed(0)}`,
@@ -3312,14 +3459,37 @@ export function createGooseEngine(
     });
 
     routes.sort((a, b) => b.total - a.total);
-    if (routes.length === 0) return;
-    trafficRoutes.push(...routes.slice(0, 24));
+    if (routes.length === 0) return false;
+    const nextTrafficRoutes = routes.slice(0, 24);
+    const nextTrafficRouteQuality =
+      nextTrafficRoutes.length * 1_000_000 +
+      nextTrafficRoutes.reduce((total, route) => total + route.total, 0);
+    if (
+      trafficBuilt &&
+      !movedFromTrafficAnchor &&
+      nextTrafficRouteQuality <= trafficRouteQuality + 25
+    )
+      return false;
+    traffic.length = 0;
+    trafficRoutes.length = 0;
+    pedestrianRoutes.length = guaranteedPedestrianRouteCount;
+    pedestrianRouteKeys.clear();
+    for (let index = 0; index < guaranteedPedestrianRouteCount; index += 1) {
+      pedestrianRouteKeys.add(`campus-lawn:${index}`);
+    }
+    dryMappedWalkwayCache = [];
+    dryMappedWalkwayCacheDirty = true;
+    pedestrianRouteGeneration += 1;
+    trafficRoutes.push(...nextTrafficRoutes);
     const colors = [
       0xc94b43, 0xe5ae39, 0x3d6f9f, 0xe8e4d6, 0x5a7358, 0x8b5a88, 0x33383c,
       0xd47a36,
     ];
     const activeRoutes = Math.min(routes.length, 20);
-    const count = Math.min(MAX_TRAFFIC, Math.max(20, activeRoutes * 2));
+    const count = Math.min(
+      MAX_TRAFFIC,
+      Math.max(24, Math.ceil(activeRoutes * 2.5)),
+    );
     for (let index = 0; index < count; index += 1) {
       const route = routes[index % activeRoutes];
       const directionSign = (index % 2 === 0 ? 1 : -1) as -1 | 1;
@@ -3362,7 +3532,10 @@ export function createGooseEngine(
     trafficFleet.wheels.count = count * 4;
     if (trafficFleet.bodies.instanceColor)
       trafficFleet.bodies.instanceColor.needsUpdate = true;
+    trafficAnchor.set(state.position.x, state.position.z);
+    trafficRouteQuality = nextTrafficRouteQuality;
     trafficBuilt = true;
+    return true;
   };
 
   const addGuaranteedCampusWalkways = () => {
@@ -3585,6 +3758,17 @@ export function createGooseEngine(
   const collectPedestrianRoutes = () => {
     let added = addGuaranteedCampusWalkways();
     let npcAssignmentsChanged = false;
+    if (pedestrianWaterGeneration !== mappedWaterGeneration) {
+      pedestrianRoutes.length = guaranteedPedestrianRouteCount;
+      pedestrianRouteKeys.clear();
+      for (let index = 0; index < guaranteedPedestrianRouteCount; index += 1) {
+        pedestrianRouteKeys.add(`campus-lawn:${index}`);
+      }
+      dryMappedWalkwayCache = [];
+      dryMappedWalkwayCacheDirty = true;
+      pedestrianWaterGeneration = mappedWaterGeneration;
+      pedestrianRouteGeneration += 1;
+    }
     const features =
       map.getSource(roadSourceId) && pedestrianRoutes.length < 80
         ? (map.querySourceFeatures(roadSourceId, {
@@ -3603,7 +3787,11 @@ export function createGooseEngine(
       const points = coordinates
         .filter((coordinate) => coordinate.length >= 2)
         .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
-        .filter((point) => Math.hypot(point.x, point.z) < 1200);
+        .filter(
+          (point) =>
+            Math.hypot(point.x - state.position.x, point.z - state.position.z) <
+            1_200,
+        );
       if (points.length < 2) return;
       const endpoints = [
         `${points[0].x.toFixed(0)}:${points[0].z.toFixed(0)}`,
@@ -3720,12 +3908,15 @@ export function createGooseEngine(
     }
 
     const mappedWalkways = getMappedPedestrianWalkways();
-    const mappedWalkwaySignature = mappedWalkways
+    const routeGenerationChanged =
+      npcRouteGeneration !== pedestrianRouteGeneration;
+    const mappedWalkwaySignature = `${pedestrianRouteGeneration}:${mappedWalkways
       .map((route) => pedestrianRoutes.indexOf(route))
-      .join(':');
+      .join(':')}`;
     if (
       mappedWalkways.length > 0 &&
-      mappedWalkwaySignature !== mappedCrowdWalkwaySignature
+      (routeGenerationChanged ||
+        mappedWalkwaySignature !== mappedCrowdWalkwaySignature)
     ) {
       for (
         let index = NEAR_SPAWN_CROWD_COUNT;
@@ -3757,10 +3948,18 @@ export function createGooseEngine(
       npcAssignmentsChanged = true;
     } else if (
       mappedWalkways.length === 0 &&
-      mappedCrowdWalkwaySignature !== ''
+      (routeGenerationChanged || mappedCrowdWalkwaySignature !== '')
     ) {
+      const streamedRoutes = pedestrianRoutes.slice(
+        guaranteedPedestrianRouteCount,
+      );
       campusNpcs.forEach((_, index) => {
-        const route = pedestrianRoutes[index % guaranteedPedestrianRouteCount];
+        const route =
+          index < NEAR_SPAWN_CROWD_COUNT || streamedRoutes.length === 0
+            ? pedestrianRoutes[index % guaranteedPedestrianRouteCount]
+            : streamedRoutes[
+                (index - NEAR_SPAWN_CROWD_COUNT) % streamedRoutes.length
+              ];
         const distance =
           route.total * (0.06 + ((index * 0.61803398875 + 0.17) % 1) * 0.88);
         campusNpcs[index] = createCampusNpc(
@@ -3773,6 +3972,7 @@ export function createGooseEngine(
       mappedCrowdWalkwaySignature = '';
       npcAssignmentsChanged = true;
     }
+    npcRouteGeneration = pedestrianRouteGeneration;
     if (npcAssignmentsChanged)
       updateCrowdVisuals(crowdFleet, campusNpcs, 1, elapsedTime);
     return added > 0 || npcAssignmentsChanged;
@@ -4230,9 +4430,17 @@ export function createGooseEngine(
         const { definition } = secret;
         if (
           definition.trigger !== 'honk' &&
-          definition.trigger !== 'multi-honk'
+          definition.trigger !== 'multi-honk' &&
+          definition.trigger !== 'water-honk'
         )
           return;
+        const landedOnWater =
+          state.onWater &&
+          (state.mode === 'swimming' || state.mode === 'planing');
+        if (definition.trigger === 'water-honk' && !landedOnWater) {
+          hooks.onToast(`${definition.label} · land on the lake and honk`);
+          return;
+        }
         if (secret.honkWindow <= 0) secret.honkCount = 0;
         secret.honkCount += 1;
         secret.honkWindow = definition.id === 'student-megaphone' ? 7 : 4;
@@ -5934,6 +6142,13 @@ export function createGooseEngine(
       nearestSecretDistance: nearestSecret?.distance ?? null,
       nearestSecretDirection,
       nearestSecretBearing: secretBearing / DEG,
+      secretMarkers: campusSecrets.map((secret) => ({
+        id: secret.id,
+        label: secret.group.name,
+        east: secret.position.x,
+        north: secret.position.z,
+        found: secret.found,
+      })),
       students: campusNpcs.length,
       studentsNearby,
       studentsOnMappedWalkways,
@@ -6042,13 +6257,22 @@ export function createGooseEngine(
     waterContactLatched = false;
     waterContactReleaseTime = 0;
     altitudeBoostActive = false;
-    cameraDistanceScale = 1;
-    cameraDistanceTarget = 1;
+    cameraDistanceScale = DEFAULT_CAMERA_SCALE;
+    cameraDistanceTarget = DEFAULT_CAMERA_SCALE;
     cameraOrbitYaw = 0;
     cameraOrbitYawTarget = 0;
     cameraOrbitPitch = 24 * DEG;
     cameraOrbitPitchTarget = 24 * DEG;
     crowdRelocationClock = 0;
+    trafficAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+    trafficRefreshRequested = true;
+    trafficRouteQuality = 0;
+    buildingIngestAnchor.set(
+      Number.POSITIVE_INFINITY,
+      Number.POSITIVE_INFINITY,
+    );
+    woodlandAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+    trafficRefreshClock = 0;
     accumulator = 0;
     relocateNearbyCrowd(true);
     campusNpcs.forEach((npc, index) => {
@@ -6133,16 +6357,15 @@ export function createGooseEngine(
 
   const onIdle = () => {
     collectMappedWaterAreas();
-    const hadTraffic = trafficBuilt;
-    buildTraffic();
+    const trafficChanged = buildTraffic();
     const crowdChanged = collectPedestrianRoutes();
     const buildingsChanged =
       buildingColliders.length === 0 ? buildTexturedBuildings() : false;
     const woodlandChanged = collectMappedWoodlandTrees();
     const treePlacementsChanged = refreshTreePlacementMask();
-    if (!hadTraffic && trafficBuilt) updateTrafficVisuals(1);
+    if (trafficChanged) updateTrafficVisuals(1);
     if (
-      (!hadTraffic && trafficBuilt) ||
+      trafficChanged ||
       crowdChanged ||
       buildingsChanged ||
       woodlandChanged ||
@@ -6159,12 +6382,22 @@ export function createGooseEngine(
       buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
     }
     if (event.sourceDataType !== 'content') return;
+    if (event.sourceId === roadSourceId) {
+      trafficRefreshRequested = true;
+      trafficRefreshClock = Math.min(trafficRefreshClock, 0.12);
+    }
     if (event.sourceId === buildingSourceId) {
       buildingRefreshRequested = true;
       buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
     }
     if (terrainSourceId && event.sourceId === terrainSourceId) {
-      buildingRefreshRequested = true;
+      refreshActiveBuildingColliders();
+      if (
+        activeBuildingColliders.some((building) => !building.terrainResolved)
+      ) {
+        buildingRefreshRequested = true;
+        buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
+      }
       treeRefreshClock = Math.min(treeRefreshClock, 0.12);
       campusSecrets.forEach((secret, index) => {
         secret.terrainRefreshRemaining = Math.min(
@@ -6190,11 +6423,20 @@ export function createGooseEngine(
     previousTime = now;
     elapsedTime += frameDt;
     buildingRefreshClock = Math.max(0, buildingRefreshClock - frameDt);
+    trafficRefreshClock = Math.max(0, trafficRefreshClock - frameDt);
+    if (
+      Math.hypot(
+        state.position.x - buildingIngestAnchor.x,
+        state.position.z - buildingIngestAnchor.y,
+      ) > BUILDING_RESCAN_DISTANCE
+    ) {
+      buildingRefreshRequested = true;
+      buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
+    }
     if (!buildingRefreshRequested && buildingRefreshClock <= 0) {
       refreshActiveBuildingColliders();
       buildingRefreshRequested = activeBuildingColliders.some(
-        (building) =>
-          !building.terrainResolved || elapsedTime >= building.terrainRefreshAt,
+        (building) => !building.terrainResolved,
       );
       if (!buildingRefreshRequested) buildingRefreshClock = 0.2;
     }
@@ -6202,6 +6444,16 @@ export function createGooseEngine(
       buildingRefreshRequested = false;
       buildingRefreshClock = 0.28;
       if (buildTexturedBuildings()) {
+        refreshTreePlacementMask();
+        map.triggerRepaint();
+      }
+    }
+    if (playing && trafficRefreshClock <= 0) {
+      trafficRefreshClock = 1;
+      if (buildTraffic()) {
+        collectPedestrianRoutes();
+        collectMappedWoodlandTrees();
+        updateTrafficVisuals(1);
         refreshTreePlacementMask();
         map.triggerRepaint();
       }
@@ -6264,7 +6516,7 @@ export function createGooseEngine(
       previousTime = performance.now();
       updateCamera(1 / 60, renderState, true);
       hooks.onToast(
-        'Twenty-six campus secrets are live — find the runaway WMU Bronco and build your flock',
+        `${campusSecrets.length} Kalamazoo secrets are live — explore the city, find the runaway WMU Bronco, and build your flock`,
       );
     },
     reset() {
@@ -6313,7 +6565,7 @@ export function createGooseEngine(
       map.triggerRepaint();
     },
     resetCamera() {
-      cameraDistanceTarget = 1;
+      cameraDistanceTarget = DEFAULT_CAMERA_SCALE;
       cameraDistanceScale = cameraDistanceTarget;
       cameraOrbitYawTarget = 0;
       cameraOrbitYaw = cameraOrbitYawTarget;

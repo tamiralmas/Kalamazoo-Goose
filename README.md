@@ -1,6 +1,6 @@
 # Kalamazoo Goose
 
-Kalamazoo Goose is a chaotic 3D browser sandbox set around Western Michigan University. Fly over a real map of campus, splash down in water, waddle through crowds, stop traffic, recruit a flock, and hunt for campus secrets.
+Kalamazoo Goose is a chaotic 3D browser sandbox set across Western Michigan University and Kalamazoo. Fly over a real map, splash down in water, waddle through crowds, stop traffic, recruit a flock, and hunt for secrets from campus to downtown.
 
 ## Play
 
@@ -30,4 +30,4 @@ Touch controls are included for mobile browsers.
 
 ## World data
 
-The game combines OpenStreetMap-derived roads, buildings, water, trails, and vegetation with elevation and aerial map layers around the WMU campus.
+The game combines OpenStreetMap-derived roads, buildings, water, trails, and vegetation with elevation and aerial map layers across Kalamazoo.

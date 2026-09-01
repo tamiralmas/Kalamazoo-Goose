@@ -584,52 +584,6 @@
   color: #ffd36a;
 }
 
-.flight-reticle {
-  position: absolute;
-  z-index: 3;
-  top: 48%;
-  left: 50%;
-  width: 38px;
-  height: 20px;
-  transform: translate(-50%, -50%);
-  opacity: 0.6;
-  pointer-events: none;
-}
-
-.flight-reticle::before,
-.flight-reticle::after,
-.flight-reticle span {
-  content: '';
-  position: absolute;
-  top: 50%;
-  height: 1px;
-  background: rgba(255, 255, 255, 0.8);
-}
-
-.flight-reticle::before {
-  left: 0;
-  width: 12px;
-}
-.flight-reticle::after {
-  right: 0;
-  width: 12px;
-}
-.flight-reticle span {
-  left: 50%;
-  width: 5px;
-  transform: translateX(-50%);
-}
-.flight-reticle i {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  width: 5px;
-  height: 5px;
-  transform: translate(-50%, -50%);
-  border: 1px solid rgba(255, 255, 255, 0.75);
-  border-radius: 50%;
-}
-
 .mode-stack {
   position: absolute;
   z-index: 4;
@@ -1111,9 +1065,8 @@ kbd {
   z-index: 0;
   top: 50%;
   left: 50%;
-  width: 1280px;
-  height: 1280px;
-  transition: transform 120ms linear;
+  width: 768px;
+  height: 768px;
   will-change: transform;
 }
 
@@ -1148,7 +1101,7 @@ kbd {
 }
 
 .minimap-goose-marker,
-.minimap-objective-marker {
+.minimap-secret-marker {
   position: absolute;
   z-index: 5;
   top: 50%;
@@ -1186,13 +1139,14 @@ kbd {
   height: 15px;
 }
 
-.minimap-objective-marker {
-  width: 22px;
-  height: 22px;
+.minimap-secret-marker {
+  width: 13px;
+  height: 13px;
   transform: translate(-50%, -50%);
   border: 1px solid rgba(255, 245, 203, 0.8);
   background: rgba(111, 65, 18, 0.9);
   color: #ffd070;
+  pointer-events: auto;
   box-shadow:
     0 0 0 3px rgba(255, 197, 76, 0.18),
     0 4px 12px rgba(34, 18, 3, 0.36);
@@ -1201,9 +1155,24 @@ kbd {
     left 120ms linear;
 }
 
-.minimap-objective-marker svg {
-  width: 12px;
-  height: 12px;
+.minimap-secret-marker.is-offscreen {
+  border-style: dashed;
+}
+
+.minimap-secret-marker.is-found {
+  z-index: 4;
+  width: 11px;
+  height: 11px;
+  border-color: rgba(83, 46, 31, 0.72);
+  background: rgba(255, 244, 209, 0.84);
+  color: #532e1f;
+  box-shadow: 0 3px 8px rgba(34, 18, 3, 0.28);
+  opacity: 0.78;
+}
+
+.minimap-secret-marker svg {
+  width: 8px;
+  height: 8px;
 }
 
 .minimap-attribution {
@@ -2043,7 +2012,7 @@ kbd {
   }
   .campus-minimap,
   .minimap-tiles,
-  .minimap-objective-marker,
+  .minimap-secret-marker,
   .minimap-toggle-chevron {
     transition: none;
   }

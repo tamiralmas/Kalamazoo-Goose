@@ -3,6 +3,7 @@
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
@@ -12,6 +13,7 @@ import {
   Activity,
   Bird,
   Building2,
+  Check,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -41,6 +43,7 @@ import type {
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 
 import { Button } from '@/components/ui/button';
+import { TOTAL_CAMPUS_SECRETS } from '@/app/chaos-secrets';
 import type { FlightMode, GameTelemetry, GooseEngine } from '@/app/game-engine';
 import { WMU_SPAWN } from '@/app/world-config';
 import {
@@ -53,9 +56,12 @@ import {
 
 const MINIMAP_ZOOM = 16;
 const MINIMAP_TILE_SIZE = 256;
-const MINIMAP_GRID_RADIUS = 2;
+const MINIMAP_GRID_RADIUS = 1;
 const MINIMAP_GRID_SIZE = MINIMAP_GRID_RADIUS * 2 + 1;
 const MINIMAP_WORLD_SIZE = MINIMAP_TILE_SIZE * 2 ** MINIMAP_ZOOM;
+const MINIMAP_SECRET_EDGE_RADIUS = 62;
+const MINIMAP_SECRET_SEPARATION = 14;
+const MINIMAP_GOOSE_CLEARANCE = 22;
 const EARTH_CIRCUMFERENCE_METERS = 40_075_016.686;
 
 const lngLatToMinimapPixel = (longitude: number, latitude: number) => {
@@ -70,36 +76,33 @@ const lngLatToMinimapPixel = (longitude: number, latitude: number) => {
 };
 
 const minimapSpawnPixel = lngLatToMinimapPixel(WMU_SPAWN[0], WMU_SPAWN[1]);
-const minimapCenterTileX = Math.floor(minimapSpawnPixel.x / MINIMAP_TILE_SIZE);
-const minimapCenterTileY = Math.floor(minimapSpawnPixel.y / MINIMAP_TILE_SIZE);
-const minimapMinimumTileX = minimapCenterTileX - MINIMAP_GRID_RADIUS;
-const minimapMinimumTileY = minimapCenterTileY - MINIMAP_GRID_RADIUS;
-const minimapSpawnGridX =
-  minimapSpawnPixel.x - minimapMinimumTileX * MINIMAP_TILE_SIZE;
-const minimapSpawnGridY =
-  minimapSpawnPixel.y - minimapMinimumTileY * MINIMAP_TILE_SIZE;
 const minimapPixelsPerMeter =
   MINIMAP_WORLD_SIZE /
   (EARTH_CIRCUMFERENCE_METERS * Math.cos((WMU_SPAWN[1] * Math.PI) / 180));
-const MINIMAP_TILES = Array.from(
-  { length: MINIMAP_GRID_SIZE ** 2 },
-  (_, index) => {
-    const column = index % MINIMAP_GRID_SIZE;
-    const row = Math.floor(index / MINIMAP_GRID_SIZE);
-    const x = minimapMinimumTileX + column;
-    const y = minimapMinimumTileY + row;
-    const url = getAerialTileUrl(MINIMAP_ZOOM, x, y);
-    return {
-      key: `${MINIMAP_ZOOM}/${x}/${y}`,
-      style: {
-        left: column * MINIMAP_TILE_SIZE,
-        top: row * MINIMAP_TILE_SIZE,
-        backgroundImage: `url(${url})`,
-      } as CSSProperties,
-    };
-  },
-);
 
+const MINIMAP_SECRET_SLOTS = (() => {
+  const slots: Array<{ x: number; y: number }> = [];
+  const rowHeight = (MINIMAP_SECRET_SEPARATION * Math.sqrt(3)) / 2;
+  const maximumRow = Math.ceil(MINIMAP_SECRET_EDGE_RADIUS / rowHeight);
+  const maximumColumn = Math.ceil(
+    MINIMAP_SECRET_EDGE_RADIUS / MINIMAP_SECRET_SEPARATION,
+  );
+  for (let row = -maximumRow; row <= maximumRow; row += 1) {
+    const y = row * rowHeight;
+    const rowOffset = Math.abs(row) % 2 === 1 ? 0.5 : 0;
+    for (let column = -maximumColumn; column <= maximumColumn; column += 1) {
+      const x = (column + rowOffset) * MINIMAP_SECRET_SEPARATION;
+      const distance = Math.hypot(x, y);
+      if (
+        distance <= MINIMAP_SECRET_EDGE_RADIUS &&
+        distance >= MINIMAP_GOOSE_CLEARANCE
+      ) {
+        slots.push({ x, y });
+      }
+    }
+  }
+  return slots;
+})();
 const INITIAL_TELEMETRY: GameTelemetry = {
   speed: 13.8,
   agl: 42,
@@ -111,12 +114,13 @@ const INITIAL_TELEMETRY: GameTelemetry = {
   score: 0,
   combo: 1,
   secretsFound: 0,
-  secretsTotal: 26,
+  secretsTotal: TOTAL_CAMPUS_SECRETS,
   secretVisuals: 0,
   nearestSecretLabel: 'Council of Ducks',
   nearestSecretDistance: null,
   nearestSecretDirection: 0,
   nearestSecretBearing: 0,
+  secretMarkers: [],
   students: 0,
   studentsNearby: 0,
   studentsOnMappedWalkways: 0,
@@ -134,7 +138,7 @@ const INITIAL_TELEMETRY: GameTelemetry = {
   heading: 0,
   buildings: 0,
   cameraZoom: 15.9,
-  cameraScale: 1,
+  cameraScale: 10 / 7,
   insideBuilding: false,
   renderCalls: 0,
   gooseVisible: false,
@@ -320,6 +324,13 @@ export function GooseGame() {
           new maplibre.AttributionControl({ compact: true }),
           'bottom-right',
         );
+        const collapseAttribution = () =>
+          map
+            .getContainer()
+            .querySelector('.maplibregl-ctrl-attrib')
+            ?.classList.remove('maplibregl-compact-show');
+        collapseAttribution();
+        map.once('load', collapseAttribution);
 
         const previewSourceId = 'wmug-aerial-preview';
         const fullSourceId = 'wmug-aerial-imagery';
@@ -892,22 +903,73 @@ export function GooseGame() {
     : `Flock ${telemetry.flockSize}/${telemetry.flockTotal}`;
   const minimapHeadingDegrees = (telemetry.heading * 180) / Math.PI;
   const showMobileDiscoveryChip = playing && !toast && telemetry.stall <= 0.22;
+  const minimapGoosePixelX =
+    minimapSpawnPixel.x + telemetry.east * minimapPixelsPerMeter;
+  const minimapGoosePixelY =
+    minimapSpawnPixel.y - telemetry.north * minimapPixelsPerMeter;
+  const minimapCenterTileX = Math.floor(minimapGoosePixelX / MINIMAP_TILE_SIZE);
+  const minimapCenterTileY = Math.floor(minimapGoosePixelY / MINIMAP_TILE_SIZE);
+  const minimapMinimumTileX = minimapCenterTileX - MINIMAP_GRID_RADIUS;
+  const minimapMinimumTileY = minimapCenterTileY - MINIMAP_GRID_RADIUS;
+  const minimapTiles = useMemo(
+    () =>
+      Array.from({ length: MINIMAP_GRID_SIZE ** 2 }, (_, index) => {
+        const column = index % MINIMAP_GRID_SIZE;
+        const row = Math.floor(index / MINIMAP_GRID_SIZE);
+        const x = minimapMinimumTileX + column;
+        const y = minimapMinimumTileY + row;
+        return {
+          key: `${MINIMAP_ZOOM}/${x}/${y}`,
+          style: {
+            left: column * MINIMAP_TILE_SIZE,
+            top: row * MINIMAP_TILE_SIZE,
+            backgroundImage: `url(${getAerialTileUrl(MINIMAP_ZOOM, x, y)})`,
+          } as CSSProperties,
+        };
+      }),
+    [minimapMinimumTileX, minimapMinimumTileY],
+  );
+  const minimapGooseGridX =
+    minimapGoosePixelX - minimapMinimumTileX * MINIMAP_TILE_SIZE;
+  const minimapGooseGridY =
+    minimapGoosePixelY - minimapMinimumTileY * MINIMAP_TILE_SIZE;
   const minimapTileStyle = {
-    transform: `translate3d(${-minimapSpawnGridX - telemetry.east * minimapPixelsPerMeter}px, ${-minimapSpawnGridY + telemetry.north * minimapPixelsPerMeter}px, 0)`,
+    transform: `translate3d(${-minimapGooseGridX}px, ${-minimapGooseGridY}px, 0)`,
   } as CSSProperties;
-  const objectiveBearingRadians =
-    (telemetry.nearestSecretBearing * Math.PI) / 180;
-  const objectiveMarkerRadius =
-    telemetry.nearestSecretDistance === null
-      ? 0
-      : Math.min(
-          62,
-          Math.max(18, telemetry.nearestSecretDistance * minimapPixelsPerMeter),
-        );
-  const minimapObjectiveStyle = {
-    left: `calc(50% + ${Math.sin(objectiveBearingRadians) * objectiveMarkerRadius}px)`,
-    top: `calc(50% - ${Math.cos(objectiveBearingRadians) * objectiveMarkerRadius}px)`,
-  } as CSSProperties;
+  const usedMinimapSecretSlots = new Set<number>();
+  const minimapSecretMarkers = [...telemetry.secretMarkers]
+    .sort((first, second) => first.id.localeCompare(second.id))
+    .map((secret) => {
+      const offsetX = (secret.east - telemetry.east) * minimapPixelsPerMeter;
+      const offsetY = -(secret.north - telemetry.north) * minimapPixelsPerMeter;
+      const distance = Math.hypot(offsetX, offsetY);
+      const isOffscreen = distance > MINIMAP_SECRET_EDGE_RADIUS;
+      const scale = isOffscreen ? MINIMAP_SECRET_EDGE_RADIUS / distance : 1;
+      const desiredX = offsetX * scale;
+      const desiredY = offsetY * scale;
+      let slotIndex = -1;
+      let nearestSlotDistance = Number.POSITIVE_INFINITY;
+      MINIMAP_SECRET_SLOTS.forEach((slot, index) => {
+        if (usedMinimapSecretSlots.has(index)) return;
+        const slotDistance =
+          (slot.x - desiredX) ** 2 + (slot.y - desiredY) ** 2;
+        if (slotDistance >= nearestSlotDistance) return;
+        nearestSlotDistance = slotDistance;
+        slotIndex = index;
+      });
+      const position =
+        MINIMAP_SECRET_SLOTS[slotIndex] ??
+        MINIMAP_SECRET_SLOTS[usedMinimapSecretSlots.size];
+      if (slotIndex >= 0) usedMinimapSecretSlots.add(slotIndex);
+      return {
+        secret,
+        isOffscreen,
+        style: {
+          left: `calc(50% + ${position.x}px)`,
+          top: `calc(50% + ${position.y}px)`,
+        } as CSSProperties,
+      };
+    });
   const secretCompassStyle = {
     '--secret-bearing': `${telemetry.nearestSecretDirection}deg`,
   } as CSSProperties;
@@ -1034,7 +1096,7 @@ export function GooseGame() {
           aria-labelledby="launch-title"
         >
           <div className="eyebrow">
-            <span /> REAL-SCALE CAMPUS · AERIAL ROOFS · CHAOS SANDBOX
+            <span /> REAL-SCALE KALAMAZOO · AERIAL ROOFS · CHAOS SANDBOX
           </div>
           <h1 id="launch-title">
             Take wing
@@ -1043,7 +1105,8 @@ export function GooseGame() {
           </h1>
           <p>
             Fly, honk, recruit a V-formation flock, scatter trail-walking
-            students, skim across ponds, and uncover twenty-six campus secrets.
+            students, skim across ponds, and uncover {TOTAL_CAMPUS_SECRETS}{' '}
+            Kalamazoo secrets.
           </p>
           <Button
             className="launch-button"
@@ -1222,7 +1285,7 @@ export function GooseGame() {
           >
             <div className="minimap-desktop-title">
               <span>
-                <MapPin /> Campus map
+                <MapPin /> Kalamazoo map
               </span>
               <small>North up</small>
             </div>
@@ -1235,7 +1298,7 @@ export function GooseGame() {
             >
               <MapPin />
               <span>
-                <strong>Campus map</strong>
+                <strong>Kalamazoo map</strong>
                 <small>{minimapOpen ? 'Tap to close' : 'Tap to open'}</small>
               </span>
               <ChevronDown className="minimap-toggle-chevron" />
@@ -1243,7 +1306,7 @@ export function GooseGame() {
             <div className="minimap-panel" id="campus-minimap-panel">
               <figure
                 className="minimap-viewport"
-                aria-label={`Aerial map centered on the goose. ${telemetry.nearestSecretDistance === null ? 'All campus anomalies found.' : `Nearest anomaly ${nearestSecretLabel}, ${Math.round(telemetry.nearestSecretDistance)} meters away.`}`}
+                aria-label={`Aerial map centered on the goose with ${telemetry.secretMarkers.length} individual secret markers. ${telemetry.nearestSecretDistance === null ? 'All Kalamazoo anomalies found.' : `Nearest anomaly ${nearestSecretLabel}, ${Math.round(telemetry.nearestSecretDistance)} meters away.`}`}
               >
                 <div
                   className="minimap-tiles"
@@ -1251,7 +1314,7 @@ export function GooseGame() {
                   aria-hidden="true"
                 >
                   {minimapTilesEnabled &&
-                    MINIMAP_TILES.map((tile) => (
+                    minimapTiles.map((tile) => (
                       <span
                         key={tile.key}
                         className="minimap-tile"
@@ -1263,15 +1326,17 @@ export function GooseGame() {
                 <span className="minimap-north" aria-hidden="true">
                   N
                 </span>
-                {telemetry.nearestSecretDistance !== null && (
+                {minimapSecretMarkers.map(({ secret, isOffscreen, style }) => (
                   <span
-                    className="minimap-objective-marker"
-                    style={minimapObjectiveStyle}
+                    key={secret.id}
+                    className={`minimap-secret-marker${secret.found ? ' is-found' : ''}${isOffscreen ? ' is-offscreen' : ''}`}
+                    style={style}
                     aria-hidden="true"
+                    title={secret.label}
                   >
-                    <Radar />
+                    {secret.found ? <Check /> : <Radar />}
                   </span>
-                )}
+                ))}
                 <span
                   className="minimap-goose-marker"
                   style={{
@@ -1281,6 +1346,17 @@ export function GooseGame() {
                 >
                   <Bird />
                 </span>
+                <figcaption className="sr-only">
+                  <span>Secret markers:</span>
+                  <ul>
+                    {telemetry.secretMarkers.map((secret) => (
+                      <li key={secret.id}>
+                        {secret.label} —{' '}
+                        {secret.found ? 'found' : 'undiscovered'}
+                      </li>
+                    ))}
+                  </ul>
+                </figcaption>
               </figure>
               <a
                 className="minimap-attribution"
@@ -1299,11 +1375,6 @@ export function GooseGame() {
               TOP SPEED
             </div>
           )}
-
-          <div className="flight-reticle" aria-hidden="true">
-            <span />
-            <i />
-          </div>
 
           <div className="mode-stack">
             <span className={`mode-badge mode-${telemetry.mode}`}>
