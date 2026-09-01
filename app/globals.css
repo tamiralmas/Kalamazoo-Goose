@@ -482,6 +482,19 @@
   font-size: 9px;
 }
 
+.right-hud-stack {
+  position: absolute;
+  z-index: 4;
+  top: 102px;
+  right: calc(29px + env(safe-area-inset-right));
+  display: flex;
+  width: 255px;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 9px;
+  pointer-events: none;
+}
+
 .objective-card {
   position: absolute;
   z-index: 4;
@@ -498,6 +511,17 @@
   box-shadow: 0 13px 30px rgba(5, 25, 22, 0.1);
   backdrop-filter: blur(14px);
   pointer-events: none;
+}
+
+.right-hud-stack > .objective-card,
+.right-hud-stack > .stamina-card,
+.right-hud-stack > .chaos-card {
+  position: static;
+  top: auto;
+  right: auto;
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
 }
 
 .objective-card strong {
@@ -522,7 +546,7 @@
 
 .secret-bearing svg {
   transform: rotate(var(--secret-bearing, 0deg));
-  transition: transform 160ms linear;
+  transition: transform 100ms linear;
 }
 
 .mobile-alert-stack {
@@ -1332,6 +1356,7 @@ kbd {
 @media (max-width: 900px), (any-pointer: coarse) {
   .control-deck,
   .telemetry-panel,
+  .right-hud-stack,
   .objective-card,
   .stamina-card,
   .chaos-card,
@@ -1596,8 +1621,7 @@ kbd {
     bottom: calc(122px + env(safe-area-inset-bottom));
   }
   .jetstream-indicator {
-    top: 43%;
-    backdrop-filter: none;
+    display: none;
   }
   .is-playing .game-footer {
     display: none;
@@ -1628,7 +1652,9 @@ kbd {
   }
 }
 
-@media (max-width: 820px) {
+@media (max-width: 900px),
+  (any-pointer: coarse),
+  (max-height: 650px) and (min-width: 821px) and (pointer: fine) {
   .game-topbar {
     grid-template-columns: auto 1fr;
     gap: 12px;
@@ -1638,6 +1664,10 @@ kbd {
   }
 
   .location-chip {
+    display: none;
+  }
+
+  .game-shell.is-minimap-open .right-hud-stack {
     display: none;
   }
 
@@ -1723,6 +1753,12 @@ kbd {
   }
   .minimap-attribution {
     font-size: 8px;
+  }
+}
+
+@media (max-width: 520px) {
+  .brand-lockup > span:last-child {
+    display: none;
   }
 }
 
@@ -1900,6 +1936,11 @@ kbd {
 }
 
 @media (max-height: 560px) and (max-width: 1000px) and (orientation: landscape) {
+  .game-shell.is-minimap-open .mobile-status-strip,
+  .game-shell.is-minimap-open .mobile-alert-stack {
+    display: none;
+  }
+
   .game-topbar {
     grid-template-columns: auto 1fr;
     padding: calc(6px + env(safe-area-inset-top))

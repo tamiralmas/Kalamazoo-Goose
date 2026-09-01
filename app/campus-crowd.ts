@@ -244,21 +244,39 @@ export function createCrowdFleet(capacity: number): CrowdFleet {
     color: 0xffffff,
     roughness: 0.92,
     metalness: 0,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
   });
   const shirtMaterial = new THREE.MeshStandardMaterial({
     color: 0xffffff,
     roughness: 0.88,
     metalness: 0,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
   });
   const trousersMaterial = new THREE.MeshStandardMaterial({
     color: 0xffffff,
     roughness: 0.94,
     metalness: 0,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
   });
   const headGeometry = new THREE.DodecahedronGeometry(0.17, 0);
   const torsoGeometry = new THREE.BoxGeometry(0.38, 0.62, 0.24);
   const armGeometry = new THREE.CylinderGeometry(0.045, 0.055, 0.6, 6);
   const legGeometry = new THREE.CylinderGeometry(0.06, 0.075, 0.76, 6);
+  // Put each leg's local origin at its top so gait rotations hinge at the hip
+  // instead of spinning the whole cylinder around its middle.
+  legGeometry.translate(0, -0.38, 0);
   const heads = new THREE.InstancedMesh(
     headGeometry,
     skinMaterial,
@@ -676,7 +694,7 @@ export function updateCrowdVisuals(
         fleet.leftLegs,
         index,
         -0.11,
-        -0.68,
+        -0.3,
         0,
         -flail,
         0,
@@ -686,7 +704,7 @@ export function updateCrowdVisuals(
         fleet.rightLegs,
         index,
         0.11,
-        -0.68,
+        -0.3,
         0,
         flail,
         0,
@@ -730,8 +748,8 @@ export function updateCrowdVisuals(
     );
     placePart(fleet.leftArms, index, -0.25, 1.11, 0, limbSwing, 0, 0.08);
     placePart(fleet.rightArms, index, 0.25, 1.11, 0, -limbSwing, 0, -0.08);
-    placePart(fleet.leftLegs, index, -0.11, 0.42, 0, -limbSwing, 0, 0.025);
-    placePart(fleet.rightLegs, index, 0.11, 0.42, 0, limbSwing, 0, -0.025);
+    placePart(fleet.leftLegs, index, -0.11, 0.8, 0, -limbSwing);
+    placePart(fleet.rightLegs, index, 0.11, 0.8, 0, limbSwing);
   }
 
   const meshes = [

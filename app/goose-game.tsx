@@ -98,8 +98,8 @@ const MINIMAP_TILES = Array.from(
 );
 
 const INITIAL_TELEMETRY: GameTelemetry = {
-  speed: 16.2,
-  agl: 64,
+  speed: 13.8,
+  agl: 42,
   sink: 0.4,
   glideRatio: 12,
   stamina: 1,
@@ -123,6 +123,7 @@ const INITIAL_TELEMETRY: GameTelemetry = {
   treesResolved: 0,
   flockSize: 0,
   flockTotal: 8,
+  recruitableGooseInRange: false,
   altitudeBoost: 0,
   groundElevation: 0,
   east: 0,
@@ -716,11 +717,11 @@ export function GooseGame() {
     telemetry.nearestSecretDistance === null
       ? 'Complete'
       : `${Math.round(telemetry.nearestSecretDistance)} m`;
-  const flockDiscoveryCopy =
-    telemetry.flockSize === 0
-      ? 'Honk near glowing geese to recruit'
-      : `Flock ${telemetry.flockSize}/${telemetry.flockTotal}`;
+  const flockDiscoveryCopy = telemetry.recruitableGooseInRange
+    ? 'Honk now to recruit this goose'
+    : `Flock ${telemetry.flockSize}/${telemetry.flockTotal}`;
   const minimapHeadingDegrees = (telemetry.heading * 180) / Math.PI;
+  const showMobileDiscoveryChip = playing && !toast && telemetry.stall <= 0.22;
   const minimapTileStyle = {
     transform: `translate3d(${-minimapSpawnGridX - telemetry.east * minimapPixelsPerMeter}px, ${-minimapSpawnGridY + telemetry.north * minimapPixelsPerMeter}px, 0)`,
   } as CSSProperties;
@@ -743,7 +744,7 @@ export function GooseGame() {
 
   return (
     <main
-      className={`game-shell ${playing ? 'is-playing' : 'is-launching'}`}
+      className={`game-shell ${playing ? 'is-playing' : 'is-launching'}${minimapOpen ? ' is-minimap-open' : ''}`}
       data-campus-students={telemetry.students}
       data-nearby-students={telemetry.studentsNearby}
       data-students-on-mapped-walkways={telemetry.studentsOnMappedWalkways}
@@ -987,60 +988,62 @@ export function GooseGame() {
             </span>
           </section>
 
-          <aside className="objective-card">
-            <span
-              className="objective-icon secret-bearing"
-              style={secretCompassStyle}
+          <div className="right-hud-stack">
+            <aside className="objective-card">
+              <span
+                className="objective-icon secret-bearing"
+                style={secretCompassStyle}
+              >
+                <Radar />
+              </span>
+              <span>
+                <small>Nearest campus anomaly</small>
+                <strong>{nearestSecretLabel}</strong>
+                <em>
+                  {nearestSecretDistance} · {telemetry.secretsFound}/
+                  {telemetry.secretsTotal} secrets
+                </em>
+                <em className="flock-hint">{flockDiscoveryCopy}</em>
+              </span>
+            </aside>
+
+            <div
+              className="stamina-card"
+              aria-label={`Wing stamina ${Math.round(telemetry.stamina * 100)} percent`}
             >
-              <Radar />
-            </span>
-            <span>
-              <small>Nearest campus anomaly</small>
-              <strong>{nearestSecretLabel}</strong>
-              <em>
-                {nearestSecretDistance} · {telemetry.secretsFound}/
-                {telemetry.secretsTotal} secrets
+              <span>
+                <Activity />
+                <small>Wing stamina</small>
+                <strong>{Math.round(telemetry.stamina * 100)}%</strong>
+              </span>
+              <i>
+                <b style={{ width: `${telemetry.stamina * 100}%` }} />
+              </i>
+            </div>
+
+            <div
+              className="chaos-card"
+              aria-label={`Chaos score ${telemetry.score}, combo times ${telemetry.combo}`}
+            >
+              <span>
+                <Trophy />
+                <small>Chaos score</small>
+                <strong>{telemetry.score.toLocaleString()}</strong>
+              </span>
+              <em
+                className={
+                  telemetry.score >= 10_000
+                    ? 'is-infamous'
+                    : telemetry.combo > 1
+                      ? 'is-hot'
+                      : ''
+                }
+              >
+                {telemetry.score >= 10_000
+                  ? 'CROWD FEAR'
+                  : `COMBO ×${telemetry.combo}`}
               </em>
-              <em className="flock-hint">{flockDiscoveryCopy}</em>
-            </span>
-          </aside>
-
-          <div
-            className="stamina-card"
-            aria-label={`Wing stamina ${Math.round(telemetry.stamina * 100)} percent`}
-          >
-            <span>
-              <Activity />
-              <small>Wing stamina</small>
-              <strong>{Math.round(telemetry.stamina * 100)}%</strong>
-            </span>
-            <i>
-              <b style={{ width: `${telemetry.stamina * 100}%` }} />
-            </i>
-          </div>
-
-          <div
-            className="chaos-card"
-            aria-label={`Chaos score ${telemetry.score}, combo times ${telemetry.combo}`}
-          >
-            <span>
-              <Trophy />
-              <small>Chaos score</small>
-              <strong>{telemetry.score.toLocaleString()}</strong>
-            </span>
-            <em
-              className={
-                telemetry.score >= 10_000
-                  ? 'is-infamous'
-                  : telemetry.combo > 1
-                    ? 'is-hot'
-                    : ''
-              }
-            >
-              {telemetry.score >= 10_000
-                ? 'CROWD FEAR'
-                : `COMBO ×${telemetry.combo}`}
-            </em>
+            </div>
           </div>
 
           <aside
@@ -1121,7 +1124,7 @@ export function GooseGame() {
 
           {telemetry.altitudeBoost > 0 && (
             <div className="jetstream-indicator">
-              <Wind /> JETSTREAM · +{Math.round(telemetry.altitudeBoost * 47)}%
+              <Wind /> JETSTREAM · +{Math.round(telemetry.altitudeBoost * 16)}%
               TOP SPEED
             </div>
           )}
@@ -1274,7 +1277,7 @@ export function GooseGame() {
       )}
 
       <div className="mobile-alert-stack">
-        {playing && (
+        {showMobileDiscoveryChip && (
           <div
             className="mobile-discovery-chip"
             aria-label={`Nearest anomaly ${nearestSecretLabel}, ${nearestSecretDistance}. ${flockDiscoveryCopy}`}
