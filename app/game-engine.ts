@@ -18,11 +18,8 @@ import {
 } from './campus-crowd';
 import { BONUS_CHAOS_SECRETS, type BonusChaosSecret } from './chaos-secrets';
 import { WMU_TREE_POINTS } from './wmu-trees';
-
-// The former coordinate was the center of the Fetzer Center itself. This point is
-// on the open campus lawn immediately east of it, so a new goose never begins
-// inside a building while still spawning at WMU.
-export const WMU_SPAWN: [number, number] = [-85.616863, 42.284881];
+import { WMU_SPAWN } from './world-config';
+import { getAerialTileUrl } from './world-imagery';
 
 // Campus secrets were authored before the safe lawn spawn moved. Keep their
 // geographic anchor stable so a spawn tweak can never move a landmark again.
@@ -1428,7 +1425,7 @@ export function createGooseEngine(
       polygonOffsetFactor: -2,
       polygonOffsetUnits: -4,
     });
-    const url = `https://imagery.michigan.gov/server/rest/services/Michigan_imagery_public/MapServer/tile/${zoom}/${tileY}/${tileX}`;
+    const url = getAerialTileUrl(zoom, tileX, tileY);
     const loader = new THREE.TextureLoader();
     loader.setCrossOrigin('anonymous');
     const texture = loader.load(
@@ -1745,7 +1742,7 @@ export function createGooseEngine(
         geometry.translate(0, renderHeight + 0.08, 0);
         geometry.computeVertexNormals();
         const mesh = new THREE.Mesh(geometry, materials.roof);
-        mesh.name = 'MiSAIL aerial roof overlay';
+        mesh.name = 'World Imagery aerial roof overlay';
         mesh.position.y = centerGround;
         mesh.frustumCulled = true;
         mesh.renderOrder = 1;

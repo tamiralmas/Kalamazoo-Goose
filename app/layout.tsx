@@ -2,6 +2,8 @@ import type { Metadata, Viewport } from 'next';
 import { Geist, Geist_Mono } from 'next/font/google';
 import './globals.css';
 
+import { AERIAL_HOST_ORIGIN } from './world-imagery';
+
 const geistSans = Geist({
   variable: '--font-geist-sans',
   subsets: ['latin'],
@@ -53,6 +55,14 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
+      <head>
+        <link
+          rel="preconnect"
+          href={AERIAL_HOST_ORIGIN}
+          crossOrigin="anonymous"
+        />
+        <link rel="dns-prefetch" href={AERIAL_HOST_ORIGIN} />
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >

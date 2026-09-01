@@ -40,13 +40,14 @@ import type {
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 
 import { Button } from '@/components/ui/button';
+import type { FlightMode, GameTelemetry, GooseEngine } from '@/app/game-engine';
+import { WMU_SPAWN } from '@/app/world-config';
 import {
-  createGooseEngine,
-  WMU_SPAWN,
-  type FlightMode,
-  type GameTelemetry,
-  type GooseEngine,
-} from '@/app/game-engine';
+  AERIAL_ATTRIBUTION,
+  AERIAL_INFORMATION_URL,
+  AERIAL_TILE_TEMPLATE,
+  getAerialTileUrl,
+} from '@/app/world-imagery';
 
 const MINIMAP_ZOOM = 16;
 const MINIMAP_TILE_SIZE = 256;
@@ -85,7 +86,7 @@ const MINIMAP_TILES = Array.from(
     const row = Math.floor(index / MINIMAP_GRID_SIZE);
     const x = minimapMinimumTileX + column;
     const y = minimapMinimumTileY + row;
-    const url = `https://imagery.michigan.gov/server/rest/services/Michigan_imagery_public/MapServer/tile/${MINIMAP_ZOOM}/${y}/${x}`;
+    const url = getAerialTileUrl(MINIMAP_ZOOM, x, y);
     return {
       key: `${MINIMAP_ZOOM}/${x}/${y}`,
       style: {
@@ -235,6 +236,10 @@ export function GooseGame() {
           centerClampedToGround: false,
           attributionControl: false,
           pixelRatio,
+          fadeDuration: coarsePointer ? 0 : 300,
+          refreshExpiredTiles: !coarsePointer,
+          maxTileCacheZoomLevels: coarsePointer ? 2 : 5,
+          cancelPendingTileRequestsWhileZooming: true,
           canvasContextAttributes: {
             antialias: !coarsePointer,
             powerPreference: 'high-performance',
@@ -248,6 +253,42 @@ export function GooseGame() {
           'bottom-right',
         );
 
+        const installAerialImagery = () => {
+          if (map.getSource('wmug-aerial-imagery')) return;
+          const firstMapLayer = map
+            .getStyle()
+            .layers?.find((layer) => layer.type !== 'background')?.id;
+          map.addSource('wmug-aerial-imagery', {
+            type: 'raster',
+            tiles: [AERIAL_TILE_TEMPLATE],
+            tileSize: 256,
+            minzoom: 1,
+            maxzoom: 19,
+            attribution: AERIAL_ATTRIBUTION,
+          });
+          map.addLayer(
+            {
+              id: 'wmug-aerial-imagery',
+              type: 'raster',
+              source: 'wmug-aerial-imagery',
+              paint: {
+                'raster-opacity': 1,
+                'raster-saturation': -0.06,
+                'raster-contrast': 0.08,
+                'raster-brightness-min': 0.04,
+                'raster-brightness-max': 0.98,
+                'raster-fade-duration': 0,
+              },
+            },
+            firstMapLayer,
+          );
+        };
+
+        // Add aerial tiles as soon as the style is parsed. MapLibre can then fetch
+        // the ground in parallel with roads and buildings instead of starting the
+        // imagery only after every initial base-map tile has finished.
+        map.on('style.load', installAerialImagery);
+
         map.on('error', () => {
           if (!loaded && !cancelled) setMapError(true);
         });
@@ -256,38 +297,12 @@ export function GooseGame() {
           if (cancelled) return;
           loaded = true;
           setMapError(false);
+          // Three.js and the gameplay simulation are intentionally a second
+          // download. Ground imagery wins the first mobile network/render pass.
+          const engineModulePromise = import('@/app/game-engine');
           try {
+            installAerialImagery();
             const layers = map.getStyle().layers ?? [];
-            const firstMapLayer = layers.find(
-              (layer) => layer.type !== 'background',
-            )?.id;
-            map.addSource('wmug-aerial-imagery', {
-              type: 'raster',
-              tiles: [
-                'https://imagery.michigan.gov/server/rest/services/Michigan_imagery_public/MapServer/tile/{z}/{y}/{x}',
-              ],
-              tileSize: 256,
-              minzoom: 1,
-              maxzoom: 19,
-              bounds: [-90.52734, 41.64008, -82.26563, 48.34165],
-              attribution: 'Imagery © State of Michigan (MiSAIL)',
-            });
-            map.addLayer(
-              {
-                id: 'wmug-aerial-imagery',
-                type: 'raster',
-                source: 'wmug-aerial-imagery',
-                paint: {
-                  'raster-opacity': 1,
-                  'raster-saturation': -0.06,
-                  'raster-contrast': 0.08,
-                  'raster-brightness-min': 0.04,
-                  'raster-brightness-max': 0.98,
-                  'raster-fade-duration': 0,
-                },
-              },
-              firstMapLayer,
-            );
 
             // Let the aerial photography supply the ground detail while preserving
             // OSM water hit-testing, road guidance, labels, and real 3D geometry.
@@ -476,17 +491,24 @@ export function GooseGame() {
                 }
               }
 
-              try {
-                engineRef.current = createGooseEngine(maplibre, map, {
-                  onTelemetry: setTelemetry,
-                  onToast: showToast,
+              void engineModulePromise
+                .then(({ createGooseEngine }) => {
+                  if (cancelled) return;
+                  try {
+                    engineRef.current = createGooseEngine(maplibre, map, {
+                      onTelemetry: setTelemetry,
+                      onToast: showToast,
+                    });
+                    setTerrainReady(hasTerrain);
+                    setMapReady(true);
+                    setMapError(false);
+                  } catch {
+                    setMapError(true);
+                  }
+                })
+                .catch(() => {
+                  if (!cancelled) setMapError(true);
                 });
-                setTerrainReady(hasTerrain);
-                setMapReady(true);
-                setMapError(false);
-              } catch {
-                setMapError(true);
-              }
             };
 
             const tryTerrainReady = () => {
@@ -1113,11 +1135,11 @@ export function GooseGame() {
               </figure>
               <a
                 className="minimap-attribution"
-                href="https://www.michigan.gov/dtmb/services/maps/misail"
+                href={AERIAL_INFORMATION_URL}
                 target="_blank"
                 rel="noreferrer"
               >
-                MiSAIL imagery · State of Michigan
+                Esri World Imagery · contributors
               </a>
             </div>
           </aside>
@@ -1304,17 +1326,13 @@ export function GooseGame() {
       </div>
 
       <footer className="game-footer">
-        <span>MISAIL AERIAL ROOFS + OSM 3D</span>
+        <span>SATELLITE GROUND + AERIAL ROOFS + OSM 3D</span>
         <i />
         <span>{terrainReady ? 'REAL TERRAIN' : '3D BUILDINGS'} · WMU</span>
         <span className="map-credit">
           ©{' '}
-          <a
-            href="https://www.michigan.gov/dtmb/services/maps/misail"
-            target="_blank"
-            rel="noreferrer"
-          >
-            State of Michigan MiSAIL
+          <a href={AERIAL_INFORMATION_URL} target="_blank" rel="noreferrer">
+            Esri World Imagery contributors
           </a>{' '}
           ·{' '}
           <a
