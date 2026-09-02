@@ -6,6 +6,16 @@
 // a real DEM reading with a fallback elevation, and the only way to keep that
 // honest is to be able to unit test the rule that decides "resolved" from
 // "still waiting on a tile" without booting a WebGL context.
+//
+// How MapLibre puts a fill-extrusion on terrain, because the collider has to
+// copy it exactly: the whole polygon is lifted as one rigid slab by the DEM
+// under the vertex centroid of its rings (fill_extrusion_bucket.ts averages
+// every ring vertex, holes included, then get_elevation samples that point).
+// Nothing tilts with the hillside. Uphill the slab is buried, downhill its
+// base hangs in the air, and the roof is at `centroid DEM + render_height`
+// everywhere. Overzoomed tiles slice a big building into per-tile chunks that
+// each get their own centroid, which is why the engine treats each chunk
+// polygon it is handed as its own collider.
 
 /**
  * One DEM reading under a collider. `null` means the tile covering that point
@@ -15,7 +25,7 @@
  */
 export type ColliderTerrainSample = number | null;
 
-/** Center first, then the four AABB corners. */
+/** Vertex centroid first, then the four AABB corners. */
 export const COLLIDER_SAMPLE_COUNT = 5;
 
 /**
@@ -25,7 +35,10 @@ export const COLLIDER_SAMPLE_COUNT = 5;
 export const MIN_COLLIDER_HEIGHT = 2.6;
 
 export type ColliderTerrain = {
-  /** Terrain under the footprint center; where the roof overlay is drawn. */
+  /**
+   * Terrain under the vertex centroid: the elevation MapLibre lifts the whole
+   * extrusion by, and where the roof overlay is drawn.
+   */
   centerGround: number;
   /** Bottom of the collision box. */
   ground: number;
@@ -35,20 +48,62 @@ export type ColliderTerrain = {
   terrainResolved: boolean;
 };
 
+export type PlanarPoint = { x: number; z: number };
+
 /**
- * Writes the five sample points (center, then the four AABB corners) into
- * `out` as x,z pairs. Takes a caller-owned array because the resolve pass runs
- * this for dozens of buildings several times a second and must not allocate.
+ * The point MapLibre samples the DEM at for a polygon: the plain average of
+ * every ring vertex (outer ring and holes alike), skipping a ring's closing
+ * vertex when it repeats the first. Not the area centroid, and not the AABB
+ * center, which on an L-shaped wing can sit 20 m and several metres of
+ * hillside away from it.
+ */
+export const polygonVertexCentroid = (
+  rings: readonly (readonly PlanarPoint[])[],
+  out: PlanarPoint = { x: 0, z: 0 },
+): PlanarPoint => {
+  let sumX = 0;
+  let sumZ = 0;
+  let count = 0;
+  for (const ring of rings) {
+    const length = ring.length;
+    if (length === 0) continue;
+    const first = ring[0];
+    const last = ring[length - 1];
+    const closed = length > 1 && first.x === last.x && first.z === last.z;
+    const end = closed ? length - 1 : length;
+    for (let index = 0; index < end; index += 1) {
+      sumX += ring[index].x;
+      sumZ += ring[index].z;
+      count += 1;
+    }
+  }
+  if (count === 0) {
+    out.x = 0;
+    out.z = 0;
+    return out;
+  }
+  out.x = sumX / count;
+  out.z = sumZ / count;
+  return out;
+};
+
+/**
+ * Writes the five sample points (vertex centroid, then the four AABB corners)
+ * into `out` as x,z pairs. Takes a caller-owned array because the resolve pass
+ * runs this for dozens of buildings several times a second and must not
+ * allocate.
  */
 export const writeColliderSamplePoints = (
   out: number[],
+  centroidX: number,
+  centroidZ: number,
   minX: number,
   minZ: number,
   maxX: number,
   maxZ: number,
 ) => {
-  out[0] = (minX + maxX) * 0.5;
-  out[1] = (minZ + maxZ) * 0.5;
+  out[0] = centroidX;
+  out[1] = centroidZ;
   out[2] = minX;
   out[3] = minZ;
   out[4] = minX;
@@ -63,9 +118,10 @@ export const writeColliderSamplePoints = (
 /**
  * Fit a collision box to five terrain readings.
  *
- * All five usable: the box spans from the lowest corner (so it is solid all
- * the way down the downhill side) to `highest + renderHeight`, which is where
- * MapLibre draws the roof on the uphill corner.
+ * All five usable: the roof is exactly where MapLibre draws it, at the
+ * centroid reading plus render_height. The box reaches down to the lowest
+ * corner so the downhill side, where the drawn slab hangs above the terrain,
+ * is still a wall and not a gap to waddle through.
  *
  * Any reading unusable: the box is deliberately flat and anchored to the
  * fallback, and it is flagged unresolved so the caller can re-sample it later.
@@ -88,7 +144,6 @@ export const resolveColliderTerrain = (
   },
 ): ColliderTerrain => {
   let lowest = Number.POSITIVE_INFINITY;
-  let highest = Number.NEGATIVE_INFINITY;
   let resolved = samples.length >= COLLIDER_SAMPLE_COUNT;
   for (let index = 0; index < samples.length; index += 1) {
     const sample = samples[index];
@@ -97,7 +152,6 @@ export const resolveColliderTerrain = (
       break;
     }
     if (sample < lowest) lowest = sample;
-    if (sample > highest) highest = sample;
   }
 
   if (!resolved) {
@@ -112,7 +166,10 @@ export const resolveColliderTerrain = (
   const ground = lowest + renderMinHeight;
   out.centerGround = centerGround;
   out.ground = ground;
-  out.height = Math.max(MIN_COLLIDER_HEIGHT, highest + renderHeight - ground);
+  out.height = Math.max(
+    MIN_COLLIDER_HEIGHT,
+    centerGround + renderHeight - ground,
+  );
   out.terrainResolved = true;
   return out;
 };

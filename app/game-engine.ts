@@ -29,10 +29,13 @@ import {
 import {
   COLLIDER_SAMPLE_COUNT,
   MIN_COLLIDER_HEIGHT,
+  colliderRoof,
+  polygonVertexCentroid,
   resolveColliderTerrain,
   writeColliderSamplePoints,
   type ColliderTerrain,
   type ColliderTerrainSample,
+  type PlanarPoint,
 } from './building-terrain';
 import { BONUS_CHAOS_SECRETS, type BonusChaosSecret } from './chaos-secrets';
 import { isTouchDevice } from './device';
@@ -268,12 +271,23 @@ type BuildingCollider = {
   maxX: number;
   minZ: number;
   maxZ: number;
+  /** Vertex centroid of the footprint: the point MapLibre samples the DEM at. */
+  centroidX: number;
+  centroidZ: number;
   centerGround: number;
   ground: number;
   height: number;
   renderHeight: number;
   renderMinHeight: number;
   terrainResolved: boolean;
+  /**
+   * Consecutive building scans that did not hand this footprint back. The
+   * vector source slices a building into one chunk per overzoomed tile, and
+   * each chunk is drawn at its own centroid elevation, so when the camera
+   * moves and MapLibre swaps a coarse chunk for finer ones (or back), the old
+   * chunk's box and overlay have to go with it.
+   */
+  missingScans: number;
   outer: THREE.Vector2[];
   holes: THREE.Vector2[][];
 };
@@ -393,12 +407,15 @@ const SERVICE_CONE_MIN_LENGTH = 60;
 const SERVICE_CONE_RADIUS = 600;
 const SERVICE_CONE_ROW_LIMIT = 40;
 // The jetstream is advertised as "a 10% boost above 50 m", and these are the
-// numbers that make that literally true. The ramp is short on purpose: the
-// boost has to be all the way in a few meters above the arming height, or the
-// HUD reads "+3%" for the whole climb and the promise looks like a lie.
+// numbers that make that literally true. The boost arms the moment the goose
+// crosses 50 m and is at full strength half a second later, whatever the
+// climb rate, so the HUD's "+10%" and the airspeed agree. It lets go below
+// 47 m, a little hysteresis so a wobble at 50 m does not flicker it.
 const ALTITUDE_BOOST_HEIGHT = 50;
-const ALTITUDE_BOOST_FULL_HEIGHT = 58;
 const ALTITUDE_BOOST_RELEASE_HEIGHT = 47;
+/** Seconds for the boost to fade in once armed, and out once released. */
+const ALTITUDE_BOOST_RAMP_IN = 0.5;
+const ALTITUDE_BOOST_RAMP_OUT = 0.35;
 const BASE_CRUISE_SPEED = 18.5;
 const BASE_MAX_FLIGHT_SPEED = 38;
 const JETSTREAM_SPEED_SCALE = 1 + JETSTREAM_BOOST_PERCENT / 100;
@@ -409,6 +426,14 @@ const BUILDING_ACTIVE_RADIUS = 150;
 const BUILDING_INGEST_RADIUS = 950;
 const BUILDING_RETENTION_RADIUS = 1_800;
 const BUILDING_RESCAN_DISTANCE = 240;
+/**
+ * Building scans in a row that must miss a chunk before its collider and
+ * overlay are dropped as no longer drawn. Two is a tile reloading; three is
+ * the camera having moved on to a different chunking.
+ */
+const STALE_CHUNK_SCANS = 3;
+/** Tallest lip a goose on foot walks up rather than into, in metres. */
+const STEP_UP_HEIGHT = 0.7;
 /** How far out colliders keep chasing a DEM that had not decoded yet. */
 const UNRESOLVED_COLLIDER_RADIUS = 1_400;
 /** Seconds between sweeps of those colliders while playing. */
@@ -488,17 +513,9 @@ const smoothstep = (low: number, high: number, value: number) => {
 };
 
 // jetstreamAlways (Jet Goose) pins the boost to full strength no matter the
-// altitude; the two callers below just forward modifiers.jetstreamAlways.
-const altitudeBoostStrength = (
-  agl: number,
-  active: boolean,
-  jetstreamAlways = false,
-) =>
-  jetstreamAlways
-    ? 1
-    : active
-      ? smoothstep(ALTITUDE_BOOST_HEIGHT, ALTITUDE_BOOST_FULL_HEIGHT, agl)
-      : 0;
+// altitude; `ramp` is the engine's 0..1 fade, driven by time since arming.
+const altitudeBoostStrength = (ramp: number, jetstreamAlways = false) =>
+  jetstreamAlways ? 1 : smoothstep(0, 1, ramp);
 
 const neutralFlightAlpha = (speed: number, liftScale: number) => {
   const dynamicPressure =
@@ -1355,6 +1372,8 @@ export function createGooseEngine(
   let waterContactLatched = false;
   let waterContactReleaseTime = 0;
   let altitudeBoostActive = false;
+  /** 0..1 fade of the jetstream, so arming at 50 m is not a jolt. */
+  let altitudeBoostRamp = 0;
   const texturedBuildingKeys = new Set<string>();
   const texturedBuildingMeshByKey = new Map<string, THREE.Mesh>();
   const texturedBuildingGroup = new THREE.Group();
@@ -1837,6 +1856,7 @@ export function createGooseEngine(
     height: 0,
     terrainResolved: false,
   };
+  const colliderCentroidScratch: PlanarPoint = { x: 0, z: 0 };
 
   /**
    * Fit a collision box to the DEM under a footprint. A reading the DEM cannot
@@ -1845,8 +1865,15 @@ export function createGooseEngine(
    * the ground under the goose, which in the Valleys is up to 25 m above the
    * building, and one fallback corner among four real ones was enough to bake
    * a 12 m box onto a 5 m building forever.
+   *
+   * The roof lands on the centroid reading: MapLibre lifts the whole slab by
+   * the DEM under the footprint's vertex centroid, so that is the only sample
+   * the roof may follow. Fitting it to the highest AABB corner instead put a
+   * 480 m Goldsworth Valley chunk 11 m above the building it was drawn on.
    */
   const readColliderTerrain = (
+    centroidX: number,
+    centroidZ: number,
     minX: number,
     minZ: number,
     maxX: number,
@@ -1854,7 +1881,15 @@ export function createGooseEngine(
     renderHeight: number,
     renderMinHeight: number,
   ) => {
-    writeColliderSamplePoints(colliderSamplePoints, minX, minZ, maxX, maxZ);
+    writeColliderSamplePoints(
+      colliderSamplePoints,
+      centroidX,
+      centroidZ,
+      minX,
+      minZ,
+      maxX,
+      maxZ,
+    );
     for (let index = 0; index < COLLIDER_SAMPLE_COUNT; index += 1) {
       if (!terrainEnabled) {
         colliderSamples[index] = campusGroundFallback;
@@ -2026,30 +2061,22 @@ export function createGooseEngine(
     return materialSet;
   };
 
-  const pruneDistantBuildings = () => {
-    const maximumDistanceSquared = BUILDING_RETENTION_RADIUS ** 2;
-    let changed = false;
-    for (let index = buildingColliders.length - 1; index >= 0; index -= 1) {
-      const building = buildingColliders[index];
-      const centerX = (building.minX + building.maxX) * 0.5;
-      const centerZ = (building.minZ + building.maxZ) * 0.5;
-      const dx = centerX - state.position.x;
-      const dz = centerZ - state.position.z;
-      if (dx * dx + dz * dz <= maximumDistanceSquared) continue;
-
-      buildingColliders.splice(index, 1);
-      buildingColliderByKey.delete(building.sourceKey);
-      const roofMesh = texturedBuildingMeshByKey.get(building.sourceKey);
-      if (roofMesh) {
-        texturedBuildingGroup.remove(roofMesh);
-        roofMesh.geometry.dispose();
-        texturedBuildingMeshByKey.delete(building.sourceKey);
-        texturedBuildingKeys.delete(building.sourceKey);
-      }
-      changed = true;
+  /** Drops one collider and the aerial roof overlay built for it, if any. */
+  const removeBuildingCollider = (index: number) => {
+    const building = buildingColliders[index];
+    buildingColliders.splice(index, 1);
+    buildingColliderByKey.delete(building.sourceKey);
+    const roofMesh = texturedBuildingMeshByKey.get(building.sourceKey);
+    if (roofMesh) {
+      texturedBuildingGroup.remove(roofMesh);
+      roofMesh.geometry.dispose();
+      texturedBuildingMeshByKey.delete(building.sourceKey);
     }
-    if (!changed) return false;
+    texturedBuildingKeys.delete(building.sourceKey);
+  };
 
+  /** Rebuilds the active set and frees roof textures nothing draws any more. */
+  const finishBuildingRemoval = () => {
     buildingCollectionGeneration += 1;
     activeColliderSourceCount = -1;
     refreshActiveBuildingColliders(true);
@@ -2062,6 +2089,59 @@ export function createGooseEngine(
       materials.roof.dispose();
       buildingMaterials.delete(key);
     });
+  };
+
+  const pruneDistantBuildings = () => {
+    const maximumDistanceSquared = BUILDING_RETENTION_RADIUS ** 2;
+    let changed = false;
+    for (let index = buildingColliders.length - 1; index >= 0; index -= 1) {
+      const building = buildingColliders[index];
+      const centerX = (building.minX + building.maxX) * 0.5;
+      const centerZ = (building.minZ + building.maxZ) * 0.5;
+      const dx = centerX - state.position.x;
+      const dz = centerZ - state.position.z;
+      if (dx * dx + dz * dz <= maximumDistanceSquared) continue;
+      removeBuildingCollider(index);
+      changed = true;
+    }
+    if (!changed) return false;
+    finishBuildingRemoval();
+    return true;
+  };
+
+  /**
+   * Drops the chunks MapLibre stopped drawing.
+   *
+   * querySourceFeatures hands back the building geometry of every tile the
+   * map is rendering right now, and with a pitched camera that is a mix of
+   * zooms: 28 m chunks under the goose, 480 m chunks across the valley. Each
+   * chunk is extruded at its own centroid elevation. When the camera moves and
+   * a coarse chunk gives way to fine ones (or a zoom-out does the reverse) the
+   * old chunk's box and overlay no longer match anything on screen, and on a
+   * hillside that was a blurry slab hanging metres above the building.
+   *
+   * Three consecutive scans without the chunk is the bar, so a tile that is
+   * merely reloading does not drop the roof from under the goose; the roof it
+   * is standing on is never dropped here at all.
+   */
+  const pruneUnseenBuildingChunks = () => {
+    const scanRadiusSquared = (BUILDING_INGEST_RADIUS - 60) ** 2;
+    let changed = false;
+    for (let index = buildingColliders.length - 1; index >= 0; index -= 1) {
+      const building = buildingColliders[index];
+      if (building.missingScans < STALE_CHUNK_SCANS) continue;
+      if (colliderCenterDistanceSquared(building) > scanRadiusSquared) continue;
+      if (
+        state.mode !== 'flying' &&
+        Math.abs(state.ground - colliderRoof(building)) < 0.5 &&
+        pointInBuilding(state.position.x, state.position.z, building)
+      )
+        continue;
+      removeBuildingCollider(index);
+      changed = true;
+    }
+    if (!changed) return false;
+    finishBuildingRemoval();
     return true;
   };
 
@@ -2100,6 +2180,18 @@ export function createGooseEngine(
     }>;
     let changed = prunedDistantBuildings;
     let terrainQueryBudget = coarsePointer ? 7 : 12;
+    // Every collider in scan range starts this pass presumed gone; the loop
+    // below clears the count for each footprint the map still hands back.
+    // An empty answer is the source mid-reload, not a campus with no
+    // buildings, so it does not count against anything.
+    const countMissingScans = features.length > 0;
+    if (countMissingScans) {
+      const scanRadiusSquared = (BUILDING_INGEST_RADIUS - 60) ** 2;
+      for (const building of buildingColliders) {
+        if (colliderCenterDistanceSquared(building) <= scanRadiusSquared)
+          building.missingScans += 1;
+      }
+    }
 
     features.forEach((feature) => {
       const polygonSets =
@@ -2167,6 +2259,7 @@ export function createGooseEngine(
           texturedBuildingKeys.size < texturedRoofLimit &&
           distanceFromPlayer <= TEXTURED_ROOF_RADIUS;
         const existingCollider = buildingColliderByKey.get(footprintKey);
+        if (existingCollider) existingCollider.missingScans = 0;
         const nearPlayer =
           Math.hypot(centerX - state.position.x, centerZ - state.position.z) <=
           BUILDING_ACTIVE_RADIUS + 110;
@@ -2188,6 +2281,29 @@ export function createGooseEngine(
         if (existingCollider && !wantsTexturedRoof && !needsTerrainRefresh)
           return;
 
+        const localHoles = rings.slice(1).map((holeRing) =>
+          holeRing
+            .filter((coordinate) => coordinate.length >= 2)
+            .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
+            .slice(0, -1),
+        );
+        // The DEM point MapLibre lifts this chunk by. Holes count, exactly as
+        // the bucket averages them; the scratch is copied out at once because
+        // readColliderTerrain and the next polygon both reuse it.
+        let centroidX: number;
+        let centroidZ: number;
+        if (existingCollider) {
+          centroidX = existingCollider.centroidX;
+          centroidZ = existingCollider.centroidZ;
+        } else {
+          const centroid = polygonVertexCentroid(
+            [localOuter, ...localHoles],
+            colliderCentroidScratch,
+          );
+          centroidX = centroid.x;
+          centroidZ = centroid.z;
+        }
+
         let centerGround =
           existingCollider?.centerGround ?? campusGroundFallback;
         let colliderGround =
@@ -2204,7 +2320,7 @@ export function createGooseEngine(
             // campus shift only needs the center delta to slide it; its height
             // is still the right height for that hillside.
             const reading = terrainEnabled
-              ? queryGroundElevation(localToLngLat(centerX, centerZ))
+              ? queryGroundElevation(localToLngLat(centroidX, centroidZ))
               : campusGroundFallback;
             if (
               typeof reading === 'number' &&
@@ -2236,6 +2352,8 @@ export function createGooseEngine(
             if (terrainChanged) changed = true;
           } else {
             const fit = readColliderTerrain(
+              centroidX,
+              centroidZ,
               minX,
               minZ,
               maxX,
@@ -2252,12 +2370,6 @@ export function createGooseEngine(
 
         if (existingCollider && !wantsTexturedRoof) return;
 
-        const localHoles = rings.slice(1).map((holeRing) =>
-          holeRing
-            .filter((coordinate) => coordinate.length >= 2)
-            .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
-            .slice(0, -1),
-        );
         const colliderOuter = localOuter
           .slice(0, -1)
           .map((point) => new THREE.Vector2(point.x, point.z));
@@ -2278,12 +2390,15 @@ export function createGooseEngine(
             maxX,
             minZ,
             maxZ,
+            centroidX,
+            centroidZ,
             centerGround,
             ground: colliderGround,
             height: colliderHeight,
             renderHeight,
             renderMinHeight,
             terrainResolved: colliderTerrainResolved,
+            missingScans: 0,
             outer: colliderOuter,
             holes: colliderHoles,
           };
@@ -2342,6 +2457,7 @@ export function createGooseEngine(
       });
     });
 
+    if (countMissingScans && pruneUnseenBuildingChunks()) changed = true;
     if (changed) settleFlockRoosts();
     return changed;
   };
@@ -2401,6 +2517,8 @@ export function createGooseEngine(
     for (let index = 0; index < attempts; index += 1) {
       const building = unresolvedColliders[index];
       const fit = readColliderTerrain(
+        building.centroidX,
+        building.centroidZ,
         building.minX,
         building.minZ,
         building.maxX,
@@ -6339,6 +6457,24 @@ export function createGooseEngine(
         state.position.z,
         building,
       );
+      // A waddling goose steps onto a lip no taller than a curb instead of
+      // being walled by it. One roof is several tile chunks, each drawn at
+      // its own centroid elevation, so on a slope neighbouring chunks sit a
+      // few tens of centimetres apart; MapLibre draws that lip and the goose
+      // should hop it, not bounce off it.
+      if (
+        state.mode === 'waddling' &&
+        tumbleRemaining <= 0 &&
+        roof > state.position.y &&
+        roof - state.position.y <= STEP_UP_HEIGHT
+      ) {
+        if (inside) {
+          state.position.y = roof + 0.04;
+          state.ground = roof;
+          buildingContactThisStep = true;
+        }
+        continue;
+      }
       const boundary = closestBuildingBoundary(
         state.position.x,
         state.position.z,
@@ -6446,6 +6582,20 @@ export function createGooseEngine(
           state.position.z,
           building,
         );
+        // Same curb rule as above: a lip a waddling goose can step onto is
+        // not a wall to be pushed off, or it could never reach the step.
+        if (
+          state.mode === 'waddling' &&
+          tumbleRemaining <= 0 &&
+          roof - state.position.y <= STEP_UP_HEIGHT
+        ) {
+          if (inside) {
+            state.position.y = roof + 0.04;
+            state.ground = roof;
+            buildingContactThisStep = true;
+          }
+          continue;
+        }
         const boundary = closestBuildingBoundary(
           state.position.x,
           state.position.z,
@@ -6832,9 +6982,11 @@ export function createGooseEngine(
     } else if (agl < ALTITUDE_BOOST_RELEASE_HEIGHT) {
       altitudeBoostActive = false;
     }
+    altitudeBoostRamp = altitudeBoostActive
+      ? Math.min(1, altitudeBoostRamp + dt / ALTITUDE_BOOST_RAMP_IN)
+      : Math.max(0, altitudeBoostRamp - dt / ALTITUDE_BOOST_RAMP_OUT);
     const altitudeBoost = altitudeBoostStrength(
-      agl,
-      altitudeBoostActive,
+      altitudeBoostRamp,
       modifiers.jetstreamAlways,
     );
     const flare =
@@ -7760,6 +7912,14 @@ export function createGooseEngine(
     else if (state.mode === 'planing') simulateWaterPlaning(dt);
     else if (state.mode === 'flying') simulateFlight(dt);
     else simulateGround(dt);
+    if (state.mode !== 'flying') {
+      // Only flight arms the jetstream; a landing, splash or tumble lets it go.
+      altitudeBoostActive = false;
+      altitudeBoostRamp = Math.max(
+        0,
+        altitudeBoostRamp - dt / ALTITUDE_BOOST_RAMP_OUT,
+      );
+    }
     resolveBuildingInteractions();
     refreshBuildingSupport();
     enforceSurfacePostcondition();
@@ -7803,10 +7963,10 @@ export function createGooseEngine(
         .addScaledVector(forward, -UP.dot(forward))
         .normalize();
       const liftDirection = liftBase.applyAxisAngle(forward, -pose.bank);
-      const poseAgl = pose.position.y - pose.ground;
-      const poseBoost = altitudeBoostActive
-        ? smoothstep(ALTITUDE_BOOST_HEIGHT, ALTITUDE_BOOST_FULL_HEIGHT, poseAgl)
-        : 0;
+      const poseBoost = altitudeBoostStrength(
+        altitudeBoostRamp,
+        modifiers.jetstreamAlways,
+      );
       const visualNeutralAlpha =
         pose.mode === 'flying'
           ? neutralFlightAlpha(
@@ -8059,8 +8219,7 @@ export function createGooseEngine(
       ) / DEG;
     const agl = Math.max(0, state.position.y - state.ground);
     const altitudeBoost = altitudeBoostStrength(
-      agl,
-      altitudeBoostActive,
+      altitudeBoostRamp,
       modifiers.jetstreamAlways,
     );
     const recruitableGooseInRange = flockGeese.some((member) => {
@@ -8254,6 +8413,7 @@ export function createGooseEngine(
     waterContactLatched = false;
     waterContactReleaseTime = 0;
     altitudeBoostActive = false;
+    altitudeBoostRamp = 0;
     jetstreamToastShown = false;
     crowdRelocationClock = 0;
     trafficAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
