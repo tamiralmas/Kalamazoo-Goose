@@ -15,3 +15,12 @@ export const getAerialTileUrl = (zoom: number, x: number, y: number) =>
   `${AERIAL_HOST_ORIGIN}/server/rest/services/Michigan_imagery_public/MapServer/tile/${zoom}/${y}/${x}`;
 
 export const AERIAL_SPAWN_PRELOAD_URL = getAerialTileUrl(15, 8590, 12129);
+
+// Mapterhorn publishes global Terrarium-encoded DEM tiles. Its TileJSON omits
+// maxzoom, and the Kalamazoo coverage ends at zoom 16, so the source declares
+// the ceiling itself instead of letting MapLibre probe zooms 17-22.
+export const TERRAIN_TILE_TEMPLATE =
+  'https://tiles.mapterhorn.com/{z}/{x}/{y}.webp';
+export const TERRAIN_MAX_ZOOM = 16;
+export const TERRAIN_ATTRIBUTION =
+  'Terrain © <a href="https://mapterhorn.com/attribution/" target="_blank">Mapterhorn</a>';

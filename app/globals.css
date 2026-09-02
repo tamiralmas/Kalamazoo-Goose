@@ -722,6 +722,22 @@ kbd {
   backdrop-filter: blur(16px);
 }
 
+/* Trick / score toasts read as an award, not a tip: gold ring, brighter type,
+   and a short pop so consecutive combo hits are visibly separate events. */
+.game-toast.is-score {
+  border-color: rgba(241, 197, 0, 0.72);
+  background: rgba(56, 30, 16, 0.94);
+  padding: 10px 18px;
+  box-shadow:
+    0 0 0 3px rgba(241, 197, 0, 0.14),
+    0 14px 40px rgba(47, 26, 16, 0.28);
+  color: #ffd970;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  animation: score-toast-in 260ms cubic-bezier(0.2, 1.4, 0.4, 1);
+}
+
 @keyframes toast-in {
   from {
     opacity: 0;
@@ -730,6 +746,28 @@ kbd {
   to {
     opacity: 1;
     transform: translate(-50%, 0);
+  }
+}
+
+@keyframes score-toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 6px) scale(0.82);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0) scale(1);
+  }
+}
+
+@keyframes score-toast-in-static {
+  from {
+    opacity: 0;
+    transform: scale(0.82);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
   }
 }
 
@@ -1311,7 +1349,10 @@ kbd {
   }
 }
 
-@media (max-width: 900px), (any-pointer: coarse) {
+/* Touch layout: narrow viewports, or devices whose primary pointer is a finger.
+   `(any-pointer: coarse)` also matches touchscreen laptops, so it is avoided here
+   and in app/device.ts on purpose. */
+@media (max-width: 900px), (pointer: coarse) {
   .control-deck,
   .telemetry-panel,
   .right-hud-stack,
@@ -1453,6 +1494,9 @@ kbd {
 
   .mobile-alert-stack > .game-toast {
     width: max-content;
+  }
+  .mobile-alert-stack > .game-toast.is-score {
+    animation: score-toast-in-static 260ms cubic-bezier(0.2, 1.4, 0.4, 1);
   }
   .mobile-alert-stack > .stall-warning {
     width: max-content;
@@ -1614,7 +1658,7 @@ kbd {
 }
 
 @media (max-width: 900px),
-  (any-pointer: coarse),
+  (pointer: coarse),
   (max-height: 650px) and (min-width: 821px) and (pointer: fine) {
   .game-topbar {
     grid-template-columns: auto 1fr;
@@ -2006,6 +2050,8 @@ kbd {
     transition: none;
   }
   .game-toast,
+  .game-toast.is-score,
+  .mobile-alert-stack > .game-toast.is-score,
   .chaos-card em.is-hot,
   .chaos-card em.is-infamous,
   .stall-warning,

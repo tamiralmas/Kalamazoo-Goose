@@ -15,19 +15,22 @@ npm install
 npm run dev
 ```
 
-Open the local address shown in the terminal.
+Open the local address shown in the terminal. `npm run build:pages` produces the static GitHub Pages build in `dist-pages/`.
 
 ## Controls
 
-- `W` / `S`: pitch down / up
-- `A` / `D`: steer
-- `Space`: flap or jump
-- `Shift`: dive
-- `H`: honk
-- Mouse wheel or camera buttons: zoom
+Keyboard and mouse:
 
-Touch controls are included for mobile browsers.
+- `W` / `S`: dive / pull up while flying; waddle forward / back up on the ground
+- `A` / `D`: bank while flying; steer on the ground or water
+- `Space`: tap for one wingbeat, hold for continuous flapping; takes off from the ground or water
+- `Shift`: flare and airbrake (softens landings); brakes while planing on water
+- `E` or `H`: honk (scatters students, stops traffic, recruits geese, triggers secrets)
+- Mouse drag: orbit the camera · scroll wheel or the camera buttons: zoom · double-click: reset the camera
+- Respawn button (top right): return to the WMU spawn without losing score or secrets
+
+Touch: on-screen controls appear on phones and tablets. Drag to orbit, pinch to zoom, double-tap to reset the camera.
 
 ## World data
 
-The game combines OpenStreetMap-derived roads, buildings, water, trails, and vegetation with elevation and aerial map layers across Kalamazoo.
+The game combines OpenStreetMap-derived roads, buildings, water, trails, and vegetation (via OpenFreeMap) with Mapterhorn terrain and State of Michigan MiSAIL aerial imagery across Kalamazoo.

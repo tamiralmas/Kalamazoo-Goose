@@ -17,6 +17,7 @@ import {
   type CrowdRoute,
 } from './campus-crowd';
 import { BONUS_CHAOS_SECRETS, type BonusChaosSecret } from './chaos-secrets';
+import { isTouchDevice } from './device';
 import { WMU_TREE_POINTS } from './wmu-trees';
 import { WMU_SPAWN } from './world-config';
 import { getAerialTileUrl } from './world-imagery';
@@ -83,9 +84,13 @@ export type GameTelemetry = {
 
 type MapLibreModule = typeof import('maplibre-gl');
 
+// Score toasts announce a named trick and its points; informational toasts
+// (landing tips, traffic yielding) must not overwrite one that just appeared.
+export type ToastPriority = 'info' | 'score';
+
 type Hooks = {
   onTelemetry: (telemetry: GameTelemetry) => void;
-  onToast: (message: string) => void;
+  onToast: (message: string, priority?: ToastPriority) => void;
 };
 
 export type GooseEngine = {
@@ -824,9 +829,10 @@ export function createGooseEngine(
   map: MapLibreMap,
   hooks: Hooks,
 ): GooseEngine {
-  const coarsePointer = window.matchMedia('(any-pointer: coarse)').matches;
+  const coarsePointer = isTouchDevice();
   const fixedStep = coarsePointer ? 1 / 60 : FIXED_DT;
   const texturedRoofLimit = coarsePointer ? 180 : 320;
+  const flareHint = coarsePointer ? 'hold Flare' : 'hold Shift to flare';
   const buildingTextureMaxZoom = coarsePointer ? 16 : BUILDING_TEXTURE_MAX_ZOOM;
   const scene = new THREE.Scene();
   const camera = new THREE.Camera();
@@ -1050,6 +1056,8 @@ export function createGooseEngine(
   let elapsedTime = 0;
   let queuedFlaps = 0;
   let queuedHonks = 0;
+  let takeoffHintShown = false;
+  let firstHonkAcknowledged = false;
   let gooseWaddlePhase = 0;
   let honkCooldown = 0;
   let chaosScore = 0;
@@ -4456,6 +4464,7 @@ export function createGooseEngine(
     chaosScore += points;
     hooks.onToast(
       `${label} · +${points}${chaosCombo > 1 ? ` · x${chaosCombo}` : ''}`,
+      'score',
     );
   };
 
@@ -5023,8 +5032,12 @@ export function createGooseEngine(
       awardChaos(50 * scoredCars + 35 * crowdReaction.scored, label);
     } else if (crowdReaction.panicked > 0) {
       hooks.onToast(`HONK! · ${crowdReaction.panicked} students scattered`);
-    } else if (recruitedGeese === 0) {
-      hooks.onToast('HONK!');
+    } else if (recruitedGeese === 0 && !firstHonkAcknowledged) {
+      // The ring, the sound, and the button state already confirm every honk.
+      // A bare "HONK!" toast on each press kept overwriting score and secret
+      // toasts, so only the first quiet honk of a session gets one.
+      firstHonkAcknowledged = true;
+      hooks.onToast('HONK! · nobody around to hear it');
     }
     registerSecretHonk();
   };
@@ -5547,7 +5560,10 @@ export function createGooseEngine(
       waterSprayClock = 0;
       airborneTime = 0;
       peakAgl = 0;
-      hooks.onToast('Wingbeat — you are airborne');
+      if (!takeoffHintShown) {
+        takeoffHintShown = true;
+        hooks.onToast('Wingbeat — you are airborne');
+      }
     }
   };
 
@@ -5853,7 +5869,7 @@ export function createGooseEngine(
           hooks.onToast(
             impact < 2.4
               ? 'Clean water landing — splash!'
-              : 'Big splash — hold Shift to flare',
+              : `Big splash — ${flareHint} before touchdown`,
           );
         }
       } else {
@@ -5874,7 +5890,7 @@ export function createGooseEngine(
           hooks.onToast(
             impact < 2.4
               ? 'Touchdown — now waddle'
-              : 'Bumpy landing — flare with Shift',
+              : `Bumpy landing — ${flareHint} to soften it`,
           );
         }
       }

@@ -43,13 +43,22 @@ import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&ur
 
 import { Button } from '@/components/ui/button';
 import { TOTAL_CAMPUS_SECRETS } from '@/app/chaos-secrets';
-import type { FlightMode, GameTelemetry, GooseEngine } from '@/app/game-engine';
+import { isTouchDevice } from '@/app/device';
+import type {
+  FlightMode,
+  GameTelemetry,
+  GooseEngine,
+  ToastPriority,
+} from '@/app/game-engine';
 import { WMU_SPAWN } from '@/app/world-config';
 import {
   AERIAL_ATTRIBUTION,
   AERIAL_BOUNDS,
   AERIAL_INFORMATION_URL,
   AERIAL_TILE_TEMPLATE,
+  TERRAIN_ATTRIBUTION,
+  TERRAIN_MAX_ZOOM,
+  TERRAIN_TILE_TEMPLATE,
   getAerialTileUrl,
 } from '@/app/world-imagery';
 
@@ -230,12 +239,23 @@ type TouchControlPointer = {
   button: HTMLButtonElement | null;
 };
 
+type GameToast = {
+  message: string;
+  priority: ToastPriority;
+  shownAt: number;
+};
+
+const TOAST_DURATION_MS = 3400;
+// An informational toast waits this long before it may replace a score toast.
+const SCORE_TOAST_HOLD_MS = 1800;
+
 export function GooseGame() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const engineRef = useRef<GooseEngine | null>(null);
   const playingRef = useRef(false);
   const toastTimerRef = useRef<number | null>(null);
+  const toastRef = useRef<GameToast | null>(null);
   const cameraPointersRef = useRef(new Map<number, CameraPointer>());
   const keyboardCodesRef = useRef(new Set<string>());
   const touchPointersRef = useRef(new Map<number, TouchControlPointer>());
@@ -252,7 +272,7 @@ export function GooseGame() {
     string[]
   >([]);
   const [telemetry, setTelemetry] = useState(INITIAL_TELEMETRY);
-  const [toast, setToast] = useState<string | null>(null);
+  const [toast, setToast] = useState<GameToast | null>(null);
 
   const handleTelemetry = useCallback((nextTelemetry: GameTelemetry) => {
     setTelemetry(nextTelemetry);
@@ -321,7 +341,7 @@ export function GooseGame() {
     let loaded = false;
     let terrainTimer: number | null = null;
     let mapCanvas: HTMLCanvasElement | null = null;
-    const coarsePointer = window.matchMedia('(any-pointer: coarse)').matches;
+    const coarsePointer = isTouchDevice();
     if (!coarsePointer) {
       window.requestAnimationFrame(() => {
         if (!cancelled) setMinimapTilesEnabled(true);
@@ -332,12 +352,25 @@ export function GooseGame() {
       coarsePointer ? 1.5 : 2,
     );
 
-    const showToast = (message: string) => {
+    const showToast = (message: string, priority: ToastPriority = 'info') => {
       if (cancelled) return;
-      setToast(message);
+      const now = performance.now();
+      const current = toastRef.current;
+      if (
+        priority === 'info' &&
+        current?.priority === 'score' &&
+        now - current.shownAt < SCORE_TOAST_HOLD_MS
+      )
+        return;
+      const nextToast: GameToast = { message, priority, shownAt: now };
+      toastRef.current = nextToast;
+      setToast(nextToast);
       if (toastTimerRef.current !== null)
         window.clearTimeout(toastTimerRef.current);
-      toastTimerRef.current = window.setTimeout(() => setToast(null), 3400);
+      toastTimerRef.current = window.setTimeout(() => {
+        toastRef.current = null;
+        setToast(null);
+      }, TOAST_DURATION_MS);
     };
     const onWebglContextLost = (event: Event) => {
       event.preventDefault();
@@ -454,7 +487,11 @@ export function GooseGame() {
         });
         map.on('sourcedata', retireAerialPreview);
 
-        map.on('error', () => {
+        map.on('error', (event) => {
+          // A single failed tile (an aerial or DEM request that timed out)
+          // is retried by MapLibre and must not flip the launch button into
+          // its "reconnecting" state. Only style/source level failures do.
+          if ((event as { tile?: unknown }).tile) return;
           if (!loaded && !cancelled) setMapError(true);
         });
 
@@ -627,11 +664,19 @@ export function GooseGame() {
 
             let terrainConfigured = false;
             try {
+              // Mapterhorn's TileJSON declares no maxzoom, so MapLibre would
+              // request DEM tiles up to zoom 22 while the chase camera sits at
+              // zoom 21-23. Around Kalamazoo the dataset stops at zoom 16;
+              // every deeper request was a guaranteed 404 (about 60 per
+              // session) that also delayed terrain readiness at spawn.
               map.addSource('wmug-terrain-dem', {
                 type: 'raster-dem',
-                url: 'https://tiles.mapterhorn.com/tilejson.json',
+                tiles: [TERRAIN_TILE_TEMPLATE],
+                encoding: 'terrarium',
                 tileSize: 512,
-                attribution: 'Terrain © Mapterhorn',
+                minzoom: 0,
+                maxzoom: TERRAIN_MAX_ZOOM,
+                attribution: TERRAIN_ATTRIBUTION,
               });
               map.setTerrain({ source: 'wmug-terrain-dem', exaggeration: 1 });
               terrainConfigured = true;
@@ -1185,7 +1230,8 @@ export function GooseGame() {
             ) : (
               <>
                 <span className="desktop-instructions">
-                  Tap Space for one wingbeat · Hold it for continuous flapping
+                  Tap Space for one wingbeat · Hold it to climb · E honks ·
+                  Shift flares
                 </span>
                 <span className="touch-instructions">
                   Use the on-screen controls · Hold Flap for continuous
@@ -1660,7 +1706,14 @@ export function GooseGame() {
             <span className="touch-instructions">STALL · HOLD DIVE</span>
           </div>
         )}
-        {toast && <output className="game-toast">{toast}</output>}
+        {toast && (
+          <output
+            key={toast.shownAt}
+            className={`game-toast${toast.priority === 'score' ? ' is-score' : ''}`}
+          >
+            {toast.message}
+          </output>
+        )}
       </div>
 
       <footer className="game-footer">
