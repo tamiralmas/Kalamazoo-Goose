@@ -40,7 +40,11 @@ import {
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
-import type { Map as MapLibreMap, MapSourceDataEvent } from 'maplibre-gl';
+import type {
+  ErrorEvent as MapLibreErrorEvent,
+  Map as MapLibreMap,
+  MapSourceDataEvent,
+} from 'maplibre-gl';
 import type {
   FillExtrusionLayerSpecification,
   FilterSpecification,
@@ -97,6 +101,8 @@ const MINIMAP_WORLD_SIZE = MINIMAP_TILE_SIZE * 2 ** MINIMAP_ZOOM;
 const MINIMAP_EDGE_INSET_PX = 8;
 const MINIMAP_IN_VIEW_MARGIN_PX = 9;
 const MINIMAP_EDGE_MARKER_LIMIT = 3;
+/** How long the launch waits for the spawn DEM tile before starting flat. */
+const TERRAIN_READY_DEADLINE_MS = 12_000;
 const EARTH_CIRCUMFERENCE_METERS = 40_075_016.686;
 
 const lngLatToMinimapPixel = (longitude: number, latitude: number) => {
@@ -685,12 +691,16 @@ export function GooseGame() {
             }
 
             let worldInitialized = false;
+            let terrainPoll: number | null = null;
             const finishWorld = (hasTerrain: boolean) => {
               if (worldInitialized || cancelled) return;
               worldInitialized = true;
               map.off('idle', tryTerrainReady);
+              map.off('error', onTerrainTileError);
               if (terrainTimer !== null) window.clearTimeout(terrainTimer);
               terrainTimer = null;
+              if (terrainPoll !== null) window.clearInterval(terrainPoll);
+              terrainPoll = null;
 
               if (!hasTerrain && terrainConfigured) {
                 try {
@@ -743,9 +753,28 @@ export function GooseGame() {
                 finishWorld(true);
             };
 
+            // A DEM tile that fails outright (not a 404, MapLibre swallows
+            // those) while the world is still waiting means the terrain host
+            // is unreachable: start flat now rather than at the deadline.
+            const onTerrainTileError = (event: MapLibreErrorEvent) => {
+              const detail = event as { tile?: unknown; sourceId?: string };
+              if (detail.tile && detail.sourceId === 'wmug-terrain-dem')
+                finishWorld(false);
+            };
+
             if (terrainConfigured) {
               map.on('idle', tryTerrainReady);
-              terrainTimer = window.setTimeout(() => finishWorld(false), 3500);
+              map.on('error', onTerrainTileError);
+              // The deadline is generous because a flat campus is permanent
+              // for the session: on a slow connection the spawn DEM tile can
+              // take several seconds, and 3.5 s was turning real terrain into
+              // a coin flip. The poll covers a background tab, where 'idle'
+              // waits on a throttled animation frame.
+              terrainTimer = window.setTimeout(
+                () => finishWorld(false),
+                TERRAIN_READY_DEADLINE_MS,
+              );
+              terrainPoll = window.setInterval(tryTerrainReady, 250);
               tryTerrainReady();
             } else {
               finishWorld(false);
