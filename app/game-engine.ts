@@ -271,8 +271,16 @@ const TRAFFIC_REANCHOR_DISTANCE = 650;
 const WATER_INGEST_RADIUS = 1_600;
 const WOODLAND_INGEST_RADIUS = 1_400;
 const WOODLAND_REANCHOR_DISTANCE = 650;
+const WOODLAND_RECYCLE_DISTANCE = 1_600;
+const WOODLAND_SPAWN_MIN_DISTANCE = 180;
 const MAX_TREE_COUNT = 560;
 const NEAR_SPAWN_CROWD_COUNT = 12;
+const NPC_RECYCLE_DISTANCE = 220;
+const NPC_STALE_ROUTE_KEEP_DISTANCE = 160;
+const NPC_SPAWN_MIN_DISTANCE = 65;
+const NPC_RECYCLE_BATCH = 2;
+const NPC_STALE_RECYCLE_BATCH = 24;
+const TREE_PLACEMENT_ANCHOR_TOLERANCE = 300;
 const ALTITUDE_BOOST_HEIGHT = 50;
 const ALTITUDE_BOOST_FULL_HEIGHT = 100;
 const ALTITUDE_BOOST_RELEASE_HEIGHT = 47;
@@ -1032,8 +1040,6 @@ export function createGooseEngine(
   let buildingRefreshRequested = true;
   let trafficRefreshClock = 0;
   let trafficBuilt = false;
-  let trafficRefreshRequested = true;
-  let trafficRouteQuality = 0;
   const terrainSpecification = map.getTerrain();
   const terrainSourceId = terrainSpecification?.source ?? null;
   const terrainEnabled = Boolean(terrainSpecification);
@@ -1112,16 +1118,16 @@ export function createGooseEngine(
   const pedestrianRouteKeys = new Set<string>();
   let pedestrianRouteGeneration = 0;
   let pedestrianWaterGeneration = -1;
-  let npcRouteGeneration = -1;
   const mappedWaterAreas: WaterArea[] = [];
   let mappedWaterSignature = '';
   let mappedWaterGeneration = 0;
+  const mappedWaterAnchor = new THREE.Vector2(
+    Number.POSITIVE_INFINITY,
+    Number.POSITIVE_INFINITY,
+  );
   let dryMappedWalkwayCache: CrowdRoute[] = [];
   let dryMappedWalkwayCacheDirty = true;
-  const guaranteedWalkwayBases: THREE.Vector3[][] = [];
-  const crowdAnchor = new THREE.Vector2(0, 0);
   let guaranteedPedestrianRouteCount = 0;
-  let mappedCrowdWalkwaySignature = '';
   let crowdRelocationClock = 0;
   const splashes: Splash[] = [];
   const honkWaves: HonkWave[] = [];
@@ -1130,6 +1136,27 @@ export function createGooseEngine(
   let secretsFound = 0;
   let recruitedFlockCount = 0;
   const cameraPosition = new THREE.Vector3(0, state.position.y + 15, -18);
+  const screenVisibilityProbe = new THREE.Vector3();
+  const isPointInsideCameraView = (
+    east: number,
+    elevation: number,
+    north: number,
+    margin = 1.2,
+  ) => {
+    if (!playing) return false;
+    screenVisibilityProbe
+      .set(east, elevation, north)
+      .applyMatrix4(camera.projectionMatrix);
+    return (
+      Number.isFinite(screenVisibilityProbe.x) &&
+      Number.isFinite(screenVisibilityProbe.y) &&
+      Number.isFinite(screenVisibilityProbe.z) &&
+      Math.abs(screenVisibilityProbe.x) <= margin &&
+      Math.abs(screenVisibilityProbe.y) <= margin &&
+      screenVisibilityProbe.z >= -1.1 &&
+      screenVisibilityProbe.z <= 1.1
+    );
+  };
   const cameraTarget = new THREE.Vector3(0, state.position.y + 1, 8);
   let cameraDistanceScale = DEFAULT_CAMERA_SCALE;
   let cameraDistanceTarget = DEFAULT_CAMERA_SCALE;
@@ -1350,12 +1377,28 @@ export function createGooseEngine(
       )
       .sort()
       .join('|');
+    mappedWaterAnchor.set(state.position.x, state.position.z);
     if (nextSignature === mappedWaterSignature) return false;
     mappedWaterSignature = nextSignature;
     mappedWaterGeneration += 1;
     mappedWaterAreas.splice(0, mappedWaterAreas.length, ...nextAreas);
     dryMappedWalkwayCacheDirty = true;
     return true;
+  };
+
+  const refreshMappedWaterForCurrentArea = () => {
+    if (
+      !waterSourceId ||
+      !map.getSource(waterSourceId) ||
+      !map.isSourceLoaded(waterSourceId) ||
+      Math.hypot(
+        state.position.x - mappedWaterAnchor.x,
+        state.position.z - mappedWaterAnchor.y,
+      ) <=
+        TREE_PLACEMENT_ANCHOR_TOLERANCE * 0.7
+    )
+      return false;
+    return collectMappedWaterAreas();
   };
 
   const isPointInMappedWater = (east: number, north: number) =>
@@ -2695,6 +2738,7 @@ export function createGooseEngine(
 
   type CampusTreePoint = {
     id: number;
+    key: string | null;
     local: THREE.Vector3;
     supplemental: boolean;
     scale: number;
@@ -2703,6 +2747,7 @@ export function createGooseEngine(
   const campusTreePoints: CampusTreePoint[] = WMU_TREE_POINTS.map(
     ([id, longitude, latitude]) => ({
       id,
+      key: null,
       local: geoToLocal(longitude, latitude),
       supplemental: false,
       scale: 0.9 + Math.abs(Math.sin(Number(id % 1000000) * 0.0117)) * 0.22,
@@ -2754,6 +2799,7 @@ export function createGooseEngine(
     terrainEnabled ? null : campusGroundFallback,
   );
   const treeTerrainRefreshAt = campusTreePoints.map(() => 0);
+  const treeVisibilityLocked = campusTreePoints.map(() => false);
   const treeDummy = new THREE.Object3D();
   let treeRefreshCursor = 0;
   let treeMatricesInitialized = false;
@@ -2763,6 +2809,15 @@ export function createGooseEngine(
     Number.POSITIVE_INFINITY,
   );
   let woodlandGeneration = 0;
+  const woodlandTreeKeys = new Set<string>();
+  let pendingWoodlandTrees: Array<{
+    key: string;
+    tree: CampusTreePoint;
+  }> = [];
+  let woodlandScanNeedsRetry = false;
+  let woodlandScanRetryAt = 0;
+  const woodlandStreamBatch = coarsePointer ? 18 : 28;
+  const woodlandTerrainQueryBudget = coarsePointer ? 30 : 48;
 
   const distanceSquaredToRoute = (
     points: THREE.Vector3[],
@@ -2807,9 +2862,7 @@ export function createGooseEngine(
       );
     });
 
-  const treePlacementBlocked = (index: number) => {
-    const tree = campusTreePoints[index];
-    const { x, z } = tree.local;
+  const treePointBlocked = (x: number, z: number) => {
     if (isPointInMappedWater(x, z)) return true;
     if (nearMappedCorridor(x, z)) return true;
     return buildingColliders.some(
@@ -2821,8 +2874,39 @@ export function createGooseEngine(
         pointInBuilding(x, z, building),
     );
   };
+  const treePlacementBlocked = (index: number) => {
+    const { x, z } = campusTreePoints[index].local;
+    return treePointBlocked(x, z);
+  };
+  const treeSourceSnapshotReady = (sourceId: string | null) =>
+    !sourceId ||
+    (Boolean(map.getSource(sourceId)) && map.isSourceLoaded(sourceId));
+  const treePlacementDataReady = () =>
+    trafficBuilt &&
+    trafficRoutes.length > 0 &&
+    pedestrianRoutes.length > guaranteedPedestrianRouteCount &&
+    buildingCollectionGeneration > 0 &&
+    Math.hypot(
+      state.position.x - trafficAnchor.x,
+      state.position.z - trafficAnchor.y,
+    ) <= TREE_PLACEMENT_ANCHOR_TOLERANCE &&
+    Math.hypot(
+      state.position.x - buildingIngestAnchor.x,
+      state.position.z - buildingIngestAnchor.y,
+    ) <= TREE_PLACEMENT_ANCHOR_TOLERANCE &&
+    (!waterSourceId ||
+      Math.hypot(
+        state.position.x - mappedWaterAnchor.x,
+        state.position.z - mappedWaterAnchor.y,
+      ) <= TREE_PLACEMENT_ANCHOR_TOLERANCE) &&
+    treeSourceSnapshotReady(roadSourceId) &&
+    treeSourceSnapshotReady(buildingSourceId) &&
+    treeSourceSnapshotReady(waterSourceId);
 
-  const writeTreeInstances = (index: number) => {
+  const writeTreeInstances = (
+    index: number,
+    placementDataReady = treePlacementDataReady(),
+  ) => {
     const tree = campusTreePoints[index];
     const point = tree.local;
     const ground = treeGrounds[index];
@@ -2830,7 +2914,10 @@ export function createGooseEngine(
     const height = (6.4 + random * 4.8) * tree.scale;
     const crownRadius = (2.1 + random * 1.3) * tree.scale;
 
-    if (ground === null || treePlacementBlocked(index)) {
+    const placementBlocked =
+      !treeVisibilityLocked[index] &&
+      (!placementDataReady || treePlacementBlocked(index));
+    if (ground === null || placementBlocked) {
       treeDummy.position.set(point.x, campusGroundFallback, point.z);
       treeDummy.scale.setScalar(0);
       treeDummy.updateMatrix();
@@ -2840,6 +2927,7 @@ export function createGooseEngine(
       }
       return;
     }
+    if (placementDataReady) treeVisibilityLocked[index] = true;
 
     treeDummy.position.set(point.x, ground + height * 0.42 + 0.08, point.z);
     treeDummy.scale.set(
@@ -2888,30 +2976,26 @@ export function createGooseEngine(
     const startCursor = treeRefreshCursor;
     while (scanned < treeCount && queries < terrainQueryBudget) {
       const index = (startCursor + scanned) % treeCount;
+      scanned += 1;
+      if (!terrainEnabled || elapsedTime < treeTerrainRefreshAt[index])
+        continue;
       const tree = campusTreePoints[index];
       const point = tree.local;
       const distanceFromPlayer = Math.hypot(
         point.x - state.position.x,
         point.z - state.position.z,
       );
-      scanned += 1;
       if (
-        terrainEnabled &&
         !treePlacementBlocked(index) &&
-        (!nearPlayerOnly || distanceFromPlayer < 650) &&
-        elapsedTime >= treeTerrainRefreshAt[index]
+        (!nearPlayerOnly || distanceFromPlayer < 650)
       ) {
         queries += 1;
         const elevation = map.queryTerrainElevation(
           localToLngLat(point.x, point.z),
         );
         const terrainReady = isUsableTerrainElevation(elevation);
-        const randomRefresh = Math.abs(
-          Math.sin(Number(tree.id % 1000000) * 0.0091),
-        );
-        treeTerrainRefreshAt[index] =
-          elapsedTime + (terrainReady ? 4.4 + randomRefresh * 2.2 : 0.55);
         if (terrainReady && typeof elevation === 'number') {
+          treeTerrainRefreshAt[index] = Number.POSITIVE_INFINITY;
           const groundChanged =
             treeGrounds[index] === null ||
             Math.abs((treeGrounds[index] ?? elevation) - elevation) > 0.05;
@@ -2920,6 +3004,8 @@ export function createGooseEngine(
             changedIndices.add(index);
           }
           treeGrounds[index] = elevation;
+        } else {
+          treeTerrainRefreshAt[index] = elapsedTime + 0.55;
         }
       }
     }
@@ -2928,15 +3014,21 @@ export function createGooseEngine(
       treeCount;
 
     if (!treeMatricesInitialized) {
-      campusTreePoints.forEach((_, index) => writeTreeInstances(index));
+      const placementDataReady = treePlacementDataReady();
+      campusTreePoints.forEach((_, index) =>
+        writeTreeInstances(index, placementDataReady),
+      );
       treeMatricesInitialized = true;
       changed = true;
     } else {
-      changedIndices.forEach((index) => writeTreeInstances(index));
+      const placementDataReady = treePlacementDataReady();
+      changedIndices.forEach((index) =>
+        writeTreeInstances(index, placementDataReady),
+      );
     }
     unresolvedTreeCount = 0;
     campusTreePoints.forEach((_, index) => {
-      if (treeGrounds[index] === null || treePlacementBlocked(index))
+      if (treeGrounds[index] === null || !treeVisibilityLocked[index])
         unresolvedTreeCount += 1;
     });
     if (changed) {
@@ -2946,157 +3038,264 @@ export function createGooseEngine(
     return changed;
   };
 
-  const woodlandTreeKeys = new Set<string>();
-  const clearSupplementalTrees = () => {
-    woodlandTreeKeys.clear();
-    if (campusTreePoints.length <= mappedTreeCount) return false;
-    campusTreePoints.length = mappedTreeCount;
-    treeGrounds.length = mappedTreeCount;
-    treeTerrainRefreshAt.length = mappedTreeCount;
-    treeCount = mappedTreeCount;
-    treeTrunks.count = treeCount;
-    treeCrowns.count = treeCount * 3;
-    treeRefreshCursor = 0;
-    unresolvedTreeCount = treeGrounds.reduce<number>(
-      (count, ground) => count + (ground === null ? 1 : 0),
-      0,
-    );
-    woodlandGeneration += 1;
-    return true;
-  };
-
   const collectMappedWoodlandTrees = () => {
     if (
       !landcoverSourceId ||
       !map.getSource(landcoverSourceId) ||
-      trafficRoutes.length === 0 ||
-      pedestrianRoutes.length === 0
+      !treePlacementDataReady()
     )
       return false;
-    let changed = false;
-    if (
+    const movedFromWoodlandAnchor =
       Math.hypot(
         state.position.x - woodlandAnchor.x,
         state.position.z - woodlandAnchor.y,
-      ) > WOODLAND_REANCHOR_DISTANCE
-    ) {
-      woodlandAnchor.set(state.position.x, state.position.z);
-      changed = clearSupplementalTrees();
-    }
-    if (treeCount >= MAX_TREE_COUNT) return changed;
-    const features = map.querySourceFeatures(landcoverSourceId, {
-      sourceLayer: 'landcover',
-    }) as Array<{
-      properties?: Record<string, unknown>;
-      geometry: { type: string; coordinates: unknown };
-    }>;
-    const spacing = coarsePointer ? 15.5 : 13.5;
-    const candidates = new Map<string, CampusTreePoint>();
-    const mappedTrees = campusTreePoints.slice(0, mappedTreeCount);
+      ) > WOODLAND_REANCHOR_DISTANCE;
+    const needsReanchor =
+      movedFromWoodlandAnchor ||
+      (woodlandScanNeedsRetry && elapsedTime >= woodlandScanRetryAt);
+    if (needsReanchor) {
+      pendingWoodlandTrees = [];
+      const features = map.querySourceFeatures(landcoverSourceId, {
+        sourceLayer: 'landcover',
+      }) as Array<{
+        properties?: Record<string, unknown>;
+        geometry: { type: string; coordinates: unknown };
+      }>;
+      const spacing = coarsePointer ? 15.5 : 13.5;
+      const candidates = new Map<string, CampusTreePoint>();
+      const mappedTrees = campusTreePoints.slice(0, mappedTreeCount);
+      const candidateLimit = Math.ceil(
+        MAX_TREE_COUNT * (coarsePointer ? 1.25 : 1.75),
+      );
+      const gridInspectionLimit = coarsePointer ? 6_000 : 12_000;
+      let gridInspections = 0;
 
-    features.forEach((feature) => {
-      if (feature.properties?.class !== 'wood') return;
-      const polygonSets =
-        feature.geometry.type === 'Polygon'
-          ? [feature.geometry.coordinates as number[][][]]
-          : feature.geometry.type === 'MultiPolygon'
-            ? (feature.geometry.coordinates as number[][][][])
-            : [];
-      polygonSets.forEach((rings) => {
-        const outer = (rings[0] ?? [])
-          .filter((coordinate) => coordinate.length >= 2)
-          .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
-          .slice(0, -1)
-          .map((point) => new THREE.Vector2(point.x, point.z));
-        if (outer.length < 3) return;
-        const holes = rings
-          .slice(1)
-          .map((ring) =>
-            ring
-              .filter((coordinate) => coordinate.length >= 2)
-              .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
-              .slice(0, -1)
-              .map((point) => new THREE.Vector2(point.x, point.z)),
+      features.forEach((feature) => {
+        if (
+          candidates.size >= candidateLimit ||
+          gridInspections >= gridInspectionLimit
+        )
+          return;
+        if (feature.properties?.class !== 'wood') return;
+        const polygonSets =
+          feature.geometry.type === 'Polygon'
+            ? [feature.geometry.coordinates as number[][][]]
+            : feature.geometry.type === 'MultiPolygon'
+              ? (feature.geometry.coordinates as number[][][][])
+              : [];
+        polygonSets.forEach((rings) => {
+          if (
+            candidates.size >= candidateLimit ||
+            gridInspections >= gridInspectionLimit
           )
-          .filter((ring) => ring.length >= 3);
-        const minX = Math.max(
-          state.position.x - WOODLAND_INGEST_RADIUS,
-          Math.min(...outer.map((point) => point.x)),
-        );
-        const maxX = Math.min(
-          state.position.x + WOODLAND_INGEST_RADIUS,
-          Math.max(...outer.map((point) => point.x)),
-        );
-        const minZ = Math.max(
-          state.position.z - WOODLAND_INGEST_RADIUS,
-          Math.min(...outer.map((point) => point.y)),
-        );
-        const maxZ = Math.min(
-          state.position.z + WOODLAND_INGEST_RADIUS,
-          Math.max(...outer.map((point) => point.y)),
-        );
-        if (maxX <= minX || maxZ <= minZ) return;
-        const firstCellX = Math.floor(minX / spacing);
-        const lastCellX = Math.ceil(maxX / spacing);
-        const firstCellZ = Math.floor(minZ / spacing);
-        const lastCellZ = Math.ceil(maxZ / spacing);
-        for (let cellZ = firstCellZ; cellZ <= lastCellZ; cellZ += 1) {
-          for (let cellX = firstCellX; cellX <= lastCellX; cellX += 1) {
-            const key = `${cellX}:${cellZ}`;
-            if (woodlandTreeKeys.has(key) || candidates.has(key)) continue;
-            const hash =
-              Math.sin(cellX * 12.9898 + cellZ * 78.233) * 43758.5453;
-            const unit = hash - Math.floor(hash);
-            const secondHash =
-              Math.sin(cellX * 39.3467 - cellZ * 11.135) * 24634.6345;
-            const secondUnit = secondHash - Math.floor(secondHash);
-            const east = (cellX + 0.5) * spacing + (unit - 0.5) * 4.8;
-            const north = (cellZ + 0.5) * spacing + (secondUnit - 0.5) * 4.8;
-            if (
-              !pointInRing(east, north, outer) ||
-              holes.some((hole) => pointInRing(east, north, hole)) ||
-              nearMappedCorridor(east, north) ||
-              mappedTrees.some(
-                (tree) =>
-                  Math.hypot(tree.local.x - east, tree.local.z - north) < 6,
-              )
+            return;
+          const outer = (rings[0] ?? [])
+            .filter((coordinate) => coordinate.length >= 2)
+            .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
+            .slice(0, -1)
+            .map((point) => new THREE.Vector2(point.x, point.z));
+          if (outer.length < 3) return;
+          const holes = rings
+            .slice(1)
+            .map((ring) =>
+              ring
+                .filter((coordinate) => coordinate.length >= 2)
+                .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
+                .slice(0, -1)
+                .map((point) => new THREE.Vector2(point.x, point.z)),
             )
-              continue;
-            candidates.set(key, {
-              id:
-                9_900_000_000 +
-                Math.abs(cellX * 73_856_093 + cellZ * 19_349_663),
-              local: new THREE.Vector3(east, 0, north),
-              supplemental: true,
-              scale: 0.76 + unit * 0.25,
-            });
+            .filter((ring) => ring.length >= 3);
+          const minX = Math.max(
+            state.position.x - WOODLAND_INGEST_RADIUS,
+            Math.min(...outer.map((point) => point.x)),
+          );
+          const maxX = Math.min(
+            state.position.x + WOODLAND_INGEST_RADIUS,
+            Math.max(...outer.map((point) => point.x)),
+          );
+          const minZ = Math.max(
+            state.position.z - WOODLAND_INGEST_RADIUS,
+            Math.min(...outer.map((point) => point.y)),
+          );
+          const maxZ = Math.min(
+            state.position.z + WOODLAND_INGEST_RADIUS,
+            Math.max(...outer.map((point) => point.y)),
+          );
+          if (maxX <= minX || maxZ <= minZ) return;
+          const firstCellX = Math.floor(minX / spacing);
+          const lastCellX = Math.ceil(maxX / spacing);
+          const firstCellZ = Math.floor(minZ / spacing);
+          const lastCellZ = Math.ceil(maxZ / spacing);
+          for (
+            let cellZ = firstCellZ;
+            cellZ <= lastCellZ &&
+            candidates.size < candidateLimit &&
+            gridInspections < gridInspectionLimit;
+            cellZ += 1
+          ) {
+            for (
+              let cellX = firstCellX;
+              cellX <= lastCellX &&
+              candidates.size < candidateLimit &&
+              gridInspections < gridInspectionLimit;
+              cellX += 1
+            ) {
+              gridInspections += 1;
+              const key = `${cellX}:${cellZ}`;
+              if (woodlandTreeKeys.has(key) || candidates.has(key)) continue;
+              const hash =
+                Math.sin(cellX * 12.9898 + cellZ * 78.233) * 43758.5453;
+              const unit = hash - Math.floor(hash);
+              const secondHash =
+                Math.sin(cellX * 39.3467 - cellZ * 11.135) * 24634.6345;
+              const secondUnit = secondHash - Math.floor(secondHash);
+              const east = (cellX + 0.5) * spacing + (unit - 0.5) * 4.8;
+              const north = (cellZ + 0.5) * spacing + (secondUnit - 0.5) * 4.8;
+              if (
+                !pointInRing(east, north, outer) ||
+                holes.some((hole) => pointInRing(east, north, hole)) ||
+                mappedTrees.some(
+                  (tree) =>
+                    Math.hypot(tree.local.x - east, tree.local.z - north) < 6,
+                )
+              )
+                continue;
+              candidates.set(key, {
+                id:
+                  9_900_000_000 +
+                  Math.abs(cellX * 73_856_093 + cellZ * 19_349_663),
+                key,
+                local: new THREE.Vector3(east, 0, north),
+                supplemental: true,
+                scale: 0.76 + unit * 0.25,
+              });
+            }
           }
-        }
+        });
       });
-    });
 
-    const sortedCandidates = [...candidates.entries()].sort(
-      ([, first], [, second]) =>
-        first.local.lengthSq() - second.local.lengthSq(),
-    );
-    const firstNewIndex = treeCount;
-    for (const [key, tree] of sortedCandidates) {
-      if (campusTreePoints.length >= MAX_TREE_COUNT) break;
-      woodlandTreeKeys.add(key);
-      campusTreePoints.push(tree);
-      treeGrounds.push(terrainEnabled ? null : campusGroundFallback);
-      treeTerrainRefreshAt.push(0);
+      woodlandAnchor.set(state.position.x, state.position.z);
+      woodlandScanNeedsRetry = !map.isSourceLoaded(landcoverSourceId);
+      woodlandScanRetryAt = elapsedTime + 4;
+      if (candidates.size === 0) return false;
+      woodlandScanNeedsRetry = false;
+      pendingWoodlandTrees = [...candidates.entries()]
+        .sort(
+          ([, first], [, second]) =>
+            (first.local.x - state.position.x) ** 2 +
+            (first.local.z - state.position.z) ** 2 -
+            ((second.local.x - state.position.x) ** 2 +
+              (second.local.z - state.position.z) ** 2),
+        )
+        .map(([key, tree]) => ({ key, tree }));
     }
-    if (campusTreePoints.length === firstNewIndex) return changed;
-    treeCount = campusTreePoints.length;
+    if (pendingWoodlandTrees.length === 0) return false;
+
+    const replacementIndices = campusTreePoints
+      .map((tree, index) => ({
+        index,
+        distance: Math.hypot(
+          tree.local.x - state.position.x,
+          tree.local.z - state.position.z,
+        ),
+      }))
+      .filter(
+        ({ index, distance }) =>
+          campusTreePoints[index].supplemental &&
+          distance > WOODLAND_RECYCLE_DISTANCE &&
+          !isPointInsideCameraView(
+            campusTreePoints[index].local.x,
+            (treeGrounds[index] ?? state.ground) + 6,
+            campusTreePoints[index].local.z,
+          ),
+      )
+      .sort((first, second) => second.distance - first.distance)
+      .map(({ index }) => index);
+    const retryLater: typeof pendingWoodlandTrees = [];
+    const inspectionBudget = woodlandTerrainQueryBudget * 3;
+    let inspections = 0;
+    let terrainQueries = 0;
+    let changes = 0;
+    while (
+      pendingWoodlandTrees.length > 0 &&
+      inspections < inspectionBudget &&
+      terrainQueries < woodlandTerrainQueryBudget &&
+      changes < woodlandStreamBatch
+    ) {
+      const candidate = pendingWoodlandTrees.shift();
+      if (!candidate) break;
+      inspections += 1;
+      if (woodlandTreeKeys.has(candidate.key)) continue;
+      const distanceFromPlayer = Math.hypot(
+        candidate.tree.local.x - state.position.x,
+        candidate.tree.local.z - state.position.z,
+      );
+      if (distanceFromPlayer < WOODLAND_SPAWN_MIN_DISTANCE) {
+        retryLater.push(candidate);
+        continue;
+      }
+      if (treePointBlocked(candidate.tree.local.x, candidate.tree.local.z))
+        continue;
+      if (treeCount >= MAX_TREE_COUNT && replacementIndices.length === 0) {
+        pendingWoodlandTrees.unshift(candidate);
+        break;
+      }
+      terrainQueries += 1;
+      const elevation = terrainEnabled
+        ? map.queryTerrainElevation(
+            localToLngLat(candidate.tree.local.x, candidate.tree.local.z),
+          )
+        : campusGroundFallback;
+      if (
+        !isUsableTerrainElevation(elevation) ||
+        typeof elevation !== 'number'
+      ) {
+        retryLater.push(candidate);
+        continue;
+      }
+      if (
+        isPointInsideCameraView(
+          candidate.tree.local.x,
+          elevation + 6,
+          candidate.tree.local.z,
+        )
+      ) {
+        retryLater.push(candidate);
+        continue;
+      }
+
+      const index =
+        treeCount < MAX_TREE_COUNT
+          ? treeCount
+          : (replacementIndices.shift() ?? -1);
+      if (index < 0) {
+        retryLater.push(candidate);
+        continue;
+      }
+      const previousKey = campusTreePoints[index]?.key;
+      if (previousKey) woodlandTreeKeys.delete(previousKey);
+      if (index === treeCount) {
+        campusTreePoints.push(candidate.tree);
+        treeGrounds.push(elevation);
+        treeTerrainRefreshAt.push(Number.POSITIVE_INFINITY);
+        treeVisibilityLocked.push(false);
+        treeCount += 1;
+      } else {
+        campusTreePoints[index] = candidate.tree;
+        treeGrounds[index] = elevation;
+        treeTerrainRefreshAt[index] = Number.POSITIVE_INFINITY;
+        treeVisibilityLocked[index] = false;
+      }
+      woodlandTreeKeys.add(candidate.key);
+      writeTreeInstances(index, true);
+      changes += 1;
+    }
+    pendingWoodlandTrees.push(...retryLater);
+    if (changes === 0) return false;
+
     woodlandGeneration += 1;
     treeTrunks.count = treeCount;
     treeCrowns.count = treeCount * 3;
-    for (let index = firstNewIndex; index < treeCount; index += 1) {
-      writeTreeInstances(index);
-    }
-    treeRefreshCursor = firstNewIndex;
-    updateTrees(false);
     treeTrunks.instanceMatrix.needsUpdate = true;
     treeCrowns.instanceMatrix.needsUpdate = true;
     return true;
@@ -3107,7 +3306,10 @@ export function createGooseEngine(
     if (signature === treeBlockerSignature) return false;
     treeBlockerSignature = signature;
     if (!treeMatricesInitialized) return false;
-    campusTreePoints.forEach((_, index) => writeTreeInstances(index));
+    const placementDataReady = treePlacementDataReady();
+    campusTreePoints.forEach((_, index) =>
+      writeTreeInstances(index, placementDataReady),
+    );
     treeTrunks.instanceMatrix.needsUpdate = true;
     treeCrowns.instanceMatrix.needsUpdate = true;
     return true;
@@ -3382,10 +3584,9 @@ export function createGooseEngine(
       ) > TRAFFIC_REANCHOR_DISTANCE;
     if (
       !map.getSource(roadSourceId) ||
-      (trafficBuilt && !movedFromTrafficAnchor && !trafficRefreshRequested)
+      (trafficBuilt && !movedFromTrafficAnchor)
     )
       return false;
-    trafficRefreshRequested = false;
     const allowed = new Set([
       'motorway',
       'trunk',
@@ -3459,17 +3660,8 @@ export function createGooseEngine(
     });
 
     routes.sort((a, b) => b.total - a.total);
-    if (routes.length === 0) return false;
+    if (routes.length < 6) return false;
     const nextTrafficRoutes = routes.slice(0, 24);
-    const nextTrafficRouteQuality =
-      nextTrafficRoutes.length * 1_000_000 +
-      nextTrafficRoutes.reduce((total, route) => total + route.total, 0);
-    if (
-      trafficBuilt &&
-      !movedFromTrafficAnchor &&
-      nextTrafficRouteQuality <= trafficRouteQuality + 25
-    )
-      return false;
     traffic.length = 0;
     trafficRoutes.length = 0;
     pedestrianRoutes.length = guaranteedPedestrianRouteCount;
@@ -3533,7 +3725,6 @@ export function createGooseEngine(
     if (trafficFleet.bodies.instanceColor)
       trafficFleet.bodies.instanceColor.needsUpdate = true;
     trafficAnchor.set(state.position.x, state.position.z);
-    trafficRouteQuality = nextTrafficRouteQuality;
     trafficBuilt = true;
     return true;
   };
@@ -3633,7 +3824,6 @@ export function createGooseEngine(
         ([east, north]) =>
           new THREE.Vector3(east * 0.64, campusGroundFallback, north * 0.64),
       );
-      guaranteedWalkwayBases.push(basePoints.map((point) => point.clone()));
       const baseRoute = routeFromPoints(basePoints);
       pedestrianRouteKeys.add(`campus-lawn:${index}`);
       pedestrianRoutes.push({
@@ -3703,71 +3893,164 @@ export function createGooseEngine(
     };
   };
 
-  const assignNearbyCrowdToMappedWalkways = (
-    mappedWalkways: CrowdRoute[],
+  const sampleCrowdRouteSpawn = (
+    route: CrowdRoute,
+    distance: number,
+    east: number,
+    north: number,
+  ) => {
+    const routeDistance = clamp(distance, 0, route.total);
+    let index = 1;
+    while (
+      index < route.cumulative.length - 1 &&
+      route.cumulative[index] < routeDistance
+    )
+      index += 1;
+    const start = route.points[index - 1];
+    const end = route.points[index];
+    const segmentStart = route.cumulative[index - 1];
+    const segmentLength = Math.max(
+      0.0001,
+      route.cumulative[index] - segmentStart,
+    );
+    const amount = clamp((routeDistance - segmentStart) / segmentLength, 0, 1);
+    const spawnEast = lerp(start.x, end.x, amount);
+    const spawnNorth = lerp(start.z, end.z, amount);
+    const deltaX = spawnEast - east;
+    const deltaZ = spawnNorth - north;
+    return {
+      east: spawnEast,
+      north: spawnNorth,
+      distanceSquared: deltaX * deltaX + deltaZ * deltaZ,
+    };
+  };
+
+  const recycleDistantCrowd = (
+    routes: CrowdRoute[],
     focusX: number,
     focusZ: number,
+    force = false,
   ) => {
-    const nearbyCount = Math.min(NEAR_SPAWN_CROWD_COUNT, campusNpcs.length);
-    if (mappedWalkways.length === 0 || nearbyCount === 0) return false;
-    const nearestRoutes = mappedWalkways
+    if (routes.length === 0 || campusNpcs.length === 0) return false;
+    const activeRoutes = new Set(pedestrianRoutes);
+    const recyclable = campusNpcs
+      .map((npc) => {
+        const distance = Math.hypot(
+          npc.position.x - state.position.x,
+          npc.position.z - state.position.z,
+        );
+        return {
+          npc,
+          distance,
+          wet:
+            isPointInMappedWater(npc.position.x, npc.position.z) ||
+            crowdRouteTouchesMappedWater(npc.route),
+          stale: !activeRoutes.has(npc.route),
+        };
+      })
+      .filter(
+        ({ npc, distance, wet, stale }) =>
+          npc.mode === 'walk' &&
+          (force ||
+            (!isPointInsideCameraView(
+              npc.position.x,
+              npc.ground + 1.8,
+              npc.position.z,
+              1.25,
+            ) &&
+              distance > NPC_STALE_ROUTE_KEEP_DISTANCE &&
+              (wet || stale || distance > NPC_RECYCLE_DISTANCE))),
+      )
+      .sort(
+        (a, b) =>
+          Number(b.wet) - Number(a.wet) ||
+          Number(b.stale) - Number(a.stale) ||
+          b.distance - a.distance,
+      );
+    const offscreenStaleCount = recyclable.filter(
+      ({ stale, distance }) => stale && distance > NPC_RECYCLE_DISTANCE,
+    ).length;
+    const candidates = recyclable.slice(
+      0,
+      force
+        ? NEAR_SPAWN_CROWD_COUNT
+        : Math.min(
+            NPC_STALE_RECYCLE_BATCH,
+            Math.max(NPC_RECYCLE_BATCH, offscreenStaleCount),
+          ),
+    );
+    if (candidates.length === 0) return false;
+
+    const nearestRoutes = routes
       .map((route) => ({
         route,
         ...nearestDistanceOnCrowdRoute(route, focusX, focusZ),
       }))
       .sort((a, b) => a.distanceSquared - b.distanceSquared)
-      .slice(0, Math.min(6, mappedWalkways.length));
-    for (let index = 0; index < nearbyCount; index += 1) {
-      const candidate = nearestRoutes[index % nearestRoutes.length];
-      const row = Math.floor(index / nearestRoutes.length);
-      const side = (index + row) % 2 === 0 ? -1 : 1;
-      const distance = clamp(
-        candidate.distance + side * (6 + row * 5.5),
-        0,
-        candidate.route.total,
-      );
-      campusNpcs[index] = createCampusNpc(
-        index,
-        candidate.route,
-        distance,
-        npcTerrainAt,
-      );
-    }
-    return true;
-  };
-
-  const positionGuaranteedWalkways = (anchorX: number, anchorZ: number) => {
-    crowdAnchor.set(anchorX, anchorZ);
-    for (
-      let routeIndex = 0;
-      routeIndex < guaranteedPedestrianRouteCount;
-      routeIndex += 1
-    ) {
-      const route = pedestrianRoutes[routeIndex];
-      const basePoints = guaranteedWalkwayBases[routeIndex];
-      route.points.forEach((point, pointIndex) => {
-        point.set(
-          basePoints[pointIndex].x + anchorX,
-          campusGroundFallback,
-          basePoints[pointIndex].z + anchorZ,
-        );
-      });
-    }
+      .slice(0, Math.min(12, routes.length));
+    let changed = false;
+    candidates.forEach(({ npc }, recycleIndex) => {
+      const edgeOffset = 70 + ((npc.index + recycleIndex * 3) % 6) * 10;
+      const minimumSpawnDistance = force ? 8 : NPC_SPAWN_MIN_DISTANCE;
+      let replacement: CampusNpc | null = null;
+      for (
+        let routeAttempt = 0;
+        routeAttempt < nearestRoutes.length && replacement === null;
+        routeAttempt += 1
+      ) {
+        const candidate =
+          nearestRoutes[
+            (npc.index + recycleIndex + routeAttempt) % nearestRoutes.length
+          ];
+        for (let sideAttempt = 0; sideAttempt < 2; sideAttempt += 1) {
+          const side =
+            (npc.index + recycleIndex + routeAttempt + sideAttempt) % 2 === 0
+              ? -1
+              : 1;
+          const distance = clamp(
+            candidate.distance + side * edgeOffset,
+            0,
+            candidate.route.total,
+          );
+          const spawn = sampleCrowdRouteSpawn(
+            candidate.route,
+            distance,
+            state.position.x,
+            state.position.z,
+          );
+          if (
+            spawn.distanceSquared >= (minimumSpawnDistance + 2) ** 2 &&
+            (force ||
+              !isPointInsideCameraView(
+                spawn.east,
+                state.ground + 1.8,
+                spawn.north,
+                1.25,
+              ))
+          ) {
+            replacement = createCampusNpc(
+              npc.index,
+              candidate.route,
+              distance,
+              npcTerrainAt,
+            );
+            break;
+          }
+        }
+      }
+      if (!replacement) return;
+      campusNpcs[npc.index] = replacement;
+      changed = true;
+    });
+    return changed;
   };
 
   const collectPedestrianRoutes = () => {
     let added = addGuaranteedCampusWalkways();
     let npcAssignmentsChanged = false;
     if (pedestrianWaterGeneration !== mappedWaterGeneration) {
-      pedestrianRoutes.length = guaranteedPedestrianRouteCount;
-      pedestrianRouteKeys.clear();
-      for (let index = 0; index < guaranteedPedestrianRouteCount; index += 1) {
-        pedestrianRouteKeys.add(`campus-lawn:${index}`);
-      }
-      dryMappedWalkwayCache = [];
       dryMappedWalkwayCacheDirty = true;
       pedestrianWaterGeneration = mappedWaterGeneration;
-      pedestrianRouteGeneration += 1;
     }
     const features =
       map.getSource(roadSourceId) && pedestrianRoutes.length < 80
@@ -3907,72 +4190,6 @@ export function createGooseEngine(
       npcAssignmentsChanged = true;
     }
 
-    const mappedWalkways = getMappedPedestrianWalkways();
-    const routeGenerationChanged =
-      npcRouteGeneration !== pedestrianRouteGeneration;
-    const mappedWalkwaySignature = `${pedestrianRouteGeneration}:${mappedWalkways
-      .map((route) => pedestrianRoutes.indexOf(route))
-      .join(':')}`;
-    if (
-      mappedWalkways.length > 0 &&
-      (routeGenerationChanged ||
-        mappedWalkwaySignature !== mappedCrowdWalkwaySignature)
-    ) {
-      for (
-        let index = NEAR_SPAWN_CROWD_COUNT;
-        index < campusNpcs.length;
-        index += 1
-      ) {
-        const route =
-          mappedWalkways[
-            (index - NEAR_SPAWN_CROWD_COUNT) % mappedWalkways.length
-          ];
-        const distance =
-          route.total * (0.06 + ((index * 0.61803398875 + 0.17) % 1) * 0.88);
-        campusNpcs[index] = createCampusNpc(
-          index,
-          route,
-          distance,
-          npcTerrainAt,
-        );
-      }
-      const crowdFocusX = state.position.x + state.forward.x * 12;
-      const crowdFocusZ = state.position.z + state.forward.z * 12;
-      crowdAnchor.set(crowdFocusX, crowdFocusZ);
-      assignNearbyCrowdToMappedWalkways(
-        mappedWalkways,
-        crowdFocusX,
-        crowdFocusZ,
-      );
-      mappedCrowdWalkwaySignature = mappedWalkwaySignature;
-      npcAssignmentsChanged = true;
-    } else if (
-      mappedWalkways.length === 0 &&
-      (routeGenerationChanged || mappedCrowdWalkwaySignature !== '')
-    ) {
-      const streamedRoutes = pedestrianRoutes.slice(
-        guaranteedPedestrianRouteCount,
-      );
-      campusNpcs.forEach((_, index) => {
-        const route =
-          index < NEAR_SPAWN_CROWD_COUNT || streamedRoutes.length === 0
-            ? pedestrianRoutes[index % guaranteedPedestrianRouteCount]
-            : streamedRoutes[
-                (index - NEAR_SPAWN_CROWD_COUNT) % streamedRoutes.length
-              ];
-        const distance =
-          route.total * (0.06 + ((index * 0.61803398875 + 0.17) % 1) * 0.88);
-        campusNpcs[index] = createCampusNpc(
-          index,
-          route,
-          distance,
-          npcTerrainAt,
-        );
-      });
-      mappedCrowdWalkwaySignature = '';
-      npcAssignmentsChanged = true;
-    }
-    npcRouteGeneration = pedestrianRouteGeneration;
     if (npcAssignmentsChanged)
       updateCrowdVisuals(crowdFleet, campusNpcs, 1, elapsedTime);
     return added > 0 || npcAssignmentsChanged;
@@ -3983,93 +4200,20 @@ export function createGooseEngine(
       return false;
     const crowdFocusX = state.position.x + state.forward.x * 12;
     const crowdFocusZ = state.position.z + state.forward.z * 12;
-    const distanceFromAnchor = Math.hypot(
-      crowdFocusX - crowdAnchor.x,
-      crowdFocusZ - crowdAnchor.y,
-    );
     const mappedWalkways = getMappedPedestrianWalkways();
-    const nearbyCount = Math.min(NEAR_SPAWN_CROWD_COUNT, campusNpcs.length);
-    const needsMappedAssignment =
-      mappedWalkways.length > 0 &&
-      campusNpcs
-        .slice(0, nearbyCount)
-        .some((npc) => !npc.route.isMappedWalkway);
-    const fallbackNeedsDryRelocation =
-      mappedWalkways.length === 0 &&
-      pedestrianRoutes
-        .slice(0, guaranteedPedestrianRouteCount)
-        .some((route) => crowdRouteTouchesMappedWater(route));
-    if (
-      !force &&
-      !needsMappedAssignment &&
-      !fallbackNeedsDryRelocation &&
-      distanceFromAnchor < 70
-    )
-      return false;
-    if (mappedWalkways.length > 0) {
-      crowdAnchor.set(crowdFocusX, crowdFocusZ);
-      const changed = assignNearbyCrowdToMappedWalkways(
-        mappedWalkways,
-        crowdFocusX,
-        crowdFocusZ,
-      );
-      if (changed) updateCrowdVisuals(crowdFleet, campusNpcs, 1, elapsedTime);
-      return changed;
-    }
-
-    const previousAnchor = crowdAnchor.clone();
-    const candidateAnchors = [new THREE.Vector2(crowdFocusX, crowdFocusZ)];
-    for (let radius = 35; radius <= 175; radius += 35) {
-      for (let direction = 0; direction < 8; direction += 1) {
-        const angle = (direction * Math.PI) / 4;
-        candidateAnchors.push(
-          new THREE.Vector2(
-            crowdFocusX + Math.cos(angle) * radius,
-            crowdFocusZ + Math.sin(angle) * radius,
-          ),
-        );
-      }
-    }
-    candidateAnchors.push(new THREE.Vector2(0, 0));
-    const dryAnchor = candidateAnchors.find((candidate) => {
-      positionGuaranteedWalkways(candidate.x, candidate.y);
-      return pedestrianRoutes
-        .slice(0, guaranteedPedestrianRouteCount)
-        .every((route) => !crowdRouteTouchesMappedWater(route));
-    });
-    if (!dryAnchor)
-      positionGuaranteedWalkways(previousAnchor.x, previousAnchor.y);
-
-    for (let index = 0; index < nearbyCount; index += 1) {
-      const npc = campusNpcs[index];
-      let relocated = createCampusNpc(
-        index,
-        npc.route,
-        npc.distance,
-        npcTerrainAt,
-      );
-      for (let attempt = 0; attempt < 3; attempt += 1) {
-        const playerDistance = Math.hypot(
-          relocated.position.x - state.position.x,
-          relocated.position.z - state.position.z,
-        );
-        if (playerDistance >= 8) break;
-        const shiftedDistance = clamp(
-          relocated.distance + relocated.route.total * (0.17 + attempt * 0.11),
-          0,
-          relocated.route.total,
-        );
-        relocated = createCampusNpc(
-          index,
-          relocated.route,
-          shiftedDistance,
-          npcTerrainAt,
-        );
-      }
-      campusNpcs[index] = relocated;
-    }
-    updateCrowdVisuals(crowdFleet, campusNpcs, 1, elapsedTime);
-    return true;
+    const dryRoutes = pedestrianRoutes.filter(
+      (route) => !crowdRouteTouchesMappedWater(route),
+    );
+    const routes =
+      !force && mappedWalkways.length > 0 ? mappedWalkways : dryRoutes;
+    const changed = recycleDistantCrowd(
+      routes,
+      crowdFocusX,
+      crowdFocusZ,
+      force,
+    );
+    if (changed) updateCrowdVisuals(crowdFleet, campusNpcs, 1, elapsedTime);
+    return changed;
   };
 
   const simulateTraffic = (dt: number) => {
@@ -6265,13 +6409,14 @@ export function createGooseEngine(
     cameraOrbitPitchTarget = 24 * DEG;
     crowdRelocationClock = 0;
     trafficAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
-    trafficRefreshRequested = true;
-    trafficRouteQuality = 0;
     buildingIngestAnchor.set(
       Number.POSITIVE_INFINITY,
       Number.POSITIVE_INFINITY,
     );
+    mappedWaterAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
     woodlandAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+    woodlandScanNeedsRetry = false;
+    woodlandScanRetryAt = 0;
     trafficRefreshClock = 0;
     accumulator = 0;
     relocateNearbyCrowd(true);
@@ -6382,10 +6527,6 @@ export function createGooseEngine(
       buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
     }
     if (event.sourceDataType !== 'content') return;
-    if (event.sourceId === roadSourceId) {
-      trafficRefreshRequested = true;
-      trafficRefreshClock = Math.min(trafficRefreshClock, 0.12);
-    }
     if (event.sourceId === buildingSourceId) {
       buildingRefreshRequested = true;
       buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
@@ -6480,12 +6621,23 @@ export function createGooseEngine(
       treeRefreshClock -= frameDt;
       if (treeRefreshClock <= 0) {
         treeRefreshClock = 1.25;
+        refreshMappedWaterForCurrentArea();
+        collectMappedWoodlandTrees();
         updateTrees(true);
       }
       cloudRefreshClock -= frameDt;
       if (cloudRefreshClock <= 0) {
         cloudRefreshClock = 0.12;
         updateClouds();
+      }
+    }
+    if (!playing) {
+      treeRefreshClock -= frameDt;
+      if (treeRefreshClock <= 0) {
+        treeRefreshClock = 0.35;
+        refreshMappedWaterForCurrentArea();
+        collectMappedWoodlandTrees();
+        updateTrees(false);
       }
     }
     updateSplashes(frameDt);
