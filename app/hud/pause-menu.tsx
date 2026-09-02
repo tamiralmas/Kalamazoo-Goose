@@ -286,6 +286,24 @@ function OptionsTab({
         </div>
       </div>
 
+      <div className="option-row">
+        <span>Render scale</span>
+        <fieldset className="segmented">
+          <legend className="sr-only">Render scale</legend>
+          {(['auto', 'crisp', 'fast'] as const).map((mode) => (
+            <button
+              key={mode}
+              type="button"
+              aria-pressed={settings.renderScale === mode}
+              className={settings.renderScale === mode ? 'is-active' : ''}
+              onClick={() => setSettings({ renderScale: mode })}
+            >
+              {mode}
+            </button>
+          ))}
+        </fieldset>
+      </div>
+
       <ToggleRow
         label="Sound"
         value={settings.sound}

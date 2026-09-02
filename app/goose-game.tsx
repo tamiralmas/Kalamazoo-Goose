@@ -72,6 +72,7 @@ import { QuestDrawer } from '@/app/hud/quest-drawer';
 import { useProgress } from '@/app/hud/use-progress';
 import { MUTATOR_BY_ID } from '@/app/mutators';
 import { createProgressStore } from '@/app/progress';
+import { resolveRenderPixelRatio } from '@/app/render-scale';
 import { QUESTS } from '@/app/quests';
 import { WMU_SPAWN } from '@/app/world-config';
 import {
@@ -353,9 +354,12 @@ export function GooseGame() {
         if (!cancelled) setMinimapTilesEnabled(true);
       });
     }
-    const pixelRatio = Math.min(
+    const pixelRatio = resolveRenderPixelRatio(
+      progressStore.get().settings.renderScale,
       window.devicePixelRatio || 1,
-      coarsePointer ? 1.5 : 2,
+      coarsePointer,
+      container.clientWidth || window.innerWidth,
+      container.clientHeight || window.innerHeight,
     );
 
     const showToast = (message: string, priority: ToastPriority = 'info') => {
@@ -406,6 +410,15 @@ export function GooseGame() {
           refreshExpiredTiles: !coarsePointer,
           maxTileCacheZoomLevels: coarsePointer ? 2 : 5,
           cancelPendingTileRequestsWhileZooming: true,
+          // MapLibre 6 slices vector tiles into finer chunks for the first
+          // few zoom levels past the source's maxzoom (14 here), and with
+          // terrain on it lifts every chunk by the DEM under that chunk's
+          // own centroid. Flying toward a building therefore re-cut it into
+          // smaller pieces four times, each piece jumping to a new height:
+          // the "buildings keep updating as you get closer" effect. Leaving
+          // this undefined keeps the whole zoom-14 geometry per tile, so a
+          // building is one piece at one height from any distance.
+          zoomLevelsToOverscale: undefined,
           canvasContextAttributes: {
             antialias: !coarsePointer,
             powerPreference: 'high-performance',
@@ -462,7 +475,10 @@ export function GooseGame() {
                 'raster-contrast': 0.08,
                 'raster-brightness-min': 0.04,
                 'raster-brightness-max': 0.98,
-                'raster-fade-duration': 0,
+                // Sharper imagery streams in as the goose approaches; a
+                // cross-fade keeps that from reading as the ground popping.
+                // Phones skip it: every extra blended tile costs fill rate.
+                'raster-fade-duration': coarsePointer ? 0 : 450,
                 'raster-resampling': 'linear',
               },
             },
@@ -645,6 +661,22 @@ export function GooseGame() {
               'fill-extrusion-vertical-gradient',
               true,
             );
+
+            // Symbol placement is the single largest main-thread cost with
+            // a chase camera: MapLibre re-runs label collision every frame
+            // the camera moves, and with terrain on every road-name glyph
+            // also samples the DEM. Measured on an RTX laptop at 1080p:
+            // 2.7 ms per frame on average with 50 ms spikes with the full
+            // Liberty label set, 0.07 ms with only the POI layers. Road
+            // names, shields, one-way arrows and water names are the cost
+            // and add nothing at goose height; campus POI names and the
+            // town labels stay.
+            for (const layer of layers) {
+              if (layer.type !== 'symbol') continue;
+              const keep =
+                layer.id.startsWith('poi') || layer.id.startsWith('label_');
+              if (!keep) map.setLayoutProperty(layer.id, 'visibility', 'none');
+            }
 
             try {
               map.setSky({
@@ -854,7 +886,42 @@ export function GooseGame() {
       mapRef.current?.remove();
       mapRef.current = null;
     };
-  }, [clearAllControlInputs, handleTelemetry, releaseTouchPointer]);
+  }, [
+    clearAllControlInputs,
+    handleTelemetry,
+    releaseTouchPointer,
+    progressStore,
+  ]);
+
+  // Keeps the 3D world's pixel ratio in sync with the Render scale setting,
+  // recomputing on window resize too since 'auto' depends on the viewport's
+  // css size. MapLibre's setPixelRatio resizes the shared canvas in place
+  // (see render-scale.ts for why only the 3D world, not the DOM HUD, is
+  // affected); the >0.01 guard skips a no-op resize when the resolved ratio
+  // hasn't actually moved.
+  const renderScaleSetting = progress.settings.renderScale;
+  useEffect(() => {
+    if (!mapReady) return;
+    const map = mapRef.current;
+    const container = mapContainerRef.current;
+    if (!map || !container) return;
+    const coarsePointer = isTouchDevice();
+    const applyRenderScale = () => {
+      const ratio = resolveRenderPixelRatio(
+        renderScaleSetting,
+        window.devicePixelRatio || 1,
+        coarsePointer,
+        container.clientWidth || window.innerWidth,
+        container.clientHeight || window.innerHeight,
+      );
+      if (Math.abs(ratio - map.getPixelRatio()) > 0.01) {
+        map.setPixelRatio(ratio);
+      }
+    };
+    applyRenderScale();
+    window.addEventListener('resize', applyRenderScale);
+    return () => window.removeEventListener('resize', applyRenderScale);
+  }, [renderScaleSetting, mapReady]);
 
   // Tab opens/closes the quest drawer; Esc opens/closes the pause menu (or
   // closes the drawer first, if that is what is open). Neither is wired to
@@ -1807,12 +1874,6 @@ export function GooseGame() {
             </aside>
           </div>
 
-          {telemetry.altitudeBoost > 0 && (
-            <div className="jetstream-indicator">
-              <Wind /> JETSTREAM · +{JETSTREAM_BOOST_PERCENT}% TOP SPEED
-            </div>
-          )}
-
           <div className="mode-stack">
             <span className={`mode-badge mode-${telemetry.mode}`}>
               {telemetry.mode === 'flying' ? (
@@ -1825,6 +1886,15 @@ export function GooseGame() {
               )}
               {mode.label}
             </span>
+            {/* A chip beside the mode badge, not a banner over the goose:
+                the jetstream is a status, and the middle of the screen is
+                where the player is looking. */}
+            {telemetry.altitudeBoost > 0 && (
+              <span className="carry-chip jetstream-chip">
+                <Wind aria-hidden="true" />
+                Jetstream · +{JETSTREAM_BOOST_PERCENT}% top speed
+              </span>
+            )}
             {holdingName && (
               <span className="carry-chip">
                 <Hand aria-hidden="true" />

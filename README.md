@@ -41,6 +41,8 @@ Kalamazoo Goose saves your progress automatically. Complete quests throughout th
 
 If you want to start over, the pause menu (press Esc) includes a "Fresh goose" option in settings to wipe all saved progress.
 
+The pause menu's Options tab also has a Render scale control (Auto, Crisp, or Fast) that trades 3D world sharpness for frame rate, useful on older or integrated GPUs.
+
 ## World data
 
 The game combines OpenStreetMap-derived roads, buildings, water, trails, and vegetation (via OpenFreeMap) with Mapterhorn terrain and State of Michigan MiSAIL aerial imagery across Kalamazoo.

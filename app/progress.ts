@@ -72,6 +72,7 @@ export const sanitizeProgress = (raw: unknown): ProgressState => {
     }
   }
   const touchControls = settings.touchControls;
+  const renderScale = settings.renderScale;
   return {
     version: 1,
     bestScore: Math.max(0, finite(raw.bestScore, 0)),
@@ -97,6 +98,10 @@ export const sanitizeProgress = (raw: unknown): ProgressState => {
       ambient: settings.ambient !== false,
       music: settings.music !== false,
       slowMotion: settings.slowMotion !== false,
+      renderScale:
+        renderScale === 'crisp' || renderScale === 'fast'
+          ? renderScale
+          : 'auto',
     },
     stats: {
       flights: Math.max(0, finite(stats.flights, 0)),

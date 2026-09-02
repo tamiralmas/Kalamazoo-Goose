@@ -165,6 +165,9 @@ export type Settings = {
   ambient: boolean;
   music: boolean;
   slowMotion: boolean;
+  /** How many device pixels the 3D world (not the DOM HUD) renders at; see
+   *  render-scale.ts. 'auto' balances sharpness against GPU cost. */
+  renderScale: 'auto' | 'crisp' | 'fast';
 };
 
 export type ProgressStats = {
@@ -265,6 +268,7 @@ export const DEFAULT_SETTINGS: Settings = {
   ambient: true,
   music: true,
   slowMotion: true,
+  renderScale: 'auto',
 };
 
 export const DEFAULT_MODIFIERS: Modifiers = {

@@ -598,34 +598,6 @@
   display: none;
 }
 
-.jetstream-indicator {
-  position: absolute;
-  z-index: 6;
-  top: calc(48% - 56px);
-  left: 50%;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  transform: translateX(-50%);
-  border: 1px solid rgba(255, 208, 112, 0.48);
-  border-radius: 999px;
-  background: rgba(82, 47, 24, 0.78);
-  padding: 7px 11px;
-  box-shadow: 0 0 26px rgba(241, 197, 0, 0.22);
-  color: #fff1cc;
-  font-size: 10px;
-  font-weight: 850;
-  letter-spacing: 0.08em;
-  pointer-events: none;
-  backdrop-filter: blur(12px);
-}
-
-.jetstream-indicator svg {
-  width: 14px;
-  height: 14px;
-  color: #ffd36a;
-}
-
 .mode-stack {
   position: absolute;
   z-index: 4;
@@ -717,6 +689,17 @@
 .mode-stack .carry-chip b {
   font-weight: 800;
   opacity: 0.85;
+}
+.mode-stack .jetstream-chip {
+  border-color: rgba(255, 208, 112, 0.55);
+  background: rgba(82, 47, 24, 0.78);
+  box-shadow: 0 0 18px rgba(241, 197, 0, 0.22);
+  color: #fff1cc;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.mode-stack .jetstream-chip svg {
+  color: #ffd36a;
 }
 
 .control-deck {
@@ -2734,9 +2717,6 @@ kbd {
     & .mode-stack {
       bottom: calc(122px + env(safe-area-inset-bottom));
     }
-    & .jetstream-indicator {
-      display: none;
-    }
     & .is-playing .game-footer {
       display: none;
     }
@@ -3109,9 +3089,6 @@ kbd {
   }
   & .mode-stack {
     bottom: calc(122px + env(safe-area-inset-bottom));
-  }
-  & .jetstream-indicator {
-    display: none;
   }
   & .is-playing .game-footer {
     display: none;

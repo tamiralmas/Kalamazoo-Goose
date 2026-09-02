@@ -502,10 +502,20 @@ const flutterEuler = new THREE.Euler();
 const flutterQuaternion = new THREE.Quaternion();
 
 export function createPropSystem(options: PropSystemOptions): PropSystem {
+  // DoubleSide like every other material in the world: the camera projection
+  // comes from MapLibre and mirrors Y (mercator north is negative), which
+  // flips the screen-space winding, and three.js only corrects winding for
+  // an object's own matrix, never the camera's. Single-sided props were
+  // being drawn inside-out, which read as see-through.
   const material = new THREE.MeshStandardMaterial({
     vertexColors: true,
     roughness: 0.86,
     metalness: 0.04,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
   });
   const meshes = new Map<PropKind, THREE.InstancedMesh>();
   const byKind = new Map<PropKind, Prop[]>();

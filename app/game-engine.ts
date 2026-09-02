@@ -185,10 +185,15 @@ type GooseRig = {
 };
 
 type FlockGoose = {
-  rig: GooseRig;
   beacon: THREE.Mesh<THREE.TorusGeometry, THREE.MeshBasicMaterial>;
   home: THREE.Vector2;
   position: THREE.Vector3;
+  /**
+   * Where this goose was last drawn. The flock shares one pose rig now, so the
+   * rig root can no longer carry "where I was last frame", which is what the
+   * waddle reads to work out how fast the follower is moving.
+   */
+  drawnPosition: THREE.Vector3;
   ground: number;
   terrainResolved: boolean;
   terrainSamplePosition: THREE.Vector2;
@@ -323,6 +328,15 @@ type CampusSecret = {
   altitude: number;
   terrainResolved: boolean;
   terrainRefreshRemaining: number;
+  /**
+   * Gameplay visibility: playing, and its terrain has resolved. This is what
+   * telemetry and the HUD mean by "this secret exists in the world", kept
+   * apart from `inRange` so the draw-call gate below cannot be mistaken for a
+   * secret that failed to place.
+   */
+  shown: boolean;
+  /** Within SECRET_VISIBLE_RADIUS of the goose, refreshed a few times a second. */
+  inRange: boolean;
   definition?: BonusChaosSecret;
 };
 
@@ -433,7 +447,17 @@ const BUILDING_RESCAN_DISTANCE = 240;
  */
 const STALE_CHUNK_SCANS = 3;
 /** Seconds between the steady building scans that feed that count. */
-const BUILDING_RESCAN_INTERVAL = 1.2;
+const BUILDING_RESCAN_INTERVAL = 2;
+/**
+ * How far a secret's visual stays in the scene graph. Frustum culling alone
+ * still walks all 165 secret meshes every frame; dropping the whole group past
+ * this radius keeps the far side of the map off the render list entirely.
+ * Well past both TEXTURED_ROOF_RADIUS and anything a player can see a secret
+ * beacon at, so nothing pops in on approach.
+ */
+const SECRET_VISIBLE_RADIUS = 900;
+/** Seconds between re-evaluations of that radius. */
+const SECRET_RANGE_INTERVAL = 0.5;
 /** Tallest lip a goose on foot walks up rather than into, in metres. */
 const STEP_UP_HEIGHT = 0.7;
 /** How far out colliders keep chasing a DEM that had not decoded yet. */
@@ -1308,6 +1332,7 @@ export function createGooseEngine(
   let telemetryClock = 0;
   let buildingRefreshClock = 0;
   let buildingRescanClock = BUILDING_RESCAN_INTERVAL;
+  let secretRangeClock = 0;
   let buildingRefreshRequested = true;
   let trafficRefreshClock = 0;
   let trafficBuilt = false;
@@ -1378,7 +1403,30 @@ export function createGooseEngine(
   /** 0..1 fade of the jetstream, so arming at 50 m is not a jolt. */
   let altitudeBoostRamp = 0;
   const texturedBuildingKeys = new Set<string>();
-  const texturedBuildingMeshByKey = new Map<string, THREE.Mesh>();
+  /**
+   * One aerial roof overlay footprint. Its geometry is already in world XZ
+   * with y at the building's render height, so the only thing merging has to
+   * do is add `centerGround` to every vertex's y. Kept apart from the mesh
+   * that draws it: 200-320 footprints used to be 200-320 draw calls, and a
+   * roof overlay is a flat unlit quad-ish polygon that the GPU could not care
+   * less about batching.
+   */
+  type RoofOverlayRecord = {
+    key: string;
+    materialKey: string;
+    geometry: THREE.BufferGeometry;
+    centerGround: number;
+    terrainResolved: boolean;
+  };
+  /** Every footprint sharing one aerial tile, drawn as a single merged mesh. */
+  type RoofOverlayBatch = {
+    records: Set<RoofOverlayRecord>;
+    mesh: THREE.Mesh | null;
+    dirty: boolean;
+  };
+  const roofOverlayRecords = new Map<string, RoofOverlayRecord>();
+  const roofOverlayBatches = new Map<string, RoofOverlayBatch>();
+  let roofOverlayBatchesDirty = false;
   const texturedBuildingGroup = new THREE.Group();
   texturedBuildingGroup.name = 'Capped aerial roof overlays';
   texturedBuildingGroup.visible = false;
@@ -1390,6 +1438,8 @@ export function createGooseEngine(
     {
       texture: THREE.Texture;
       roof: THREE.MeshBasicMaterial;
+      /** True once the aerial tile has arrived (or failed for good). */
+      ready: boolean;
     }
   >();
   const buildingColliders: BuildingCollider[] = [];
@@ -1678,6 +1728,25 @@ export function createGooseEngine(
     );
   };
 
+  /**
+   * geoToLocal without the Vector3, for hot loops that only need the two
+   * numbers. The building scan calls this thousands of times a pass to decide
+   * a footprint is out of range.
+   */
+  const geoToLocalInto = (
+    longitude: number,
+    latitude: number,
+    out: { x: number; z: number },
+  ) => {
+    const coordinate = maplibre.MercatorCoordinate.fromLngLat(
+      [longitude, latitude],
+      0,
+    );
+    out.x = (coordinate.x - origin.x) / meterScale;
+    out.z = (origin.y - coordinate.y) / meterScale;
+    return out;
+  };
+
   const contentAnchorLocal = geoToLocal(
     WMU_CONTENT_ANCHOR[0],
     WMU_CONTENT_ANCHOR[1],
@@ -1860,6 +1929,9 @@ export function createGooseEngine(
     terrainResolved: false,
   };
   const colliderCentroidScratch: PlanarPoint = { x: 0, z: 0 };
+  /** The two projected corners the building scan rejects footprints with. */
+  const scanCornerLow: PlanarPoint = { x: 0, z: 0 };
+  const scanCornerHigh: PlanarPoint = { x: 0, z: 0 };
 
   /**
    * Fit a collision box to the DEM under a footprint. A reading the DEM cannot
@@ -2048,6 +2120,7 @@ export function createGooseEngine(
         roof.map = loadedTexture;
         roof.color.setHex(0xffffff);
         roof.needsUpdate = true;
+        revealWaitingRoofs(key);
         map.triggerRepaint();
       },
       undefined,
@@ -2056,12 +2129,133 @@ export function createGooseEngine(
         roof.map = null;
         roof.color.setHex(0xc7c1b5);
         roof.needsUpdate = true;
+        revealWaitingRoofs(key);
       },
     );
     texture.colorSpace = THREE.SRGBColorSpace;
-    const materialSet = { texture, roof };
+    const materialSet = { texture, roof, ready: false };
     buildingMaterials.set(key, materialSet);
     return materialSet;
+  };
+
+  const getRoofOverlayBatch = (materialKey: string) => {
+    const existing = roofOverlayBatches.get(materialKey);
+    if (existing) return existing;
+    const batch: RoofOverlayBatch = {
+      records: new Set<RoofOverlayRecord>(),
+      mesh: null,
+      dirty: true,
+    };
+    roofOverlayBatches.set(materialKey, batch);
+    return batch;
+  };
+
+  /**
+   * Anything that changes what a batch would merge to. The rebuild itself is
+   * deferred to one flush per frame: a scan can resolve a hundred footprints
+   * and there is no point merging the same tile a hundred times for it.
+   */
+  const markRoofOverlayBatchDirty = (materialKey: string) => {
+    getRoofOverlayBatch(materialKey).dirty = true;
+    roofOverlayBatchesDirty = true;
+  };
+
+  /**
+   * An overlay is drawn only once both its DEM and its aerial tile are in:
+   * a flat tan placeholder that later flips to imagery is exactly the
+   * "textures keep updating" the player sees, and MapLibre's own roof under
+   * it is the same tan anyway. Merging is what enforces that now, by leaving
+   * the footprint out of the batch until both are true.
+   */
+  const roofOverlayShowable = (record: RoofOverlayRecord) =>
+    record.terrainResolved &&
+    buildingMaterials.get(record.materialKey)?.ready === true;
+
+  const rebuildRoofOverlayBatch = (
+    materialKey: string,
+    batch: RoofOverlayBatch,
+  ) => {
+    batch.dirty = false;
+    if (batch.mesh) {
+      texturedBuildingGroup.remove(batch.mesh);
+      batch.mesh.geometry.dispose();
+      batch.mesh = null;
+    }
+    const materials = buildingMaterials.get(materialKey);
+    if (!materials) return;
+    let vertexCount = 0;
+    for (const record of batch.records) {
+      if (!roofOverlayShowable(record)) continue;
+      vertexCount += record.geometry.getAttribute('position').count;
+    }
+    if (vertexCount === 0) return;
+    const positions = new Float32Array(vertexCount * 3);
+    const normals = new Float32Array(vertexCount * 3);
+    const uvs = new Float32Array(vertexCount * 2);
+    let offset = 0;
+    for (const record of batch.records) {
+      if (!roofOverlayShowable(record)) continue;
+      const position = record.geometry.getAttribute(
+        'position',
+      ) as THREE.BufferAttribute;
+      const normal = record.geometry.getAttribute(
+        'normal',
+      ) as THREE.BufferAttribute;
+      const uv = record.geometry.getAttribute('uv') as THREE.BufferAttribute;
+      const source = position.array as Float32Array;
+      for (let index = 0; index < position.count; index += 1) {
+        const target = (offset + index) * 3;
+        positions[target] = source[index * 3];
+        // The record's own y is renderHeight + 0.08 above its ground; the
+        // ground itself only lands here, because it is the one part of the
+        // footprint that moves as the DEM resolves.
+        positions[target + 1] = source[index * 3 + 1] + record.centerGround;
+        positions[target + 2] = source[index * 3 + 2];
+      }
+      normals.set(normal.array as Float32Array, offset * 3);
+      uvs.set(uv.array as Float32Array, offset * 2);
+      offset += position.count;
+    }
+    const merged = new THREE.BufferGeometry();
+    merged.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    merged.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+    merged.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    merged.computeBoundingSphere();
+    const mesh = new THREE.Mesh(merged, materials.roof);
+    mesh.name = 'MiSAIL aerial roof overlay batch';
+    mesh.frustumCulled = true;
+    mesh.renderOrder = 1;
+    texturedBuildingGroup.add(mesh);
+    batch.mesh = mesh;
+  };
+
+  const flushRoofOverlayBatches = () => {
+    if (!roofOverlayBatchesDirty) return;
+    roofOverlayBatchesDirty = false;
+    roofOverlayBatches.forEach((batch, materialKey) => {
+      if (batch.dirty) rebuildRoofOverlayBatch(materialKey, batch);
+    });
+  };
+
+  const revealWaitingRoofs = (materialKey: string) => {
+    const materials = buildingMaterials.get(materialKey);
+    if (!materials) return;
+    materials.ready = true;
+    markRoofOverlayBatchDirty(materialKey);
+  };
+
+  /** Drops one footprint's overlay geometry and dirties the tile it was in. */
+  const removeRoofOverlayRecord = (key: string) => {
+    const record = roofOverlayRecords.get(key);
+    if (!record) return;
+    roofOverlayRecords.delete(key);
+    const batch = roofOverlayBatches.get(record.materialKey);
+    if (batch) {
+      batch.records.delete(record);
+      batch.dirty = true;
+      roofOverlayBatchesDirty = true;
+    }
+    record.geometry.dispose();
   };
 
   /** Drops one collider and the aerial roof overlay built for it, if any. */
@@ -2069,12 +2263,7 @@ export function createGooseEngine(
     const building = buildingColliders[index];
     buildingColliders.splice(index, 1);
     buildingColliderByKey.delete(building.sourceKey);
-    const roofMesh = texturedBuildingMeshByKey.get(building.sourceKey);
-    if (roofMesh) {
-      texturedBuildingGroup.remove(roofMesh);
-      roofMesh.geometry.dispose();
-      texturedBuildingMeshByKey.delete(building.sourceKey);
-    }
+    removeRoofOverlayRecord(building.sourceKey);
     texturedBuildingKeys.delete(building.sourceKey);
   };
 
@@ -2083,11 +2272,16 @@ export function createGooseEngine(
     buildingCollectionGeneration += 1;
     activeColliderSourceCount = -1;
     refreshActiveBuildingColliders(true);
-    const usedRoofMaterials = new Set(
-      [...texturedBuildingMeshByKey.values()].map((mesh) => mesh.material),
-    );
     buildingMaterials.forEach((materials, key) => {
-      if (usedRoofMaterials.has(materials.roof)) return;
+      const batch = roofOverlayBatches.get(key);
+      if (batch && batch.records.size > 0) return;
+      if (batch) {
+        if (batch.mesh) {
+          texturedBuildingGroup.remove(batch.mesh);
+          batch.mesh.geometry.dispose();
+        }
+        roofOverlayBatches.delete(key);
+      }
       materials.texture.dispose();
       materials.roof.dispose();
       buildingMaterials.delete(key);
@@ -2255,32 +2449,82 @@ export function createGooseEngine(
         Math.max(0, renderHeight - 0.5),
       );
       polygonSets.forEach((rings, polygonIndex) => {
-        const outerRing =
-          rings[0]?.filter((coordinate) => coordinate.length >= 2) ?? [];
-        if (outerRing.length < 4) return;
-        const localOuter = outerRing.map(([longitude, latitude]) =>
-          geoToLocal(longitude, latitude),
+        const rawOuter = rings[0];
+        if (!rawOuter) return;
+        // A scan is handed every building polygon of each zoom-14 tile in
+        // view, one to four thousand of them, and all but a few dozen are out
+        // of range. So the reject runs on the raw lng/lat arrays: projecting a
+        // whole ring first cost a MercatorCoordinate and a Vector3 per vertex
+        // plus four spread-allocations, for a footprint across town.
+        let minLongitude = Infinity;
+        let maxLongitude = -Infinity;
+        let minLatitude = Infinity;
+        let maxLatitude = -Infinity;
+        let ringLength = 0;
+        for (const coordinate of rawOuter) {
+          if (coordinate.length < 2) continue;
+          const longitude = coordinate[0];
+          const latitude = coordinate[1];
+          if (longitude < minLongitude) minLongitude = longitude;
+          if (longitude > maxLongitude) maxLongitude = longitude;
+          if (latitude < minLatitude) minLatitude = latitude;
+          if (latitude > maxLatitude) maxLatitude = latitude;
+          ringLength += 1;
+        }
+        if (ringLength < 4) return;
+        // Web Mercator is monotonic in both axes (x rises with longitude, the
+        // local z rises with latitude), so projecting the two opposite corners
+        // of the lng/lat box gives exactly the local box the whole ring would
+        // have produced: the same rejection, two projections instead of one
+        // per vertex.
+        const southWest = geoToLocalInto(
+          minLongitude,
+          minLatitude,
+          scanCornerLow,
         );
-        const minX = Math.min(...localOuter.map((point) => point.x));
-        const maxX = Math.max(...localOuter.map((point) => point.x));
-        const minZ = Math.min(...localOuter.map((point) => point.z));
-        const maxZ = Math.max(...localOuter.map((point) => point.z));
-        const centerX = (minX + maxX) * 0.5;
-        const centerZ = (minZ + maxZ) * 0.5;
-        const spanX = maxX - minX;
-        const spanZ = maxZ - minZ;
-        const distanceFromPlayer = Math.hypot(
-          centerX - state.position.x,
-          centerZ - state.position.z,
+        const northEast = geoToLocalInto(
+          maxLongitude,
+          maxLatitude,
+          scanCornerHigh,
         );
+        const spanX = northEast.x - southWest.x;
+        const spanZ = northEast.z - southWest.z;
         if (
-          distanceFromPlayer > BUILDING_INGEST_RADIUS ||
+          Math.hypot(
+            (southWest.x + northEast.x) * 0.5 - state.position.x,
+            (southWest.z + northEast.z) * 0.5 - state.position.z,
+          ) > BUILDING_INGEST_RADIUS ||
           spanX < 0.8 ||
           spanZ < 0.8 ||
           spanX > 500 ||
           spanZ > 500
         )
           return;
+
+        const outerRing = rawOuter.filter(
+          (coordinate) => coordinate.length >= 2,
+        );
+        const localOuter = outerRing.map(([longitude, latitude]) =>
+          geoToLocal(longitude, latitude),
+        );
+        // The footprint key and the collider box are still the projected
+        // ring's own bounds, not the corner estimate above.
+        let minX = Infinity;
+        let maxX = -Infinity;
+        let minZ = Infinity;
+        let maxZ = -Infinity;
+        for (const point of localOuter) {
+          if (point.x < minX) minX = point.x;
+          if (point.x > maxX) maxX = point.x;
+          if (point.z < minZ) minZ = point.z;
+          if (point.z > maxZ) maxZ = point.z;
+        }
+        const centerX = (minX + maxX) * 0.5;
+        const centerZ = (minZ + maxZ) * 0.5;
+        const distanceFromPlayer = Math.hypot(
+          centerX - state.position.x,
+          centerZ - state.position.z,
+        );
 
         const footprintKey = [
           feature.id ?? 'building',
@@ -2384,9 +2628,10 @@ export function createGooseEngine(
             existingCollider.renderHeight = renderHeight;
             existingCollider.renderMinHeight = renderMinHeight;
             keepGooseOnRoof(existingCollider, previousRoof, nextRoof);
-            const roofMesh = texturedBuildingMeshByKey.get(footprintKey);
-            if (roofMesh && existingCollider.terrainResolved) {
-              roofMesh.position.y = centerGround;
+            const record = roofOverlayRecords.get(footprintKey);
+            if (record && existingCollider.terrainResolved) {
+              record.centerGround = centerGround;
+              markRoofOverlayBatchDirty(record.materialKey);
             }
             if (terrainChanged) changed = true;
           } else {
@@ -2470,27 +2715,40 @@ export function createGooseEngine(
         });
 
         const { zoom, tileX, tileY } = chooseBuildingTextureTile(outerRing);
-        const materials = getBuildingMaterials(zoom, tileX, tileY);
+        // Kicks off the aerial tile fetch if this is the first footprint on
+        // it; the batch below picks the material up by key once it is ready.
+        getBuildingMaterials(zoom, tileX, tileY);
         const geometry = new THREE.ShapeGeometry(shape, 1);
         applyBuildingRoofUvs(geometry, zoom, tileX, tileY);
         geometry.rotateX(-Math.PI / 2);
         geometry.translate(0, renderHeight + 0.08, 0);
         geometry.computeVertexNormals();
-        const mesh = new THREE.Mesh(geometry, materials.roof);
-        mesh.name = 'MiSAIL aerial roof overlay';
-        mesh.position.y = centerGround;
+        // Non-indexed so merging a tile's footprints is three array copies
+        // with no index rebasing; a footprint is a dozen triangles, so the
+        // duplicated vertices cost nothing worth the extra bookkeeping.
+        const overlayGeometry = geometry.index
+          ? geometry.toNonIndexed()
+          : geometry;
+        if (overlayGeometry !== geometry) geometry.dispose();
+        const materialKey = `${zoom}/${tileY}/${tileX}`;
         // An overlay for a building whose terrain has not resolved would hang
         // at the campus fallback elevation, which on a hillside is a roof
-        // floating tens of meters over its building. It is built now (the
-        // geometry is here and the polygon is not) but stays hidden until the
-        // resolve pass can put it at the real centerGround.
-        mesh.visible = existingCollider
-          ? existingCollider.terrainResolved
-          : colliderTerrainResolved;
-        mesh.frustumCulled = true;
-        mesh.renderOrder = 1;
-        texturedBuildingGroup.add(mesh);
-        texturedBuildingMeshByKey.set(footprintKey, mesh);
+        // floating tens of meters over its building. The record is kept now
+        // (the geometry is here and the polygon is not) but stays out of the
+        // merged mesh until the resolve pass can put it at the real
+        // centerGround, and until its aerial tile has arrived.
+        const record: RoofOverlayRecord = {
+          key: footprintKey,
+          materialKey,
+          geometry: overlayGeometry,
+          centerGround,
+          terrainResolved: existingCollider
+            ? existingCollider.terrainResolved
+            : colliderTerrainResolved,
+        };
+        roofOverlayRecords.set(footprintKey, record);
+        getRoofOverlayBatch(materialKey).records.add(record);
+        markRoofOverlayBatchDirty(materialKey);
         texturedBuildingKeys.add(footprintKey);
         changed = true;
       });
@@ -2582,10 +2840,11 @@ export function createGooseEngine(
       // if the building was out of roof range when it was ingested, in which
       // case buildTexturedBuildings creates it later already resolved). Now it
       // has somewhere true to sit.
-      const roofMesh = texturedBuildingMeshByKey.get(building.sourceKey);
-      if (roofMesh) {
-        roofMesh.position.y = fit.centerGround;
-        roofMesh.visible = true;
+      const record = roofOverlayRecords.get(building.sourceKey);
+      if (record) {
+        record.centerGround = fit.centerGround;
+        record.terrainResolved = true;
+        markRoofOverlayBatchDirty(record.materialKey);
       }
       changed = true;
     }
@@ -2593,6 +2852,17 @@ export function createGooseEngine(
     buildingCollectionGeneration += 1;
     refreshActiveBuildingColliders(true);
     return true;
+  };
+
+  /**
+   * The one place a secret group's `visible` is written. `shown` is the
+   * gameplay answer (playing, terrain resolved) that telemetry and the HUD
+   * read; `inRange` is purely the draw-call gate. Discovery, the compass, the
+   * minimap and travelTo all work off `secret.position`, so a secret the goose
+   * cannot see still behaves exactly as before.
+   */
+  const applySecretVisibility = (secret: CampusSecret) => {
+    secret.group.visible = secret.shown && secret.inRange;
   };
 
   const createCampusSecrets = () => {
@@ -2645,11 +2915,15 @@ export function createGooseEngine(
 
     const finishGroup = (group: THREE.Group) => {
       group.traverse((object) => {
-        object.frustumCulled = false;
         // Remember the undiscovered look now: a fresh goose has to be able to
         // put every secret back the way it was found. The position matters for
         // the parts that drift once found, such as the diploma papers.
         if (object instanceof THREE.Mesh) {
+          // Every secret animation moves whole objects (position, rotation,
+          // scale) and never edits a vertex, so one bounding sphere per
+          // geometry stays correct for the life of the secret and the meshes
+          // can be culled like anything else in the scene.
+          object.geometry.computeBoundingSphere();
           object.userData.basePosition = object.position.clone();
           if (object.material instanceof THREE.MeshStandardMaterial) {
             object.userData.baseEmissive = object.material.emissive.getHex();
@@ -2696,10 +2970,14 @@ export function createGooseEngine(
         altitude,
         terrainResolved,
         terrainRefreshRemaining: (campusSecrets.length % 7) * 0.11,
+        shown: playing && terrainResolved,
+        // Assumed in range until the first range sweep: the alternative is a
+        // frame where every secret near the spawn is missing.
+        inRange: true,
         definition,
       };
       campusSecrets.push(secret);
-      group.visible = playing && terrainResolved;
+      applySecretVisibility(secret);
       return secret;
     };
 
@@ -2884,9 +3162,6 @@ export function createGooseEngine(
       0.06,
       2.15,
     );
-    bronco.traverse((object) => {
-      object.frustumCulled = false;
-    });
     broncoHome.set(broncoSecret.position.x, broncoSecret.position.z);
     broncoGround = broncoSecret.position.y - broncoSecret.altitude;
 
@@ -3127,11 +3402,80 @@ export function createGooseEngine(
     opacity: 0.78,
     depthWrite: false,
   });
+
+  // The flock is drawn as one InstancedMesh per rig part rather than eight
+  // rigs in the scene: a goose is fourteen little meshes, and eight of them
+  // was 112 draw calls for birds that all look identical (mutator skins only
+  // ever recolor the player's rig). This one rig is never rendered; it is
+  // posed once per goose per frame and its part matrices are copied into the
+  // instance buffers.
+  const flockPoseRig = createGooseRig();
+  flockPoseRig.root.name = 'Flock pose rig';
+  flockPoseRig.root.scale.setScalar(0.36);
+  const flockInstanceGroup = new THREE.Group();
+  flockInstanceGroup.name = 'Recruitable campus geese';
+  flockInstanceGroup.visible = false;
+  scene.add(flockInstanceGroup);
+  const flockParts: Array<{
+    source: THREE.Object3D;
+    instances: THREE.InstancedMesh;
+  }> = [];
+  flockPoseRig.root.traverse((object) => {
+    if (!(object instanceof THREE.Mesh)) return;
+    // The halo is the Angel Goose mutator, which applyModifiers only ever
+    // turns on for the player. Instancing it would be a draw call that never
+    // shows anything.
+    if (object === flockPoseRig.halo) return;
+    const instances = new THREE.InstancedMesh(
+      object.geometry,
+      object.material,
+      FLOCK_ROOSTS.length,
+    );
+    instances.name = 'Flock goose part';
+    // Eight geese spread across campus: the batch's bounding sphere would
+    // cover the whole map, so testing it would cost more than it saves.
+    instances.frustumCulled = false;
+    instances.castShadow = false;
+    instances.receiveShadow = false;
+    flockInstanceGroup.add(instances);
+    flockParts.push({ source: object, instances });
+  });
+  /** Collapses one instance to nothing without spending a draw call on it. */
+  const hiddenFlockMatrix = new THREE.Matrix4().makeScale(0, 0, 0);
+
+  /**
+   * True when the pose rig is currently showing this part: `legs.visible` is
+   * toggled for a goose in the air or on the water, and that lives on the
+   * group above the leg meshes.
+   */
+  const flockPartVisible = (part: THREE.Object3D) => {
+    let node: THREE.Object3D | null = part;
+    while (node && node !== flockPoseRig.root) {
+      if (!node.visible) return false;
+      node = node.parent;
+    }
+    return true;
+  };
+
+  /** Freezes the pose rig's current stance into one goose's instance slot. */
+  const publishFlockPose = (index: number, drawn: boolean) => {
+    flockPoseRig.root.updateMatrixWorld(true);
+    for (const part of flockParts) {
+      part.instances.setMatrixAt(
+        index,
+        drawn && flockPartVisible(part.source)
+          ? part.source.matrixWorld
+          : hiddenFlockMatrix,
+      );
+    }
+  };
+
+  const commitFlockInstances = () => {
+    for (const part of flockParts)
+      part.instances.instanceMatrix.needsUpdate = true;
+  };
+
   FLOCK_ROOSTS.forEach(([east, north], index) => {
-    const rig = createGooseRig(true);
-    rig.root.name = `Recruitable campus goose ${index + 1}`;
-    rig.root.scale.setScalar(0.36);
-    rig.root.visible = playing;
     const beacon = new THREE.Mesh(
       new THREE.TorusGeometry(1.45, 0.055, 7, 30),
       flockBeaconMaterial.clone(),
@@ -3149,14 +3493,14 @@ export function createGooseEngine(
       terrainResolved && typeof elevation === 'number'
         ? elevation
         : campusGroundFallback;
-    rig.root.position.set(east, ground + 0.04, north);
+    const position = new THREE.Vector3(east, ground + 0.04, north);
     beacon.position.set(east, ground + 0.08, north);
-    scene.add(rig.root, beacon);
+    scene.add(beacon);
     flockGeese.push({
-      rig,
       beacon,
       home,
-      position: rig.root.position.clone(),
+      position,
+      drawnPosition: position.clone(),
       ground,
       terrainResolved,
       terrainSamplePosition: home.clone(),
@@ -3313,7 +3657,7 @@ export function createGooseEngine(
       return moved;
     };
 
-    flockGeese.forEach((member) => {
+    flockGeese.forEach((member, memberIndex) => {
       member.terrainRefreshRemaining = Math.max(
         0,
         member.terrainRefreshRemaining - dt,
@@ -3329,19 +3673,20 @@ export function createGooseEngine(
             Math.abs(Math.sin(elapsedTime * 2 + member.phase)) * 0.025,
           member.home.y,
         );
-        member.rig.root.position.copy(member.position);
-        member.rig.root.visible = playing && member.terrainResolved;
-        member.rig.root.rotation.set(
+        member.drawnPosition.copy(member.position);
+        flockPoseRig.root.position.copy(member.drawnPosition);
+        flockPoseRig.root.rotation.set(
           0,
           member.phase + Math.sin(elapsedTime * 0.45 + member.phase) * 0.35,
           0,
         );
-        member.rig.legs.visible = true;
-        member.rig.leftWing.scale.set(0.42, 1, 0.84);
-        member.rig.rightWing.scale.set(0.42, 1, 0.84);
-        member.rig.leftWing.rotation.z = -0.66;
-        member.rig.rightWing.rotation.z = 0.66;
-        setGooseLegStride(member.rig, 0);
+        flockPoseRig.legs.visible = true;
+        flockPoseRig.leftWing.scale.set(0.42, 1, 0.84);
+        flockPoseRig.rightWing.scale.set(0.42, 1, 0.84);
+        flockPoseRig.leftWing.rotation.z = -0.66;
+        flockPoseRig.rightWing.rotation.z = 0.66;
+        setGooseLegStride(flockPoseRig, 0);
+        publishFlockPose(memberIndex, playing && member.terrainResolved);
         member.beacon.position.set(
           member.home.x,
           member.ground + 0.08,
@@ -3384,22 +3729,22 @@ export function createGooseEngine(
       const followerSpeed =
         dt > 0
           ? Math.hypot(
-              member.position.x - member.rig.root.position.x,
-              member.position.z - member.rig.root.position.z,
+              member.position.x - member.drawnPosition.x,
+              member.position.z - member.drawnPosition.z,
             ) / dt
           : 0;
       keepOutsideBuildings(member.position, airborne ? 0.85 : 0.48);
-      member.rig.root.position.copy(member.position);
+      member.drawnPosition.copy(member.position);
 
       if (airborne) {
-        member.rig.root.quaternion.copy(goose.root.quaternion);
-        member.rig.legs.visible = false;
-        member.rig.leftWing.scale.set(1, 1, 1);
-        member.rig.rightWing.scale.set(1, 1, 1);
+        flockPoseRig.root.quaternion.copy(goose.root.quaternion);
+        flockPoseRig.legs.visible = false;
+        flockPoseRig.leftWing.scale.set(1, 1, 1);
+        flockPoseRig.rightWing.scale.set(1, 1, 1);
         const flap = 0.12 - 0.46 * Math.cos(elapsedTime * 8.2 + member.phase);
-        member.rig.leftWing.rotation.z = flap;
-        member.rig.rightWing.rotation.z = -flap;
-        setGooseLegStride(member.rig, 0);
+        flockPoseRig.leftWing.rotation.z = flap;
+        flockPoseRig.rightWing.rotation.z = -flap;
+        setGooseLegStride(flockPoseRig, 0);
         member.waterContactReleaseTime += dt;
         if (member.waterContactReleaseTime >= 0.18)
           member.waterContactLatched = false;
@@ -3418,18 +3763,18 @@ export function createGooseEngine(
           ? 0
           : Math.sin(member.waddlePhase) * waddleAmount;
         if (!followerOnWater) {
-          member.rig.root.position.y +=
+          member.drawnPosition.y +=
             (0.5 - 0.5 * Math.cos(member.waddlePhase * 2)) *
             0.025 *
             waddleAmount;
         }
-        member.rig.root.rotation.set(0, pose.heading, -waddle * 0.035);
-        member.rig.legs.visible = !followerOnWater;
-        setGooseLegStride(member.rig, waddle);
-        member.rig.leftWing.scale.set(0.42, 1, 0.84);
-        member.rig.rightWing.scale.set(0.42, 1, 0.84);
-        member.rig.leftWing.rotation.z = -0.66;
-        member.rig.rightWing.rotation.z = 0.66;
+        flockPoseRig.root.rotation.set(0, pose.heading, -waddle * 0.035);
+        flockPoseRig.legs.visible = !followerOnWater;
+        setGooseLegStride(flockPoseRig, waddle);
+        flockPoseRig.leftWing.scale.set(0.42, 1, 0.84);
+        flockPoseRig.rightWing.scale.set(0.42, 1, 0.84);
+        flockPoseRig.leftWing.rotation.z = -0.66;
+        flockPoseRig.rightWing.rotation.z = 0.66;
 
         if (followerOnWater) {
           member.waterContactReleaseTime = 0;
@@ -3447,7 +3792,12 @@ export function createGooseEngine(
             member.waterContactLatched = false;
         }
       }
+      // Last, because the grounded branch above adds the waddle bob to the
+      // drawn height after copying the simulated position into it.
+      flockPoseRig.root.position.copy(member.drawnPosition);
+      publishFlockPose(memberIndex, playing && member.terrainResolved);
     });
+    commitFlockInstances();
   };
 
   type CampusTreePoint = {
@@ -4093,10 +4443,13 @@ export function createGooseEngine(
     cloudPuffs.visible = visible && cloudBaseResolved;
     texturedBuildingGroup.visible = visible;
     campusSecrets.forEach((secret) => {
-      secret.group.visible = visible && secret.terrainResolved;
+      secret.shown = visible && secret.terrainResolved;
+      applySecretVisibility(secret);
     });
+    // Per-goose terrainResolved is carried by the instance matrices that
+    // updateFlockVisuals writes; this flag is the whole flock at once.
+    flockInstanceGroup.visible = visible;
     flockGeese.forEach((member) => {
-      member.rig.root.visible = visible && member.terrainResolved;
       member.beacon.visible =
         visible && member.terrainResolved && !member.recruited;
     });
@@ -5845,10 +6198,14 @@ export function createGooseEngine(
           secret.position.y = elevation + secret.altitude;
           secret.group.position.y = secret.position.y;
           secret.group.userData.baseY = secret.position.y;
-          secret.group.visible = playing;
+          secret.shown = playing;
+          applySecretVisibility(secret);
         } else {
           secret.terrainRefreshRemaining = 0.52 + (secretIndex % 4) * 0.09;
-          if (!secret.terrainResolved) secret.group.visible = false;
+          if (!secret.terrainResolved) {
+            secret.shown = false;
+            applySecretVisibility(secret);
+          }
         }
       }
       secret.honkWindow = Math.max(0, secret.honkWindow - dt);
@@ -5994,9 +6351,11 @@ export function createGooseEngine(
           ) {
             broncoGround = elevation;
             secret.terrainResolved = true;
-            secret.group.visible = playing;
+            secret.shown = playing;
+            applySecretVisibility(secret);
           } else if (!secret.terrainResolved) {
-            secret.group.visible = false;
+            secret.shown = false;
+            applySecretVisibility(secret);
           }
         }
         secret.group.position.y = broncoGround + secret.altitude;
@@ -6093,6 +6452,24 @@ export function createGooseEngine(
         spawnHonkWave();
       }
     });
+  };
+
+  /**
+   * Drops secret groups the goose is nowhere near out of the render list.
+   * Only the group flag moves: positions, discovery radii and the terrain
+   * chase in updateCampusSecrets all keep running for every secret, so a
+   * secret that comes back into range is exactly where it would have been.
+   */
+  const refreshSecretRange = () => {
+    const radiusSquared = SECRET_VISIBLE_RADIUS ** 2;
+    for (const secret of campusSecrets) {
+      const dx = secret.position.x - state.position.x;
+      const dz = secret.position.z - state.position.z;
+      const inRange = dx * dx + dz * dz <= radiusSquared;
+      if (inRange === secret.inRange) continue;
+      secret.inRange = inRange;
+      applySecretVisibility(secret);
+    }
   };
 
   const spawnHonkWave = () => {
@@ -8305,8 +8682,9 @@ export function createGooseEngine(
       combo: chaosCombo,
       secretsFound,
       secretsTotal: campusSecrets.length,
-      secretVisuals: campusSecrets.filter((secret) => secret.group.visible)
-        .length,
+      // `shown`, not group.visible: a secret parked on the far side of the map
+      // is still placed in the world, it is only skipped by the renderer.
+      secretVisuals: campusSecrets.filter((secret) => secret.shown).length,
       nearestSecretLabel: nearestSecret?.secret.group.name ?? null,
       nearestSecretDistance: nearestSecret?.distance ?? null,
       nearestSecretDirection,
@@ -8346,7 +8724,7 @@ export function createGooseEngine(
       gooseScreenY: (-projectedGoose.y * 0.5 + 0.5) * mapCanvas.clientHeight,
       duckCouncilEast: duckCouncil?.position.x ?? 0,
       duckCouncilNorth: duckCouncil?.position.z ?? 0,
-      duckCouncilVisible: duckCouncil?.group.visible ?? false,
+      duckCouncilVisible: duckCouncil?.shown ?? false,
       paused,
       tokens: saved.tokens,
       questsCompleted: saved.completedQuests.length,
@@ -8541,7 +8919,6 @@ export function createGooseEngine(
       member.waddlePhase = member.phase;
       member.waterContactLatched = false;
       member.waterContactReleaseTime = 0;
-      setGooseLegStride(member.rig, 0);
     });
     copyState(previousState, state);
     copyState(renderState, state);
@@ -8567,6 +8944,8 @@ export function createGooseEngine(
     });
     updateFlockVisuals(0, renderState);
     setGameplayVisibility(playing);
+    refreshSecretRange();
+    secretRangeClock = SECRET_RANGE_INTERVAL;
     emitTelemetry();
   };
 
@@ -8599,8 +8978,7 @@ export function createGooseEngine(
       member.waterContactLatched = false;
       member.waterContactReleaseTime = 0;
       member.position.set(member.home.x, member.ground + 0.04, member.home.y);
-      member.rig.root.position.copy(member.position);
-      setGooseLegStride(member.rig, 0);
+      member.drawnPosition.copy(member.position);
     });
     chaosScore = 0;
     chaosCombo = 1;
@@ -8626,6 +9004,9 @@ export function createGooseEngine(
     },
     render(_gl, args) {
       if (!renderer) return;
+      // Last moment before the draw, so a scan, a resolve pass and a texture
+      // landing in the same frame all cost one merge between them.
+      flushRoofOverlayBatches();
       camera.projectionMatrix
         .copy(
           new THREE.Matrix4().fromArray(args.defaultProjectionData.mainMatrix),
@@ -8740,6 +9121,11 @@ export function createGooseEngine(
       if (buildingRescanClock <= 0) {
         buildingRescanClock = BUILDING_RESCAN_INTERVAL;
         buildingRefreshRequested = true;
+      }
+      secretRangeClock -= frameDt;
+      if (secretRangeClock <= 0) {
+        secretRangeClock = SECRET_RANGE_INTERVAL;
+        refreshSecretRange();
       }
     }
     if (!buildingRefreshRequested && buildingRefreshClock <= 0) {
@@ -9225,6 +9611,10 @@ export function createGooseEngine(
       sampleSurface();
       refreshActiveBuildingColliders(true);
       updateTrees(false);
+      // The goose lands next to the secret this frame; waiting out the range
+      // sweep's cadence would arrive at an empty landmark.
+      refreshSecretRange();
+      secretRangeClock = SECRET_RANGE_INTERVAL;
       copyState(previousState, state);
       copyState(renderState, state);
       updateGoosePose(renderState);
@@ -9268,6 +9658,16 @@ export function createGooseEngine(
           materials.forEach((material) => material.dispose());
         }
       });
+      // The flock pose rig shares its geometries and materials with the
+      // instanced meshes the traverse just disposed, except the halo, which is
+      // the one part that is never instanced.
+      flockPoseRig.halo.geometry.dispose();
+      flockPoseRig.halo.material.dispose();
+      // Record geometries never enter the scene (only the merged batch mesh
+      // does), so the traverse above cannot reach them.
+      roofOverlayRecords.forEach((record) => record.geometry.dispose());
+      roofOverlayRecords.clear();
+      roofOverlayBatches.clear();
       buildingMaterials.forEach(({ texture }) => texture.dispose());
       buildingMaterials.clear();
     },
