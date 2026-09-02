@@ -1,40 +1,68 @@
 import * as THREE from 'three';
 import type {
   CustomLayerInterface,
+  LngLatLike,
   Map as MapLibreMap,
   MapSourceDataEvent,
 } from 'maplibre-gl';
 
+import { createGameAudio } from './audio';
 import {
+  CAMPUS_CHASE_SECONDS,
+  CAMPUS_ITEM_KINDS,
   MAX_CAMPUS_NPCS,
+  buildCampusItemGeometry,
+  createCampusItemMaterial,
   createCampusNpc,
   createCrowdFleet,
   knockDownCampusNpc,
   panicCampusNpc,
+  resumeCampusNpcRoute,
   simulateCampusNpc,
+  startCampusNpcChase,
+  startDanceCampusNpc,
   updateCrowdVisuals,
+  type CampusChaseContext,
   type CampusNpc,
   type CrowdRoute,
 } from './campus-crowd';
 import { BONUS_CHAOS_SECRETS, type BonusChaosSecret } from './chaos-secrets';
 import { isTouchDevice } from './device';
+import { createPropSystem, type PropPoi, type PropSystem } from './props';
+import { PROP_PLACEMENTS } from './props-placement';
 import { WMU_TREE_POINTS } from './wmu-trees';
 import { WMU_SPAWN } from './world-config';
-import { getAerialTileUrl } from './world-imagery';
+import { TERRAIN_MAX_ZOOM, getAerialTileUrl } from './world-imagery';
+import { slugifyLabel } from './game-contract';
+import type {
+  FlightMode,
+  GameEvent,
+  GooseColors,
+  GooseEngineApi,
+  ItemKind,
+  Modifiers,
+  ProgressState,
+  ProgressStore,
+  PropKind,
+  QuestDefinition,
+  SecretMarkerTelemetry,
+  ToastPriority,
+} from './game-contract';
+import { QUESTS, applyGameEvent } from './quests';
+// Phase 4: mutators. computeModifiers folds the active mutator ids into one
+// Modifiers snapshot; MUTATOR_BY_ID resolves an id to its display name for
+// the "Unlocked: <name>" toast.
+import { MUTATOR_BY_ID, computeModifiers } from './mutators';
+
+export type {
+  FlightMode,
+  SecretMarkerTelemetry,
+  ToastPriority,
+} from './game-contract';
 
 // Campus secrets were authored before the safe lawn spawn moved. Keep their
 // geographic anchor stable so a spawn tweak can never move a landmark again.
 const WMU_CONTENT_ANCHOR: [number, number] = [-85.61771, 42.284996];
-
-export type FlightMode = 'flying' | 'planing' | 'waddling' | 'swimming';
-
-export type SecretMarkerTelemetry = {
-  id: string;
-  label: string;
-  east: number;
-  north: number;
-  found: boolean;
-};
 
 export type GameTelemetry = {
   speed: number;
@@ -80,28 +108,38 @@ export type GameTelemetry = {
   duckCouncilEast: number;
   duckCouncilNorth: number;
   duckCouncilVisible: boolean;
+  // Phase 1 progression readouts.
+  paused: boolean;
+  tokens: number;
+  questsCompleted: number;
+  questsTotal: number;
+  // Phase 2 prop readouts.
+  props: number;
+  propsAwake: number;
+  // Phase 3: what is in the beak right now ('cone', 'phone', ...), or null.
+  holding: string | null;
+  // Phase 4 mutator readouts.
+  activeMutators: string[];
+  gooseScale: number;
+  // Phase 5 impact theater.
+  /** The goose is limp: a crash tumble, or the KeyR ragdoll being held. */
+  ragdolling: boolean;
+  /** Simulation speed multiplier. 1 normally, 0.35 during a hit-stop. */
+  timeScale: number;
 };
 
 type MapLibreModule = typeof import('maplibre-gl');
 
 // Score toasts announce a named trick and its points; informational toasts
 // (landing tips, traffic yielding) must not overwrite one that just appeared.
-export type ToastPriority = 'info' | 'score';
-
 type Hooks = {
   onTelemetry: (telemetry: GameTelemetry) => void;
   onToast: (message: string, priority?: ToastPriority) => void;
+  /** Every quest-countable moment; the HUD and audio can react to these. */
+  onEvent?: (event: GameEvent) => void;
 };
 
-export type GooseEngine = {
-  start: () => void;
-  reset: () => void;
-  setKey: (code: string, pressed: boolean) => void;
-  scaleCameraZoom: (multiplier: number) => void;
-  orbitCamera: (yawDelta: number, pitchDelta: number) => void;
-  resetCamera: () => void;
-  destroy: () => void;
-};
+export type GooseEngine = GooseEngineApi;
 
 type GooseRig = {
   root: THREE.Group;
@@ -110,6 +148,18 @@ type GooseRig = {
   legs: THREE.Group;
   leftLeg: THREE.Group;
   rightLeg: THREE.Group;
+  /** Phase 3: head, cheeks and beak on one pivot, so a full beak can droop. */
+  head: THREE.Group;
+  // Phase 4: mutators. Material refs so skins can recolor in place (no new
+  // geometry), and the Angel Goose halo, hidden by default.
+  materials: {
+    body: THREE.MeshStandardMaterial;
+    breast: THREE.MeshStandardMaterial;
+    neck: THREE.MeshStandardMaterial;
+    wing: THREE.MeshStandardMaterial;
+    beak: THREE.MeshStandardMaterial;
+  };
+  halo: THREE.Mesh<THREE.TorusGeometry, THREE.MeshBasicMaterial>;
 };
 
 type FlockGoose = {
@@ -163,6 +213,8 @@ type TrafficCar = {
   targetGround: number;
   elevationTimer: number;
   stopped: boolean;
+  /** Phase 5: last step's shouldYield, so a fresh brake can screech once. */
+  yielding: boolean;
   position: THREE.Vector3;
   previousPosition: THREE.Vector3;
   direction: THREE.Vector3;
@@ -286,6 +338,9 @@ const NPC_SPAWN_MIN_DISTANCE = 65;
 const NPC_RECYCLE_BATCH = 2;
 const NPC_STALE_RECYCLE_BATCH = 24;
 const TREE_PLACEMENT_ANCHOR_TOLERANCE = 300;
+const PROP_POI_RADIUS = 1_100;
+const PROP_POI_RESCAN_DISTANCE = 220;
+const PROP_POI_REFRESH_SECONDS = 2.5;
 const ALTITUDE_BOOST_HEIGHT = 50;
 const ALTITUDE_BOOST_FULL_HEIGHT = 100;
 const ALTITUDE_BOOST_RELEASE_HEIGHT = 47;
@@ -301,6 +356,19 @@ const TEXTURED_ROOF_RADIUS = 760;
 const BUILDING_TEXTURE_MAX_ZOOM = 18;
 const BUILDING_TEXTURE_MIN_ZOOM = 15;
 const CHAOS_COMBO_SECONDS = 4;
+// Phase 5: impact theater.
+/** How long a hit-stop lasts, in simulated seconds. */
+const HIT_STOP_SECONDS = 0.4;
+/** The tail of that window spent easing back to full speed. */
+const HIT_STOP_RELEASE_SECONDS = 0.1;
+/** Simulation speed while the hit-stop holds. */
+const HIT_STOP_SCALE = 0.35;
+/** Below this, a collision is a bump and reads better at full speed. */
+const HIT_STOP_MIN_SEVERITY = 0.7;
+/** Re-armed every step KeyR is held; the tail is what decays on release. */
+const RAGDOLL_HOLD_SECONDS = 0.25;
+/** A standing goose still flops over rather than freezing mid-air. */
+const RAGDOLL_MIN_SPIN = 4;
 const DEDICATED_WALKWAY_CLASSES = new Set([
   'path',
   'pedestrian',
@@ -358,10 +426,18 @@ const smoothstep = (low: number, high: number, value: number) => {
   return t * t * (3 - 2 * t);
 };
 
-const altitudeBoostStrength = (agl: number, active: boolean) =>
-  active
-    ? smoothstep(ALTITUDE_BOOST_HEIGHT, ALTITUDE_BOOST_FULL_HEIGHT, agl)
-    : 0;
+// jetstreamAlways (Jet Goose) pins the boost to full strength no matter the
+// altitude; the two callers below just forward modifiers.jetstreamAlways.
+const altitudeBoostStrength = (
+  agl: number,
+  active: boolean,
+  jetstreamAlways = false,
+) =>
+  jetstreamAlways
+    ? 1
+    : active
+      ? smoothstep(ALTITUDE_BOOST_HEIGHT, ALTITUDE_BOOST_FULL_HEIGHT, agl)
+      : 0;
 
 const neutralFlightAlpha = (speed: number, liftScale: number) => {
   const dynamicPressure =
@@ -460,6 +536,17 @@ function createGooseRig(frustumCulled = false) {
     depthTest: true,
     depthWrite: true,
   });
+  // Phase 4: mutators. The beak used to share `dark` with the neck/head, but
+  // GooseColors recolors them independently, so it gets its own material.
+  const beakMat = new THREE.MeshStandardMaterial({
+    color: 0x171b19,
+    roughness: 0.82,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
+  });
 
   const body = new THREE.Mesh(new THREE.SphereGeometry(0.54, 14, 10), brown);
   body.scale.set(0.9, 0.72, 1.36);
@@ -479,23 +566,34 @@ function createGooseRig(frustumCulled = false) {
   neck.position.set(0, 1.25, 0.43);
   root.add(neck);
 
+  // Phase 3: a pivot at the top of the neck. Everything above the neck hangs
+  // off it, so carrying something can tip the whole head without bending the
+  // body, and each part keeps the local position it was authored with.
+  const headPivot = new THREE.Group();
+  headPivot.position.set(0, 1.5, 0.5);
+  root.add(headPivot);
+  const addToHead = (part: THREE.Mesh) => {
+    part.position.sub(headPivot.position);
+    headPivot.add(part);
+  };
+
   const head = new THREE.Mesh(new THREE.SphereGeometry(0.245, 12, 9), dark);
   head.scale.set(0.88, 0.9, 1.04);
   head.position.set(0, 1.68, 0.66);
-  root.add(head);
+  addToHead(head);
 
   const cheekGeometry = new THREE.SphereGeometry(0.105, 9, 6);
   for (const side of [-1, 1]) {
     const cheek = new THREE.Mesh(cheekGeometry, cream);
     cheek.scale.set(0.38, 0.84, 0.86);
     cheek.position.set(side * 0.2, 1.64, 0.75);
-    root.add(cheek);
+    addToHead(cheek);
   }
 
-  const beak = new THREE.Mesh(new THREE.ConeGeometry(0.1, 0.27, 8), dark);
+  const beak = new THREE.Mesh(new THREE.ConeGeometry(0.1, 0.27, 8), beakMat);
   beak.rotation.x = Math.PI / 2;
   beak.position.set(0, 1.66, 0.95);
-  root.add(beak);
+  addToHead(beak);
 
   const tail = new THREE.Mesh(new THREE.ConeGeometry(0.3, 0.62, 7), cream);
   tail.rotation.x = -Math.PI / 2;
@@ -536,6 +634,24 @@ function createGooseRig(frustumCulled = false) {
   }
   root.add(legs);
 
+  // Phase 4: mutators. Angel Goose's halo: a thin gold ring hovering above
+  // the head, hidden by default and toggled/animated in updateGoosePose.
+  const halo = new THREE.Mesh(
+    new THREE.TorusGeometry(0.42, 0.035, 10, 28),
+    new THREE.MeshBasicMaterial({
+      color: 0xffd76a,
+      transparent: true,
+      opacity: 0.88,
+      depthTest: true,
+      depthWrite: false,
+      side: THREE.DoubleSide,
+    }),
+  );
+  halo.rotation.x = Math.PI / 2;
+  halo.position.set(0, head.position.y + 0.25, head.position.z);
+  halo.visible = false;
+  root.add(halo);
+
   root.traverse((object) => {
     object.frustumCulled = false;
     if (object instanceof THREE.Mesh) {
@@ -551,6 +667,15 @@ function createGooseRig(frustumCulled = false) {
     legs,
     leftLeg,
     rightLeg,
+    head: headPivot,
+    materials: {
+      body: brown,
+      breast: cream,
+      neck: dark,
+      wing: wingMat,
+      beak: beakMat,
+    },
+    halo,
   } satisfies GooseRig;
 }
 
@@ -828,6 +953,7 @@ export function createGooseEngine(
   maplibre: MapLibreModule,
   map: MapLibreMap,
   hooks: Hooks,
+  progress: ProgressStore,
 ): GooseEngine {
   const coarsePointer = isTouchDevice();
   const fixedStep = coarsePointer ? 1 / 60 : FIXED_DT;
@@ -849,6 +975,7 @@ export function createGooseEngine(
     crowdFleet.leftLegs,
     crowdFleet.rightLegs,
   );
+  for (const kind of CAMPUS_ITEM_KINDS) scene.add(crowdFleet.items[kind]);
   goose.root.visible = false;
   trafficFleet.bodies.visible = false;
   trafficFleet.cabins.visible = false;
@@ -884,6 +1011,21 @@ export function createGooseEngine(
     0,
     1,
   );
+
+  // map.queryTerrainElevation() samples through the tiles the camera can see.
+  // A chase camera that sits below the real terrain (which happens whenever
+  // the DEM resolves after the goose was placed at the sea-level fallback)
+  // sees no terrain tiles and reads 0 forever, so the world can never climb
+  // to the real ground. Sampling the DEM directly at its own max zoom does not
+  // depend on the camera at all; it returns 0 only while no tile has decoded.
+  const queryGroundElevation = (lngLat: LngLatLike): number | null => {
+    const terrain = map.terrain;
+    if (!terrain) return null;
+    return terrain.getElevationForLngLatZoom(
+      maplibre.LngLat.convert(lngLat),
+      TERRAIN_MAX_ZOOM,
+    );
+  };
 
   const keys = new Set<string>();
   const styleLayers = map.getStyle().layers ?? [];
@@ -933,6 +1075,22 @@ export function createGooseEngine(
       : null;
   if (!roadSourceId)
     throw new Error('The map style did not provide OSM road geometry.');
+  // Bike racks and waste baskets ride in the same vector source as everything
+  // else; a style that draws no POI layer still serves the source layer, so
+  // fall back to the road source rather than giving up on POI props.
+  const poiStyleLayer = styleLayers.find(
+    (layer) =>
+      'source-layer' in layer &&
+      layer['source-layer'] === 'poi' &&
+      'source' in layer &&
+      typeof layer.source === 'string',
+  );
+  const poiSourceId =
+    poiStyleLayer &&
+    'source' in poiStyleLayer &&
+    typeof poiStyleLayer.source === 'string'
+      ? poiStyleLayer.source
+      : roadSourceId;
   const buildingLayerIndex = styleLayers.findIndex(
     (layer) =>
       layer.type === 'fill-extrusion' && layer['source-layer'] === 'building',
@@ -1076,7 +1234,28 @@ export function createGooseEngine(
   let lowGravityRemaining = 0;
   let megaHonkRemaining = 0;
   let slipperyRemaining = 0;
-  let audioContext: AudioContext | null = null;
+  // Phase 5: every sound the game makes comes out of this one module. It is
+  // lazy (no AudioContext until unlock()), rate limited, and never throws, so
+  // call sites below are plain one-liners with no guards of their own.
+  const audio = createGameAudio();
+  audio.setEnabled(
+    progress.get().settings.sound,
+    progress.get().settings.ambient,
+  );
+  // Phase 5: hold KeyR to go limp. The key only seeds the existing tumble
+  // path, so a ragdolling goose still bowls students and a car that hits it is
+  // still an ordinary car hit; the key itself awards nothing.
+  let ragdollLatched = false;
+  let ragdollSplashLatched = false;
+  let ragdollHintShown = false;
+  // Phase 5: hit-stop. slowMotionRemaining counts down in simulated seconds,
+  // so the dip lasts the same amount of game time on any frame rate; timeScale
+  // is what frame() multiplies real time by before it enters the accumulator.
+  let slowMotionRemaining = 0;
+  let timeScale = 1;
+  let slowMotionEnabled = progress.get().settings.slowMotion;
+  // One screech per burst of cars braking at once, rather than one per car.
+  let lastYieldScreech = -10;
   let airborneTime = 0;
   let peakAgl = 0;
   let terrainSurfaceY = state.ground;
@@ -1143,6 +1322,107 @@ export function createGooseEngine(
   const flockGeese: FlockGoose[] = [];
   let secretsFound = 0;
   let recruitedFlockCount = 0;
+  let paused = false;
+  // Play time is banked in bulk: a store write every fifteen seconds instead of
+  // one per frame keeps the debounced save from thrashing localStorage.
+  let unsavedPlaySeconds = 0;
+  // Per-flight tallies. airborneTime and peakAgl already exist; these two ride
+  // along so a touchdown can report the whole flight in one event.
+  let flightMeters = 0;
+  let flightTopSpeed = 0;
+  let progressGeneration = progress.get().generation;
+
+  // A trick toast and the quest it just completed both want the score slot, and
+  // the HUD only shows one at a time. The trick reads first; queued banners wait
+  // their turn and drain in frame().
+  const QUEST_TOAST_DELAY = 1.7;
+  const pendingToasts: Array<{
+    message: string;
+    priority: ToastPriority;
+    remaining: number;
+  }> = [];
+  let scoreToastCooldown = 0;
+
+  const showScoreToast = (message: string) => {
+    hooks.onToast(message, 'score');
+    scoreToastCooldown = QUEST_TOAST_DELAY;
+  };
+
+  const queueScoreToast = (message: string) => {
+    if (scoreToastCooldown <= 0 && pendingToasts.length === 0) {
+      showScoreToast(message);
+      return;
+    }
+    pendingToasts.push({
+      message,
+      priority: 'score',
+      remaining: scoreToastCooldown + pendingToasts.length * QUEST_TOAST_DELAY,
+    });
+  };
+
+  const drainPendingToasts = (dt: number) => {
+    scoreToastCooldown = Math.max(0, scoreToastCooldown - dt);
+    for (const toast of pendingToasts) toast.remaining -= dt;
+    while (pendingToasts.length > 0 && pendingToasts[0].remaining <= 0) {
+      const [toast] = pendingToasts.splice(0, 1);
+      hooks.onToast(toast.message, toast.priority);
+      scoreToastCooldown = QUEST_TOAST_DELAY;
+    }
+  };
+
+  /**
+   * The single funnel from the simulation into saved progress. `persist` runs in
+   * the same store update as the quest pass so a discovery and its bookkeeping
+   * are one write. Completed quests are announced and then reported as events of
+   * their own; nothing listens for 'quest', so the recursion stops immediately.
+   */
+  /**
+   * Phase 5: the sound for anything a quest could count. Routed off the event
+   * stream rather than off each award site, so a new award that reports an
+   * existing event type is audible without touching this list again.
+   */
+  const playEventSound = (event: GameEvent) => {
+    if (event.type === 'prop') {
+      if (event.action === 'wrecked') audio.crunch(event.kind);
+    } else if (event.type === 'bowl') {
+      audio.yelp();
+    } else if (event.type === 'quest') {
+      audio.chime();
+      // Tokens land in the locker as part of the same store write, so the coin
+      // follows the chime rather than waiting for the HUD to notice.
+      if (event.tokens > 0) audio.coin();
+    } else if (event.type === 'secret') {
+      audio.chime();
+      // Every secret pays exactly one token (quests.ts applyGameEvent).
+      audio.coin();
+    } else if (event.type === 'unlock') {
+      audio.coin();
+    } else if (event.type === 'grab') {
+      audio.grab();
+    } else if (event.type === 'trick' && event.id === 'dance-party') {
+      audio.cheer();
+    }
+  };
+
+  const recordEvent = (
+    event: GameEvent,
+    persist?: (saved: ProgressState) => void,
+  ) => {
+    const completed: QuestDefinition[] = [];
+    progress.update((saved) => {
+      persist?.(saved);
+      const result = applyGameEvent(saved, event);
+      completed.push(...result.completed);
+    });
+    playEventSound(event);
+    hooks.onEvent?.(event);
+    for (const quest of completed) {
+      queueScoreToast(
+        `QUEST COMPLETE · ${quest.title} · +${quest.reward} tokens`,
+      );
+      recordEvent({ type: 'quest', id: quest.id, tokens: quest.reward });
+    }
+  };
   const cameraPosition = new THREE.Vector3(0, state.position.y + 15, -18);
   const screenVisibilityProbe = new THREE.Vector3();
   const isPointInsideCameraView = (
@@ -1172,7 +1452,7 @@ export function createGooseEngine(
   let cameraOrbitYawTarget = 0;
   let cameraOrbitPitch = 24 * DEG;
   let cameraOrbitPitchTarget = 24 * DEG;
-  const initialCampusElevation = map.queryTerrainElevation(WMU_SPAWN);
+  const initialCampusElevation = queryGroundElevation(WMU_SPAWN);
   let campusGroundResolved =
     !terrainEnabled ||
     (typeof initialCampusElevation === 'number' &&
@@ -1313,7 +1593,7 @@ export function createGooseEngine(
   };
 
   const terrainAt = (east: number, north: number, fallback = state.ground) => {
-    const elevation = map.queryTerrainElevation(localToLngLat(east, north));
+    const elevation = queryGroundElevation(localToLngLat(east, north));
     return typeof elevation === 'number' && isUsableTerrainElevation(elevation)
       ? elevation
       : fallback;
@@ -1754,7 +2034,7 @@ export function createGooseEngine(
                 ];
           const terrainReadings = terrainEnabled
             ? terrainLocations.map(([east, north]) =>
-                map.queryTerrainElevation(localToLngLat(east, north)),
+                queryGroundElevation(localToLngLat(east, north)),
               )
             : [];
           colliderTerrainResolved =
@@ -1964,6 +2244,17 @@ export function createGooseEngine(
     const finishGroup = (group: THREE.Group) => {
       group.traverse((object) => {
         object.frustumCulled = false;
+        // Remember the undiscovered look now: a fresh goose has to be able to
+        // put every secret back the way it was found. The position matters for
+        // the parts that drift once found, such as the diploma papers.
+        if (object instanceof THREE.Mesh) {
+          object.userData.basePosition = object.position.clone();
+          if (object.material instanceof THREE.MeshStandardMaterial) {
+            object.userData.baseEmissive = object.material.emissive.getHex();
+            object.userData.baseEmissiveIntensity =
+              object.material.emissiveIntensity;
+          }
+        }
       });
       group.visible = playing;
       scene.add(group);
@@ -1980,9 +2271,7 @@ export function createGooseEngine(
       definition?: BonusChaosSecret,
     ) => {
       const local = authoredToLocal(east, north);
-      const elevation = map.queryTerrainElevation(
-        localToLngLat(local.x, local.y),
-      );
+      const elevation = queryGroundElevation(localToLngLat(local.x, local.y));
       const terrainResolved =
         !terrainEnabled || isUsableTerrainElevation(elevation);
       const ground =
@@ -2450,7 +2739,7 @@ export function createGooseEngine(
     beacon.visible = playing;
     const home = new THREE.Vector2(east, north);
     const elevation = terrainEnabled
-      ? map.queryTerrainElevation(localToLngLat(east, north))
+      ? queryGroundElevation(localToLngLat(east, north))
       : campusGroundFallback;
     const terrainResolved =
       !terrainEnabled || isUsableTerrainElevation(elevation);
@@ -2492,7 +2781,7 @@ export function createGooseEngine(
       member.terrainRefreshRemaining = 0.5;
       return member.ground;
     }
-    const elevation = map.queryTerrainElevation(localToLngLat(east, north));
+    const elevation = queryGroundElevation(localToLngLat(east, north));
     if (typeof elevation === 'number' && isUsableTerrainElevation(elevation)) {
       member.ground = elevation;
       member.terrainResolved = true;
@@ -2533,7 +2822,7 @@ export function createGooseEngine(
     });
   };
 
-  const recruitFlockMember = (member: FlockGoose) => {
+  const recruitFlockMember = (member: FlockGoose, silent = false) => {
     if (member.recruited) return;
     member.recruited = true;
     member.beacon.visible = false;
@@ -2541,9 +2830,24 @@ export function createGooseEngine(
     member.waterContactLatched = false;
     member.waterContactReleaseTime = 0;
     recruitedFlockCount += 1;
+    // A goose restored from the save was already paid for; it just falls in.
+    if (silent) return;
+    const roostIndex = flockGeese.indexOf(member);
     awardChaos(
       300,
       `FLOCK RECRUITED ${recruitedFlockCount}/${flockGeese.length}`,
+      { id: 'flock-recruited', subject: String(roostIndex) },
+    );
+    recordEvent(
+      {
+        type: 'flock',
+        recruited: recruitedFlockCount,
+        total: flockGeese.length,
+      },
+      (saved) => {
+        if (!saved.recruitedGeese.includes(roostIndex))
+          saved.recruitedGeese = [...saved.recruitedGeese, roostIndex];
+      },
     );
   };
 
@@ -2998,9 +3302,7 @@ export function createGooseEngine(
         (!nearPlayerOnly || distanceFromPlayer < 650)
       ) {
         queries += 1;
-        const elevation = map.queryTerrainElevation(
-          localToLngLat(point.x, point.z),
-        );
+        const elevation = queryGroundElevation(localToLngLat(point.x, point.z));
         const terrainReady = isUsableTerrainElevation(elevation);
         if (terrainReady && typeof elevation === 'number') {
           treeTerrainRefreshAt[index] = Number.POSITIVE_INFINITY;
@@ -3250,7 +3552,7 @@ export function createGooseEngine(
       }
       terrainQueries += 1;
       const elevation = terrainEnabled
-        ? map.queryTerrainElevation(
+        ? queryGroundElevation(
             localToLngLat(candidate.tree.local.x, candidate.tree.local.z),
           )
         : campusGroundFallback;
@@ -3338,6 +3640,8 @@ export function createGooseEngine(
     crowdFleet.rightLegs.visible = visible;
     treeTrunks.visible = visible;
     treeCrowns.visible = visible;
+    propSystem.setVisible(visible);
+    setPhase3Visibility(visible);
     cloudPuffs.visible = visible && cloudBaseResolved;
     texturedBuildingGroup.visible = visible;
     campusSecrets.forEach((secret) => {
@@ -3375,7 +3679,7 @@ export function createGooseEngine(
 
   const sampleSurface = () => {
     const location = localToLngLat(state.position.x, state.position.z);
-    const elevation = map.queryTerrainElevation(location);
+    const elevation = queryGroundElevation(location);
     if (typeof elevation === 'number' && isUsableTerrainElevation(elevation)) {
       const previousFallback = campusGroundFallback;
       const previousTerrain = terrainSurfaceY;
@@ -3512,6 +3816,10 @@ export function createGooseEngine(
     });
     scene.add(group);
     splashes.push({ group, age: 0, life: 1.35, rings, drops });
+    // Only the player's own entry is audible. Flock followers splash in with
+    // the same helper, and eight geese landing on a pond would be a wall of
+    // noise rather than a landing the player can read.
+    if (position === state.position) audio.splash(strength);
   };
 
   const spawnSkimSpray = (speed: number) => {
@@ -3552,6 +3860,7 @@ export function createGooseEngine(
     });
     scene.add(group);
     splashes.push({ group, age: 0, life: 0.62, rings: [], drops });
+    audio.skim();
   };
 
   const updateSplashes = (dt: number) => {
@@ -3716,6 +4025,7 @@ export function createGooseEngine(
         targetGround: ground,
         elevationTimer: index * 0.02,
         stopped: false,
+        yielding: false,
         position: position.clone(),
         previousPosition: position.clone(),
         direction: direction.clone(),
@@ -4306,6 +4616,19 @@ export function createGooseEngine(
         lastYieldToast = elapsedTime;
         hooks.onToast('Traffic stopped for the goose');
       }
+      // Only the moment a moving car decides to brake is worth a tire squeal;
+      // a car already stopped for the goose keeps yielding silently. A whole
+      // lane braking together still gets one screech, not one per car.
+      if (
+        shouldYield &&
+        !car.yielding &&
+        car.speed > 3 &&
+        elapsedTime - lastYieldScreech > 0.6
+      ) {
+        lastYieldScreech = elapsedTime;
+        audio.screech();
+      }
+      car.yielding = shouldYield;
       car.stopped = shouldYield || car.reactionRemaining > 0;
     });
   };
@@ -4415,7 +4738,11 @@ export function createGooseEngine(
       const dz = npc.position.z - closestZ;
       const horizontalDistance = Math.hypot(dx, dz);
       const vertical = state.position.y - npc.ground;
-      if (horizontalDistance > 0.78 || vertical < -0.25 || vertical > 1.85)
+      if (
+        horizontalDistance > 0.78 * modifiers.gooseScale ||
+        vertical < -0.25 ||
+        vertical > 1.85
+      )
         continue;
 
       const npcVelocity = npc.direction.clone().multiplyScalar(npc.speed);
@@ -4437,6 +4764,13 @@ export function createGooseEngine(
         .addScaledVector(outward, 1.7 + severity * 2.2);
       impulse.y = 2.6 + severity * 3.2;
       if (!knockDownCampusNpc(npc, impulse)) continue;
+      // Every knockdown counts for the bowling quest, even the ones the score
+      // cooldown declines to pay for.
+      recordEvent({
+        type: 'bowl',
+        by: 'goose',
+        airborne: state.mode === 'flying',
+      });
       state.velocity.addScaledVector(outward, -0.55 * severity);
       state.velocity.y = Math.max(state.velocity.y, 0.5 + severity);
       cameraShakeRemaining = Math.max(
@@ -4456,16 +4790,187 @@ export function createGooseEngine(
     }
   };
 
-  const awardChaos = (basePoints: number, label: string) => {
+  const awardChaos = (
+    basePoints: number,
+    label: string,
+    options?: { id?: string; subject?: string },
+  ) => {
     chaosComboEvents += 1;
     chaosCombo = Math.min(5, 1 + Math.floor((chaosComboEvents - 1) / 3));
     chaosComboRemaining = CHAOS_COMBO_SECONDS;
     const points = basePoints * chaosCombo;
     chaosScore += points;
-    hooks.onToast(
+    showScoreToast(
       `${label} · +${points}${chaosCombo > 1 ? ` · x${chaosCombo}` : ''}`,
-      'score',
     );
+    // Labels carry counters ("×3", "SECRET 4/33"), so quests key off the id an
+    // award site passes in; the slug is only the fallback for fixed labels.
+    recordEvent(
+      {
+        type: 'trick',
+        id: options?.id ?? slugifyLabel(label),
+        label,
+        points,
+        combo: chaosCombo,
+        mode: state.mode,
+        speed: state.velocity.length(),
+        agl: Math.max(0, state.position.y - state.ground),
+        subject: options?.subject,
+      },
+      (saved) => {
+        saved.lifetimeChaos += points;
+        saved.bestScore = Math.max(saved.bestScore, chaosScore);
+      },
+    );
+  };
+
+  /**
+   * Props stand on the highest surface under them, so a cone parked on a roof
+   * stays on the roof instead of falling through it to the terrain.
+   */
+  const propGroundAt = (east: number, north: number, fallback: number) => {
+    const base = Number.isFinite(fallback) ? fallback : state.ground;
+    const terrain = terrainAt(east, north, base);
+    const roof = highestRoofAt(east, north);
+    return roof === null ? terrain : Math.max(terrain, roof);
+  };
+
+  /**
+   * Push a prop back out of any building wall it is standing in. A prop that is
+   * up on a roof is inside the footprint by definition, so anything at or above
+   * roof height is left alone.
+   */
+  const resolvePropBuilding = (
+    point: { x: number; y: number; z: number },
+    radius: number,
+  ) => {
+    refreshActiveBuildingColliders();
+    let pushed = false;
+    for (const building of activeBuildingColliders) {
+      if (
+        point.x < building.minX - radius ||
+        point.x > building.maxX + radius ||
+        point.z < building.minZ - radius ||
+        point.z > building.maxZ + radius
+      )
+        continue;
+      if (point.y > building.ground + building.height - 0.5) continue;
+      if (!pointInBuilding(point.x, point.z, building)) continue;
+      const boundary = closestBuildingBoundary(point.x, point.z, building);
+      // The point is inside, so boundary-to-point aims deeper in; stepping the
+      // other way past the wall by a full radius sets the body clear of it.
+      let inwardX = point.x - boundary.x;
+      let inwardZ = point.z - boundary.z;
+      const inwardLength = Math.hypot(inwardX, inwardZ);
+      if (inwardLength < 1e-4) {
+        inwardX = point.x - (building.minX + building.maxX) * 0.5;
+        inwardZ = point.z - (building.minZ + building.maxZ) * 0.5;
+        const centerLength = Math.hypot(inwardX, inwardZ);
+        if (centerLength < 1e-4) {
+          inwardX = 1;
+          inwardZ = 0;
+        } else {
+          inwardX /= centerLength;
+          inwardZ /= centerLength;
+        }
+      } else {
+        inwardX /= inwardLength;
+        inwardZ /= inwardLength;
+      }
+      point.x = boundary.x - inwardX * radius;
+      point.z = boundary.z - inwardZ * radius;
+      pushed = true;
+    }
+    return { pushed };
+  };
+
+  const propSystem: PropSystem = createPropSystem({
+    scene,
+    groundAt: propGroundAt,
+    isWater: isPointInMappedWater,
+    resolveBuilding: resolvePropBuilding,
+    awardChaos,
+    recordEvent,
+    shake: (seconds) => {
+      cameraShakeRemaining = Math.max(cameraShakeRemaining, seconds);
+    },
+    isInView: (east, elevation, north) =>
+      isPointInsideCameraView(east, elevation, north, 1.25),
+  });
+  // Reused every fixed step; the vectors are the live simulation state, which
+  // is only ever written in place, so the probe never needs rebuilding.
+  const goosePropProbe = {
+    position: state.position,
+    velocity: state.velocity,
+    prevPosition: previousState.position,
+    radius: 0.58,
+    mode: state.mode,
+  };
+  const propPoiBuffer: PropPoi[] = [];
+  const propPoiAnchor = new THREE.Vector2(
+    Number.POSITIVE_INFINITY,
+    Number.POSITIVE_INFINITY,
+  );
+  let propPoiClock = 0;
+  let propPoiScans = 0;
+
+  /** OSM bicycle_parking becomes bike racks, waste_basket becomes trash cans. */
+  const collectPropPois = (force = false) => {
+    if (!map.getSource(poiSourceId)) return;
+    if (
+      !force &&
+      // The first few scans of a life repeat while POI tiles are still
+      // streaming in; after that a scan costs a rescan distance to earn.
+      propPoiScans > 4 &&
+      Math.hypot(
+        state.position.x - propPoiAnchor.x,
+        state.position.z - propPoiAnchor.y,
+      ) < PROP_POI_RESCAN_DISTANCE
+    )
+      return;
+    propPoiScans += 1;
+    propPoiAnchor.set(state.position.x, state.position.z);
+    const features = map.querySourceFeatures(poiSourceId, {
+      sourceLayer: 'poi',
+    }) as Array<{
+      properties?: Record<string, unknown>;
+      geometry: { type: string; coordinates: unknown };
+    }>;
+    propPoiBuffer.length = 0;
+    const seen = new Set<string>();
+    for (const feature of features) {
+      if (feature.geometry.type !== 'Point') continue;
+      const coordinates = feature.geometry.coordinates as number[];
+      if (!Array.isArray(coordinates) || coordinates.length < 2) continue;
+      const subclass =
+        feature.properties?.subclass ?? feature.properties?.class;
+      const kind =
+        subclass === 'bicycle_parking'
+          ? 'bike'
+          : subclass === 'waste_basket'
+            ? 'trash'
+            : null;
+      if (!kind) continue;
+      const local = geoToLocal(coordinates[0], coordinates[1]);
+      if (
+        Math.hypot(local.x - state.position.x, local.z - state.position.z) >
+        PROP_POI_RADIUS
+      )
+        continue;
+      const key = `${kind}:${local.x.toFixed(0)}:${local.z.toFixed(0)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      propPoiBuffer.push({ east: local.x, north: local.z, kind });
+    }
+    if (propPoiBuffer.length > 0) propSystem.spawnFromPois(propPoiBuffer);
+  };
+
+  const refreshProps = (focusX: number, focusZ: number) => {
+    propSystem.spawnFromPlacements(PROP_PLACEMENTS, authoredToLocal, {
+      x: focusX,
+      z: focusZ,
+    });
+    collectPropPois(true);
   };
 
   const launchGoose = (verticalSpeed: number, forwardBoost: number) => {
@@ -4486,14 +4991,17 @@ export function createGooseEngine(
     peakAgl = 0;
   };
 
-  const discoverSecret = (
-    secret: CampusSecret,
-    points: number,
-    label: string,
-  ) => {
-    if (secret.found) return;
+  /**
+   * Light a secret up as found. `silent` is the restore path: no score, no
+   * toast, and the activation clock starts past every intro animation so a
+   * secret from the save looks like one you found ages ago.
+   */
+  const markSecretFound = (secret: CampusSecret, silent = false) => {
+    if (secret.found) return false;
     secret.found = true;
-    secret.activation = 0;
+    secret.activation = silent ? 12 : 0;
+    secret.honkCount = 0;
+    secret.honkWindow = 0;
     secretsFound += 1;
     secret.group.traverse((object) => {
       if (
@@ -4507,9 +5015,32 @@ export function createGooseEngine(
         );
       }
     });
+    return true;
+  };
+
+  const discoverSecret = (
+    secret: CampusSecret,
+    points: number,
+    label: string,
+  ) => {
+    if (!markSecretFound(secret)) return;
     awardChaos(
       points,
       `${label} · SECRET ${secretsFound}/${campusSecrets.length}`,
+      { id: secret.id, subject: secret.id },
+    );
+    recordEvent(
+      {
+        type: 'secret',
+        id: secret.id,
+        label: secret.group.name,
+        found: secretsFound,
+        total: campusSecrets.length,
+      },
+      (saved) => {
+        if (!saved.secretsFound.includes(secret.id))
+          saved.secretsFound = [...saved.secretsFound, secret.id];
+      },
     );
   };
 
@@ -4591,14 +5122,21 @@ export function createGooseEngine(
           state.onWater &&
           (state.mode === 'swimming' || state.mode === 'planing');
         if (definition.trigger === 'water-honk' && !landedOnWater) {
-          hooks.onToast(`${definition.label} · land on the lake and honk`);
+          // Queued at score priority for the same reason as the honk counters
+          // below: the crowd award for this very honk gets the slot first.
+          queueScoreToast(`${definition.label} · land on the lake and honk`);
           return;
         }
         if (secret.honkWindow <= 0) secret.honkCount = 0;
         secret.honkCount += 1;
         secret.honkWindow = definition.id === 'student-megaphone' ? 7 : 4;
         if (secret.honkCount < definition.requiredHonks) {
-          hooks.onToast(
+          // The same honk that advances this counter usually scatters the
+          // crowd, and that award's score toast is written first: an info
+          // toast landing behind it is dropped by the HUD, which loses the
+          // player's only feedback that the secret is counting. Queue it at
+          // score priority so it waits its turn instead of vanishing.
+          queueScoreToast(
             `${definition.label} · honk ${secret.honkCount}/${definition.requiredHonks}`,
           );
           return;
@@ -4623,7 +5161,7 @@ export function createGooseEngine(
         secret.honkCount += 1;
         secret.honkWindow = 4;
         if (secret.honkCount < 3) {
-          hooks.onToast(
+          queueScoreToast(
             `${secret.kind === 'radio' ? 'The dish is listening' : 'The cones are humming'} · honk ${secret.honkCount}/3`,
           );
           return;
@@ -4655,7 +5193,7 @@ export function createGooseEngine(
           secret.position.z - state.position.z,
         ) < 850
       ) {
-        const elevation = map.queryTerrainElevation(
+        const elevation = queryGroundElevation(
           localToLngLat(secret.position.x, secret.position.z),
         );
         if (
@@ -4733,10 +5271,14 @@ export function createGooseEngine(
         broncoTurnRemaining -= dt;
         broncoObstacleRemaining -= dt;
         broncoTerrainRemaining -= dt;
+        // Bronco Goose: the horse's leash follows the goose instead of its
+        // authored spawn (Phase 4: mutators).
+        if (modifiers.broncoFollows)
+          broncoHome.set(state.position.x, state.position.z);
         const homeX = broncoHome.x - secret.group.position.x;
         const homeZ = broncoHome.y - secret.group.position.z;
         const homeDistance = Math.hypot(homeX, homeZ);
-        if (homeDistance > 68) {
+        if (homeDistance > (modifiers.broncoFollows ? 12 : 68)) {
           const homeHeading = Math.atan2(homeX, homeZ);
           const headingDelta = Math.atan2(
             Math.sin(homeHeading - broncoHeading),
@@ -4794,12 +5336,16 @@ export function createGooseEngine(
           }
         }
 
-        const horseSpeed = secret.found ? 4.8 : 3.15;
+        const horseSpeed = modifiers.broncoFollows
+          ? 6
+          : secret.found
+            ? 4.8
+            : 3.15;
         secret.group.position.x += Math.sin(broncoHeading) * horseSpeed * dt;
         secret.group.position.z += Math.cos(broncoHeading) * horseSpeed * dt;
         if (broncoTerrainRemaining <= 0) {
           broncoTerrainRemaining = 0.28;
-          const elevation = map.queryTerrainElevation(
+          const elevation = queryGroundElevation(
             localToLngLat(secret.group.position.x, secret.group.position.z),
           );
           if (
@@ -4817,6 +5363,8 @@ export function createGooseEngine(
         secret.group.userData.baseY = secret.group.position.y;
         secret.group.rotation.y = broncoHeading;
         secret.position.copy(secret.group.position);
+        if (modifiers.broncoFollows)
+          trampleNearbyCrowd(secret, broncoHeading, horseSpeed);
         let legIndex = 0;
         secret.group.children.forEach((child) => {
           if (child.name.startsWith('bronco-leg-')) {
@@ -4907,45 +5455,6 @@ export function createGooseEngine(
     });
   };
 
-  const unlockAudio = () => {
-    try {
-      audioContext ??= new AudioContext();
-      if (audioContext.state === 'suspended') void audioContext.resume();
-      return audioContext;
-    } catch {
-      return null;
-    }
-  };
-
-  const playHonk = () => {
-    try {
-      const context = unlockAudio();
-      if (!context) return;
-      const now = context.currentTime;
-      const gain = context.createGain();
-      gain.gain.setValueAtTime(0.0001, now);
-      gain.gain.exponentialRampToValueAtTime(0.11, now + 0.018);
-      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.34);
-      gain.connect(context.destination);
-      [
-        { start: 205, end: 142, volume: 0.7 },
-        { start: 154, end: 112, volume: 0.42 },
-      ].forEach(({ start, end, volume }) => {
-        const oscillator = context.createOscillator();
-        const voiceGain = context.createGain();
-        oscillator.type = 'square';
-        oscillator.frequency.setValueAtTime(start, now);
-        oscillator.frequency.exponentialRampToValueAtTime(end, now + 0.31);
-        voiceGain.gain.value = volume;
-        oscillator.connect(voiceGain).connect(gain);
-        oscillator.start(now);
-        oscillator.stop(now + 0.35);
-      });
-    } catch {
-      // Audio is a bonus; browsers may block it without affecting the honk interaction.
-    }
-  };
-
   const spawnHonkWave = () => {
     const material = new THREE.MeshBasicMaterial({
       color: 0xffc85a,
@@ -4990,10 +5499,13 @@ export function createGooseEngine(
     queuedHonks = 0;
     honkCooldown = 0.58;
     spawnHonkWave();
-    playHonk();
+    audio.honk(megaHonkRemaining > 0);
     const agl = state.position.y - state.ground;
     const baseRadius = state.mode === 'flying' && agl < 20 ? 34 : 26;
-    const radius = baseRadius * (megaHonkRemaining > 0 ? 2.4 : 1);
+    const radius =
+      baseRadius *
+      (megaHonkRemaining > 0 ? 2.4 : 1) *
+      modifiers.honkRadiusScale;
     const nearby = traffic
       .map((car) => ({
         car,
@@ -5017,21 +5529,34 @@ export function createGooseEngine(
         scoredCars += 1;
       }
     });
-    const crowdReaction = terrorizeCampusCrowd(radius, true);
+    // Every car in the wave brakes for the goose, whether or not it still owes
+    // points; the traffic quest counts stopped cars, not scored ones.
+    const carsStopped = nearby.length;
+    // Party Goose: students dance instead of scattering (Phase 4: mutators).
+    const crowdReaction =
+      modifiers.honkStyle === 'party'
+        ? partyCampusCrowd(radius, true)
+        : terrorizeCampusCrowd(radius, true);
     const recruitedGeese = recruitNearbyFlock(true);
     if (scoredCars > 0 || crowdReaction.scored > 0) {
       const totalTargets = scoredCars + crowdReaction.scored;
-      const label =
-        scoredCars > 0 && crowdReaction.scored > 0
-          ? `CAMPUS PANIC ×${totalTargets}`
-          : crowdReaction.scored > 0
-            ? `HONK PANIC ×${crowdReaction.scored}`
-            : scoredCars >= 2
-              ? `HONK CHAIN ×${scoredCars}`
-              : 'HONK IF YOU YIELD';
-      awardChaos(50 * scoredCars + 35 * crowdReaction.scored, label);
+      const [label, id] =
+        modifiers.honkStyle === 'party' && crowdReaction.scored > 0
+          ? [`DANCE PARTY ×${crowdReaction.scored}`, 'dance-party']
+          : scoredCars > 0 && crowdReaction.scored > 0
+            ? [`CAMPUS PANIC ×${totalTargets}`, 'campus-panic']
+            : crowdReaction.scored > 0
+              ? [`HONK PANIC ×${crowdReaction.scored}`, 'honk-panic']
+              : scoredCars >= 2
+                ? [`HONK CHAIN ×${scoredCars}`, 'honk-chain']
+                : ['HONK IF YOU YIELD', 'honk-if-you-yield'];
+      awardChaos(50 * scoredCars + 35 * crowdReaction.scored, label, { id });
     } else if (crowdReaction.panicked > 0) {
-      hooks.onToast(`HONK! · ${crowdReaction.panicked} students scattered`);
+      hooks.onToast(
+        modifiers.honkStyle === 'party'
+          ? `HONK! · ${crowdReaction.panicked} students started dancing`
+          : `HONK! · ${crowdReaction.panicked} students scattered`,
+      );
     } else if (recruitedGeese === 0 && !firstHonkAcknowledged) {
       // The ring, the sound, and the button state already confirm every honk.
       // A bare "HONK!" toast on each press kept overwriting score and secret
@@ -5039,11 +5564,82 @@ export function createGooseEngine(
       firstHonkAcknowledged = true;
       hooks.onToast('HONK! · nobody around to hear it');
     }
+    recordEvent({
+      type: 'honk',
+      scattered: crowdReaction.panicked,
+      carsStopped,
+      airborne: state.mode === 'flying',
+      mega: megaHonkRemaining > 0,
+    });
     registerSecretHonk();
+  };
+
+  /**
+   * Phase 5: hit-stop. A big impact drops the simulation to a third speed for
+   * a beat so the player can read what just happened, then eases back. Only
+   * collisions worth watching qualify, and only when the player left the
+   * setting on; anything softer would turn ordinary flying into slow motion.
+   */
+  const triggerHitStop = (severity: number) => {
+    if (!slowMotionEnabled || severity <= HIT_STOP_MIN_SEVERITY) return;
+    slowMotionRemaining = HIT_STOP_SECONDS;
+  };
+
+  const updateTimeScale = () => {
+    timeScale =
+      slowMotionRemaining <= 0
+        ? 1
+        : slowMotionRemaining > HIT_STOP_RELEASE_SECONDS
+          ? HIT_STOP_SCALE
+          : lerp(
+              1,
+              HIT_STOP_SCALE,
+              slowMotionRemaining / HIT_STOP_RELEASE_SECONDS,
+            );
+  };
+
+  /**
+   * Phase 5: KeyR keeps the goose limp for as long as it is held. It re-arms
+   * the tumble every step instead of setting a long one, so letting go decays
+   * through the ordinary tumble path rather than snapping upright.
+   */
+  const updateRagdollKey = () => {
+    if (!keys.has('KeyR')) {
+      ragdollLatched = false;
+      ragdollSplashLatched = false;
+      return;
+    }
+    if (!ragdollHintShown) {
+      ragdollHintShown = true;
+      queueInfoToast('RAGDOLL · hold R to stay limp');
+    }
+    // On water a limp goose is just a floating goose, so the key answers with
+    // a splash and nothing else: that is how a player learns it is a move for
+    // land and air.
+    if (state.mode === 'swimming' || state.mode === 'planing') {
+      ragdollLatched = false;
+      if (!ragdollSplashLatched) {
+        ragdollSplashLatched = true;
+        audio.splash(0.2);
+      }
+      return;
+    }
+    ragdollSplashLatched = false;
+    if (!ragdollLatched) {
+      ragdollLatched = true;
+      // Seed the spin from how fast the goose was going, so bailing out of a
+      // dive whips around and bailing out of a waddle flops over.
+      tumbleAngularSpeed =
+        Math.max(RAGDOLL_MIN_SPIN, state.velocity.length() * 0.9) *
+        (state.bank >= 0 ? 1 : -1);
+    }
+    tumbleRemaining = Math.max(tumbleRemaining, RAGDOLL_HOLD_SECONDS);
   };
 
   const updateChaosTimers = (dt: number) => {
     honkCooldown = Math.max(0, honkCooldown - dt);
+    slowMotionRemaining = Math.max(0, slowMotionRemaining - dt);
+    updateTimeScale();
     hitCooldown = Math.max(0, hitCooldown - dt);
     buildingHitCooldown = Math.max(0, buildingHitCooldown - dt);
     cameraShakeRemaining = Math.max(0, cameraShakeRemaining - dt);
@@ -5055,6 +5651,7 @@ export function createGooseEngine(
       if (!campusInfamyUnlocked) {
         campusInfamyUnlocked = true;
         hooks.onToast('CAMPUS INFAMY · students now flee on sight');
+        recordEvent({ type: 'infamy' });
       }
       if (infamyPanicClock <= 0) {
         infamyPanicClock = 0.35;
@@ -5066,7 +5663,7 @@ export function createGooseEngine(
               npc.position.z - state.position.z,
             ) < 95
           ) {
-            panicCampusNpc(npc, state.position);
+            applyInfamyReaction(npc);
           }
         });
       }
@@ -5086,11 +5683,16 @@ export function createGooseEngine(
     if (state.mode === 'flying' && tumbleRemaining <= 0) {
       airborneTime += dt;
       peakAgl = Math.max(peakAgl, state.position.y - state.ground);
+      flightTopSpeed = Math.max(flightTopSpeed, state.velocity.length());
     }
   };
 
   const simulateTumble = (dt: number) => {
-    state.velocity.y -= FLIGHT.gravity * 0.75 * dt;
+    state.velocity.y -=
+      FLIGHT.gravity *
+      0.75 *
+      Math.min(lowGravityRemaining > 0 ? 0.42 : 1, modifiers.gravityScale) *
+      dt;
     state.velocity.x *= Math.exp(-1.45 * dt);
     state.velocity.z *= Math.exp(-1.45 * dt);
     state.position.addScaledVector(state.velocity, dt);
@@ -5139,7 +5741,8 @@ export function createGooseEngine(
     if (activeBuildingColliders.length === 0) return;
     // Use the visible body/inner-wing envelope, not just the goose's center point.
     // This prevents the wings and neck from visibly entering walls first.
-    const radius = state.mode === 'flying' ? 0.68 : 0.58;
+    const radius =
+      (state.mode === 'flying' ? 0.68 : 0.58) * modifiers.gooseScale;
     const gooseHeight = 0.92;
 
     let roofLanding: {
@@ -5147,6 +5750,7 @@ export function createGooseEngine(
       east: number;
       north: number;
       time: number;
+      key: string;
     } | null = null;
     const downwardTravel = previousState.position.y - state.position.y;
     if (
@@ -5171,7 +5775,7 @@ export function createGooseEngine(
           (roofLanding !== null && time >= roofLanding.time)
         )
           continue;
-        roofLanding = { roof, east, north, time };
+        roofLanding = { roof, east, north, time, key: building.sourceKey };
       }
     }
 
@@ -5195,13 +5799,18 @@ export function createGooseEngine(
       waterDryTime = 0;
       if (buildingHitCooldown <= 0) {
         buildingHitCooldown = 1.2;
+        // The footprint key is the roof's identity, so "ten different roofs"
+        // cannot be farmed by bouncing on one of them.
         if (impact > 5) {
           tumbleRemaining = 0.7;
           tumbleAngularSpeed = 10;
           cameraShakeRemaining = 0.24;
-          awardChaos(180, 'ROOFTOP PANCAKE');
+          audio.thud(0.8);
+          triggerHitStop(0.8);
+          awardChaos(180, 'ROOFTOP PANCAKE', { subject: roofLanding.key });
         } else {
-          awardChaos(220, 'ROOFTOP LANDING');
+          audio.thud(0.3);
+          awardChaos(220, 'ROOFTOP LANDING', { subject: roofLanding.key });
         }
       }
     }
@@ -5303,6 +5912,8 @@ export function createGooseEngine(
       }
       if (state.mode === 'flying' && inwardSpeed > 1.8) {
         const severity = clamp((inwardSpeed - 1.5) / 10, 0.18, 1);
+        audio.thud(severity);
+        triggerHitStop(severity);
         state.velocity.x *= lerp(0.88, 0.62, severity);
         state.velocity.z *= lerp(0.88, 0.62, severity);
         if (state.position.y - state.ground <= 2.2)
@@ -5321,7 +5932,9 @@ export function createGooseEngine(
         queuedFlaps = 0;
         if (buildingHitCooldown <= 0) {
           buildingHitCooldown = 1.5;
-          awardChaos(200, 'ARCHITECTURAL CRITIQUE');
+          awardChaos(200, 'ARCHITECTURAL CRITIQUE', {
+            subject: building.sourceKey,
+          });
         }
       }
       const horizontal = new THREE.Vector3(
@@ -5424,7 +6037,7 @@ export function createGooseEngine(
       (state.mode === 'flying' && nearSurface) ||
       (grounded && finalSurfaceSampleClock <= 0);
     if (shouldResample) {
-      const elevation = map.queryTerrainElevation(
+      const elevation = queryGroundElevation(
         localToLngLat(state.position.x, state.position.z),
       );
       if (
@@ -5484,8 +6097,8 @@ export function createGooseEngine(
       const localZ = dx * car.direction.x + dz * car.direction.z;
       const vertical = state.position.y - car.ground;
       const overlaps =
-        Math.abs(localX) < 1.25 &&
-        Math.abs(localZ) < 2.45 &&
+        Math.abs(localX) < 1.25 * modifiers.gooseScale &&
+        Math.abs(localZ) < 2.45 * modifiers.gooseScale &&
         vertical > -0.2 &&
         vertical < 1.65;
 
@@ -5496,20 +6109,33 @@ export function createGooseEngine(
         const normal = new THREE.Vector3(dx, 0, dz);
         if (normal.lengthSq() < 0.01) normal.set(rightX, 0, rightZ);
         normal.normalize();
-        state.velocity.addScaledVector(normal, lerp(2, 7, severity));
-        state.velocity.y = Math.max(state.velocity.y, lerp(1.2, 3.5, severity));
-        tumbleRemaining = lerp(0.55, 1.35, severity);
-        tumbleAngularSpeed = lerp(8, 17, severity) * (localX >= 0 ? 1 : -1);
+        // Giga Goose out-masses the car: it eats the impulse instead of the
+        // goose (Phase 4: mutators).
+        const gigaBounce = modifiers.gooseScale >= 2;
+        applyTrafficImpact(car, normal, severity, localX, gigaBounce);
+        audio.thud(severity);
+        audio.screech();
+        // ROAD HOG is the Giga Goose payoff shot, so it always earns the
+        // slow motion beat even when the closing speed was gentle.
+        triggerHitStop(gigaBounce ? 0.9 : severity);
         hitCooldown = 1;
         cameraShakeRemaining = lerp(0.12, 0.32, severity);
         queuedFlaps = 0;
         car.collisionCooldown = 5;
         car.reactionRemaining = Math.max(car.reactionRemaining, 1.8);
         car.wobbleRemaining = Math.max(car.wobbleRemaining, 1.4);
-        awardChaos(
-          state.mode === 'flying' ? 225 : 200,
-          state.mode === 'flying' ? 'AIRBORNE CAR BOP' : 'INSURANCE FRAUD',
-        );
+        if (gigaBounce) {
+          awardChaos(240, 'ROAD HOG', {
+            id: 'road-hog',
+            subject: String(car.index),
+          });
+        } else {
+          awardChaos(
+            state.mode === 'flying' ? 225 : 200,
+            state.mode === 'flying' ? 'AIRBORNE CAR BOP' : 'INSURANCE FRAUD',
+            { subject: String(car.index) },
+          );
+        }
         break;
       }
 
@@ -5537,6 +6163,8 @@ export function createGooseEngine(
 
     queuedFlaps = Math.max(0, queuedFlaps - 1);
     state.flapRemaining = FLAP_PERIOD;
+    // One wingbeat, one sound: this is the single place a beat starts.
+    audio.flap();
     state.stamina = Math.max(0, state.stamina - FLAP_STAMINA_COST);
     if (state.mode !== 'flying') {
       const forward = new THREE.Vector3(
@@ -5682,6 +6310,25 @@ export function createGooseEngine(
     state.stamina = Math.min(1, state.stamina + 0.18 * dt);
   };
 
+  /** The footprint key of the roof the goose is standing on, or null. */
+  const roofKeyUnderGoose = () => {
+    refreshActiveBuildingColliders();
+    for (const building of activeBuildingColliders) {
+      const roof = building.ground + building.height;
+      if (Math.abs(roof - state.ground) > 0.3) continue;
+      if (
+        state.position.x < building.minX ||
+        state.position.x > building.maxX ||
+        state.position.z < building.minZ ||
+        state.position.z > building.maxZ ||
+        !pointInBuilding(state.position.x, state.position.z, building)
+      )
+        continue;
+      return building.sourceKey;
+    }
+    return null;
+  };
+
   const simulateFlight = (dt: number) => {
     const bankInput = Number(keys.has('KeyD')) - Number(keys.has('KeyA'));
     const pullInput = Number(keys.has('KeyS')) - Number(keys.has('KeyW'));
@@ -5698,11 +6345,15 @@ export function createGooseEngine(
     const agl = state.position.y - state.ground;
     if (agl > ALTITUDE_BOOST_HEIGHT && !altitudeBoostActive) {
       altitudeBoostActive = true;
-      hooks.onToast('JETSTREAM · 50m altitude speed boost engaged');
+      announceJetstream();
     } else if (agl < ALTITUDE_BOOST_RELEASE_HEIGHT) {
       altitudeBoostActive = false;
     }
-    const altitudeBoost = altitudeBoostStrength(agl, altitudeBoostActive);
+    const altitudeBoost = altitudeBoostStrength(
+      agl,
+      altitudeBoostActive,
+      modifiers.jetstreamAlways,
+    );
     const flare =
       brake *
       clamp((8 - agl) / 7, 0, 1) *
@@ -5736,7 +6387,8 @@ export function createGooseEngine(
       FLIGHT.clMin,
       lerp(FLIGHT.clMax, 1.7, brake),
     );
-    const stallStart = state.alpha >= 0 ? FLIGHT.alphaStall : 13 * DEG;
+    const stallStart =
+      (state.alpha >= 0 ? FLIGHT.alphaStall : 13 * DEG) * heldStallPenalty();
     state.stall = smoothstep(
       stallStart,
       FLIGHT.alphaDeepStall,
@@ -5749,7 +6401,12 @@ export function createGooseEngine(
       FLIGHT.deepStallDrag * state.stall * state.stall +
       0.12 * brake;
     const dynamicPressure = 0.5 * FLIGHT.rho * speed * speed;
-    const gravityScale = lowGravityRemaining > 0 ? 0.42 : 1;
+    // Angel Goose's gravityScale combines with the low-gravity power-up by
+    // taking whichever makes the goose float more (the smaller multiplier).
+    const gravityScale = Math.min(
+      lowGravityRemaining > 0 ? 0.42 : 1,
+      modifiers.gravityScale,
+    );
     const force = new THREE.Vector3(
       0,
       -FLIGHT.mass * FLIGHT.gravity * gravityScale,
@@ -5776,7 +6433,9 @@ export function createGooseEngine(
     if (state.flapRemaining > 0) {
       const elapsed = FLAP_PERIOD - state.flapRemaining;
       const pulse =
-        elapsed < DOWNSTROKE ? Math.sin((Math.PI * elapsed) / DOWNSTROKE) : 0;
+        (elapsed < DOWNSTROKE
+          ? Math.sin((Math.PI * elapsed) / DOWNSTROKE)
+          : 0) * modifiers.flapPowerScale;
       // Tired wings lose climb performance, but never silently discard an accepted input.
       const staminaScale = lerp(0.48, 1, smoothstep(0, 0.28, state.stamina));
       const lowSpeedLift = lerp(155, 58, smoothstep(2, 10, speed));
@@ -5817,11 +6476,10 @@ export function createGooseEngine(
         );
       }
     }
-    const maximumSpeed = lerp(
-      BASE_MAX_FLIGHT_SPEED,
-      ALTITUDE_BOOST_MAX_SPEED,
-      altitudeBoost,
-    );
+    const maximumSpeed =
+      lerp(BASE_MAX_FLIGHT_SPEED, ALTITUDE_BOOST_MAX_SPEED, altitudeBoost) *
+      heldMassPenalty() *
+      modifiers.topSpeedScale;
     if (state.velocity.length() > maximumSpeed)
       state.velocity.setLength(maximumSpeed);
     state.position.addScaledVector(state.velocity, dt);
@@ -5872,6 +6530,23 @@ export function createGooseEngine(
               : `Big splash — ${flareHint} before touchdown`,
           );
         }
+      } else if (roofKeyUnderGoose() !== null) {
+        // sampleSurface folds a roof into state.ground once the goose is
+        // within 12 cm of it, so most rooftop touchdowns resolve here rather
+        // than in resolveBuildingInteractions' plane-crossing test. Award them
+        // as roofs, or every roof landing reads as a LAWN DART on the lawn.
+        const roofKey = roofKeyUnderGoose() ?? '';
+        if (buildingHitCooldown <= 0) {
+          buildingHitCooldown = 1.2;
+          if (impact > 5) {
+            audio.thud(0.8);
+            triggerHitStop(0.8);
+            awardChaos(180, 'ROOFTOP PANCAKE', { subject: roofKey });
+          } else {
+            audio.thud(0.3);
+            awardChaos(220, 'ROOFTOP LANDING', { subject: roofKey });
+          }
+        }
       } else {
         if (landingCounts) {
           if (
@@ -5880,10 +6555,15 @@ export function createGooseEngine(
             landingSpeed >= 8 &&
             landingSpeed <= 17
           ) {
+            // A greased landing is silent on purpose: the reward for nailing
+            // it is that nothing goes crunch.
             awardChaos(250, 'GREASED LANDING');
           } else if (impact > 4.5) {
+            audio.thud(0.9);
+            triggerHitStop(0.9);
             awardChaos(300, 'LAWN DART');
           } else {
+            audio.thud(0.35);
             awardChaos(100, 'TOUCHDOWN-ISH');
           }
         } else {
@@ -5895,7 +6575,9 @@ export function createGooseEngine(
         }
       }
       if (!state.onWater && impact > 4.5) {
-        tumbleRemaining = 0.82;
+        // Shortened from 0.82: QA found the old tumble outlasted the player's
+        // patience, and a queued Space tap now waits it out to take off.
+        tumbleRemaining = 0.6;
         tumbleAngularSpeed = 11 * (state.bank >= 0 ? 1 : -1);
         cameraShakeRemaining = 0.28;
       } else if (state.onWater && impact > 4.5) {
@@ -5939,8 +6621,619 @@ export function createGooseEngine(
     hooks.onToast(impact > 4 ? 'BELLY FLOP · splash!' : 'Splash!');
   };
 
+  /**
+   * One flight event per touchdown, wherever the landing came from: a flare, a
+   * roof, or a tumble that ran out of sky. Watching the mode transition catches
+   * all three without threading a report through each landing branch.
+   */
+  const finishFlightIfLanded = () => {
+    if (previousState.mode === 'flying' || state.mode === 'flying') {
+      flightMeters += Math.hypot(
+        state.position.x - previousState.position.x,
+        state.position.z - previousState.position.z,
+      );
+    }
+    if (previousState.mode !== 'flying' || state.mode === 'flying') return;
+    const seconds = airborneTime;
+    const meters = flightMeters;
+    const flightPeakAgl = peakAgl;
+    const topSpeed = flightTopSpeed;
+    airborneTime = 0;
+    peakAgl = 0;
+    flightMeters = 0;
+    flightTopSpeed = 0;
+    // Hops off a curb are not flights.
+    if (seconds < 0.5) return;
+    const roof = highestRoofAt(
+      state.position.x,
+      state.position.z,
+      state.position.y + 0.2,
+    );
+    recordEvent({
+      type: 'flight',
+      seconds,
+      meters,
+      peakAgl: flightPeakAgl,
+      topSpeed,
+      surface: roof !== null ? 'roof' : state.onWater ? 'water' : 'ground',
+    });
+  };
+
+  // =========================================================================
+  // Phase 3: grab and steal
+  //
+  // Deliberately one block. The grab key, whatever is in the beak, the throw,
+  // student items and the chase after a theft all live here, so the rest of the
+  // engine only carries single-line hooks into it: setKey queues a grab,
+  // simulate runs updateGrabAndSteal, simulateFlight asks what the load costs,
+  // emitTelemetry reads the label, placeGoose lets go, and
+  // setGameplayVisibility hides the meshes.
+  // =========================================================================
+
+  /** Reach from the beak point, before the goose scale multiplies it. */
+  const GRAB_REACH = 1.4;
+  /** createGooseRig ships the rig at this scale; a giga goose reaches further. */
+  const RIG_BASE_SCALE = 0.4;
+  /** How far ahead of the beak a carried thing rides. */
+  const HOLD_LEAD = 0.35;
+  /**
+   * Critically damped spring on the hold point: carried, not welded on. Stiff
+   * enough that a takeoff does not leave the load a meter behind the beak.
+   */
+  const HOLD_STIFFNESS = 24;
+  /** Head droop while carrying, in radians. */
+  const HOLD_HEAD_TILT = 0.25;
+  /**
+   * Benches, signs and bike racks. At or above this mass a load spoils the
+   * flight envelope; above it, a grounded goose cannot keep hold at all.
+   */
+  const HEAVY_PROP_MASS = 12;
+  const TOO_HEAVY_GROUND_SECONDS = 3;
+  /** Held-load penalties: top speed and how early the wing lets go. */
+  const HEAVY_SPEED_PENALTY = 0.6;
+  const HEAVY_STALL_PENALTY = 0.7;
+  const THROW_FORWARD = 6;
+  const THROW_UP = 2.5;
+  /** A flying goose throws harder; it has a wing to put behind it. */
+  const FLYING_THROW_SCALE = 1.3;
+  const FASTBALL_SPEED = 8;
+  /** Below this a release is a drop, not a throw, and nothing is announced. */
+  const THROW_EVENT_SPEED = 3;
+  const ITEM_FLIGHT_SECONDS = 6;
+  const CHASE_CATCH_DISTANCE = 0.9;
+  /**
+   * The double take. A theft happens inside arm's reach, so without a moment
+   * where the student is still working out what just happened there would be no
+   * theft at all: the catch would land in the same second as the grab.
+   */
+  const CHASE_REACTION_SECONDS = 1.2;
+  const CHASE_ESCAPE_DISTANCE = 25;
+  const CHASE_ESCAPE_ALTITUDE = 6;
+  const CHASE_ESCAPE_SECONDS = 2;
+  /** Beak tip in rig-local space; the root scale turns it into meters. */
+  const BEAK_LOCAL = new THREE.Vector3(0, 1.66, 0.95);
+
+  const PROP_NAMES: Record<PropKind, string> = {
+    cone: 'cone',
+    bench: 'bench',
+    trash: 'trash can',
+    bike: 'bike',
+    sign: 'sign',
+    flag: 'flag',
+  };
+  const ITEM_NAMES: Record<ItemKind, string> = {
+    phone: 'phone',
+    coffee: 'coffee',
+    sandwich: 'sandwich',
+    'id-card': 'ID card',
+    umbrella: 'umbrella',
+  };
+  type TheftAward = { points: number; label: string; id: string };
+  /** Anything without a headline of its own is plain old petty theft. */
+  const PETTY_THEFT: TheftAward = {
+    points: 150,
+    label: 'PETTY THEFT',
+    id: 'petty-theft',
+  };
+  const THEFT_AWARDS: Partial<Record<ItemKind, TheftAward>> = {
+    phone: { points: 170, label: 'DOOMSCROLL DENIED', id: 'doomscroll-denied' },
+    coffee: { points: 180, label: 'CAFFEINE HEIST', id: 'caffeine-heist' },
+    sandwich: { points: 160, label: 'LUNCH MONEY', id: 'lunch-money' },
+    'id-card': { points: 260, label: 'IDENTITY THEFT', id: 'identity-theft' },
+    umbrella: { points: 140, label: 'RAIN CHECK', id: 'rain-check' },
+  };
+
+  type HeldObject =
+    | { target: 'prop'; id: string; kind: PropKind; mass: number }
+    | { target: 'item'; kind: ItemKind; mesh: THREE.Mesh };
+  type ThrownItem = {
+    kind: ItemKind;
+    mesh: THREE.Mesh;
+    velocity: THREE.Vector3;
+    spin: THREE.Vector3;
+    age: number;
+    ground: number;
+    groundRefresh: number;
+    resting: boolean;
+  };
+  /** One theft in flight: who is chasing, for what, and how it ends. */
+  type ItemChase = {
+    npc: CampusNpc;
+    item: ItemKind;
+    remaining: number;
+    airborneTime: number;
+    resolved: boolean;
+  };
+
+  let held: HeldObject | null = null;
+  let grabQueued = false;
+  /** How long a heavy load has been dragged around on foot. */
+  let heldGroundSeconds = 0;
+  const itemChases: ItemChase[] = [];
+  const thrownItems: ThrownItem[] = [];
+  const beakPoint = new THREE.Vector3();
+  const holdPoint = new THREE.Vector3();
+  const holdIdeal = new THREE.Vector3();
+  const holdVelocity = new THREE.Vector3();
+  const springDelta = new THREE.Vector3();
+  const springTemp = new THREE.Vector3();
+  const grabScratch = new THREE.Vector3();
+  const releaseVelocity = new THREE.Vector3();
+
+  // Held and thrown items are plain meshes, not props: a stolen phone has no
+  // business waking the rigid body system up for six seconds of arc.
+  const itemGeometries = new Map<ItemKind, THREE.BufferGeometry>();
+  const itemMeshPool = new Map<ItemKind, THREE.Mesh[]>();
+  const heldItemMaterial = createCampusItemMaterial();
+
+  const takeItemMesh = (kind: ItemKind) => {
+    const pooled = itemMeshPool.get(kind)?.pop();
+    if (pooled) {
+      pooled.visible = playing;
+      return pooled;
+    }
+    let geometry = itemGeometries.get(kind);
+    if (!geometry) {
+      geometry = buildCampusItemGeometry(kind);
+      itemGeometries.set(kind, geometry);
+    }
+    const mesh = new THREE.Mesh(geometry, heldItemMaterial);
+    mesh.name = `Stolen item (${kind})`;
+    mesh.frustumCulled = false;
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    mesh.visible = playing;
+    scene.add(mesh);
+    return mesh;
+  };
+
+  const returnItemMesh = (kind: ItemKind, mesh: THREE.Mesh) => {
+    mesh.visible = false;
+    mesh.rotation.set(0, 0, 0);
+    const pool = itemMeshPool.get(kind);
+    if (pool) pool.push(mesh);
+    else itemMeshPool.set(kind, [mesh]);
+  };
+
+  /** 1 at the authored size; a mutator that scales the goose scales its reach. */
+  const gooseScaleFactor = () => {
+    const scale = goose.root.scale.x;
+    return Number.isFinite(scale) && scale > 0.01 ? scale / RIG_BASE_SCALE : 1;
+  };
+
+  const updateBeakPoint = () => {
+    goose.root.updateMatrixWorld();
+    beakPoint.copy(BEAK_LOCAL).applyMatrix4(goose.root.matrixWorld);
+  };
+
+  /** Where the beak wants a carried thing to sit, a little way out in front. */
+  const updateHoldIdeal = () => {
+    grabScratch.copy(state.forward);
+    if (grabScratch.lengthSq() < 1e-6)
+      grabScratch.set(Math.sin(state.heading), 0, Math.cos(state.heading));
+    grabScratch.normalize();
+    holdIdeal
+      .copy(beakPoint)
+      .addScaledVector(grabScratch, HOLD_LEAD * gooseScaleFactor());
+  };
+
+  const springHoldPoint = (dt: number) => {
+    // Textbook critically damped step, so the load trails the beak through a
+    // turn and settles without ever overshooting into the goose.
+    const decay = Math.exp(-HOLD_STIFFNESS * dt);
+    springDelta.copy(holdPoint).sub(holdIdeal);
+    springTemp
+      .copy(holdVelocity)
+      .addScaledVector(springDelta, HOLD_STIFFNESS)
+      .multiplyScalar(dt);
+    holdVelocity
+      .addScaledVector(springTemp, -HOLD_STIFFNESS)
+      .multiplyScalar(decay);
+    holdPoint
+      .copy(holdIdeal)
+      .addScaledVector(springDelta.add(springTemp), decay);
+  };
+
+  /** A heavy load caps top speed; cones, flags and stolen lunches do not. */
+  const carryingHeavyProp = () =>
+    held?.target === 'prop' && held.mass >= HEAVY_PROP_MASS;
+  const heldMassPenalty = () => (carryingHeavyProp() ? HEAVY_SPEED_PENALTY : 1);
+  const heldStallPenalty = () =>
+    carryingHeavyProp() ? HEAVY_STALL_PENALTY : 1;
+
+  const heldLabel = () => (held ? held.kind : null);
+
+  // The HUD does not mirror `holding` yet, so the engine publishes it on the
+  // map container the way the prop counters were published before the HUD
+  // picked those up. The steal target rides along because the harness has no
+  // other way to see a student worth robbing: telemetry reports how far the
+  // nearest one is, never which way. Both go away once data-holding lands on
+  // the shell and the crowd is readable some better way.
+  const mirrorHost = map.getContainer();
+  const setMirror = (name: string, value: string) => {
+    if (mirrorHost.dataset[name] !== value) mirrorHost.dataset[name] = value;
+  };
+  const mirrorHarnessAttributes = () => {
+    setMirror('holding', heldLabel() ?? '');
+    let target: CampusNpc | null = null;
+    let targetDistance = Number.POSITIVE_INFINITY;
+    for (const npc of campusNpcs) {
+      if (!npc.item) continue;
+      if (npc.mode === 'ragdoll' || npc.mode === 'recover') continue;
+      const distance = Math.hypot(
+        npc.position.x - state.position.x,
+        npc.position.z - state.position.z,
+      );
+      if (distance >= targetDistance) continue;
+      targetDistance = distance;
+      target = npc;
+    }
+    setMirror('stealTargetItem', target?.item ?? '');
+    setMirror('stealTargetEast', target ? target.position.x.toFixed(2) : '');
+    setMirror('stealTargetNorth', target ? target.position.z.toFixed(2) : '');
+    // Phase 5 readouts are mirrored here as well as reported as telemetry, so
+    // the harness can watch a ragdoll and a hit-stop without waiting for the
+    // HUD to publish them on the shell.
+    setMirror('ragdolling', tumbleRemaining > 0 ? 'true' : 'false');
+    setMirror('timeScale', timeScale.toFixed(3));
+  };
+
+  /**
+   * The closest student still carrying something. The aim point is the middle
+   * of the body at hand height rather than the hand itself: the hand swings
+   * through a third of a meter with the gait, and a grab that depended on gait
+   * phase would read as broken rather than as skilful.
+   */
+  const nearestStudentWithItem = (reach: number) => {
+    let best: CampusNpc | null = null;
+    let bestDistance = reach * reach;
+    for (const npc of campusNpcs) {
+      if (!npc.item) continue;
+      if (npc.mode === 'ragdoll' || npc.mode === 'recover') continue;
+      const dx = npc.position.x - beakPoint.x;
+      const dy = npc.ground + 1.05 * npc.heightScale - beakPoint.y;
+      const dz = npc.position.z - beakPoint.z;
+      const distanceSquared = dx * dx + dy * dy + dz * dz;
+      if (distanceSquared >= bestDistance) continue;
+      bestDistance = distanceSquared;
+      best = npc;
+    }
+    return best;
+  };
+
+  const beginHold = () => {
+    updateHoldIdeal();
+    holdPoint.copy(holdIdeal);
+    holdVelocity.set(0, 0, 0);
+    heldGroundSeconds = 0;
+  };
+
+  const stealItem = (npc: CampusNpc, item: ItemKind) => {
+    npc.item = null;
+    beginHold();
+    const mesh = takeItemMesh(item);
+    mesh.position.copy(holdPoint);
+    held = { target: 'item', kind: item, mesh };
+    const award = THEFT_AWARDS[item] ?? PETTY_THEFT;
+    awardChaos(award.points, award.label, { id: award.id });
+    // The grab is reported now; the steal waits for the chase to end, so a
+    // quest counting uncaught thefts never has to unlearn one.
+    recordEvent({ type: 'grab', target: 'item', kind: item });
+    if (startCampusNpcChase(npc)) {
+      itemChases.push({
+        npc,
+        item,
+        remaining: CAMPUS_CHASE_SECONDS,
+        airborneTime: 0,
+        resolved: false,
+      });
+    } else {
+      recordEvent({ type: 'steal', item, caught: false });
+    }
+  };
+
+  const tryGrab = () => {
+    if (held) return;
+    updateBeakPoint();
+    const reach = GRAB_REACH * gooseScaleFactor();
+    const victim = nearestStudentWithItem(reach);
+    // Students first: reaching past a cone for a coffee is the better joke.
+    if (victim?.item) {
+      stealItem(victim, victim.item);
+      return;
+    }
+    const propId = propSystem.nearest(beakPoint, reach);
+    if (!propId) return;
+    const description = propSystem.describe(propId);
+    if (!description) return;
+    beginHold();
+    if (!propSystem.hold(propId, holdPoint)) return;
+    held = {
+      target: 'prop',
+      id: propId,
+      kind: description.kind,
+      mass: description.mass,
+    };
+    hooks.onToast(`Grabbed: ${PROP_NAMES[description.kind]}`);
+    recordEvent({ type: 'grab', target: 'prop', kind: description.kind });
+  };
+
+  const spawnThrownItem = (
+    kind: ItemKind,
+    mesh: THREE.Mesh,
+    velocity: THREE.Vector3,
+  ) => {
+    thrownItems.push({
+      kind,
+      mesh,
+      velocity: velocity.clone(),
+      // Tumble taken from the clock rather than a random number, so a replay of
+      // the same inputs throws the same phone the same way.
+      spin: new THREE.Vector3(
+        Math.sin(elapsedTime * 7.7) * 9,
+        Math.cos(elapsedTime * 5.3) * 6,
+        Math.sin(elapsedTime * 3.1) * 7,
+      ),
+      age: 0,
+      ground: state.ground,
+      groundRefresh: 0,
+      resting: false,
+    });
+  };
+
+  /** Let go. `thrown` adds the arm; a drop just inherits the goose momentum. */
+  const releaseHeld = (thrown: boolean) => {
+    if (!held) return;
+    releaseVelocity.set(0, 0, 0);
+    if (thrown) {
+      const power = state.mode === 'flying' ? FLYING_THROW_SCALE : 1;
+      grabScratch.copy(state.forward);
+      if (grabScratch.lengthSq() < 1e-6)
+        grabScratch.set(Math.sin(state.heading), 0, Math.cos(state.heading));
+      grabScratch.normalize();
+      releaseVelocity.copy(grabScratch).multiplyScalar(THROW_FORWARD * power);
+      releaseVelocity.y += THROW_UP * power;
+    }
+    releaseVelocity.add(state.velocity);
+    const speed = releaseVelocity.length();
+    if (held.target === 'prop') {
+      propSystem.release(held.id, releaseVelocity);
+      // props.ts stays out of this on purpose: only the thrower knows whether
+      // the prop left the beak or was merely dropped.
+      if (speed > THROW_EVENT_SPEED)
+        recordEvent({ type: 'prop', kind: held.kind, action: 'thrown' });
+    } else {
+      spawnThrownItem(held.kind, held.mesh, releaseVelocity);
+    }
+    if (thrown && speed > FASTBALL_SPEED)
+      awardChaos(90, 'FASTBALL', { id: 'fastball' });
+    held = null;
+    heldGroundSeconds = 0;
+  };
+
+  const updateThrownItems = (dt: number) => {
+    for (let index = thrownItems.length - 1; index >= 0; index -= 1) {
+      const item = thrownItems[index];
+      item.age += dt;
+      if (item.age >= ITEM_FLIGHT_SECONDS) {
+        returnItemMesh(item.kind, item.mesh);
+        thrownItems.splice(index, 1);
+        continue;
+      }
+      if (item.resting) continue;
+      item.groundRefresh -= dt;
+      if (item.groundRefresh <= 0) {
+        item.groundRefresh = 0.12;
+        item.ground = propGroundAt(
+          item.mesh.position.x,
+          item.mesh.position.z,
+          item.ground,
+        );
+      }
+      item.velocity.y -= FLIGHT.gravity * dt;
+      const drag = Math.exp(-0.5 * dt);
+      item.velocity.x *= drag;
+      item.velocity.z *= drag;
+      item.mesh.position.addScaledVector(item.velocity, dt);
+      item.mesh.rotation.x += item.spin.x * dt;
+      item.mesh.rotation.y += item.spin.y * dt;
+      item.mesh.rotation.z += item.spin.z * dt;
+      const rest = item.ground + 0.04;
+      if (item.mesh.position.y > rest) continue;
+      item.mesh.position.y = rest;
+      if (item.velocity.y < -1.2) {
+        item.velocity.y *= -0.25;
+        item.velocity.x *= 0.55;
+        item.velocity.z *= 0.55;
+        item.spin.multiplyScalar(0.5);
+      } else {
+        item.resting = true;
+        item.velocity.set(0, 0, 0);
+        item.spin.set(0, 0, 0);
+        item.mesh.rotation.set(0, item.mesh.rotation.y, 0);
+      }
+    }
+  };
+
+  const endChase = (index: number) => {
+    const chase = itemChases[index];
+    itemChases.splice(index, 1);
+    if (campusNpcs[chase.npc.index] !== chase.npc) return;
+    if (chase.npc.mode === 'chase')
+      resumeCampusNpcRoute(chase.npc, npcTerrainAt);
+  };
+
+  const resolveChase = (chase: ItemChase, caught: boolean) => {
+    if (chase.resolved) return;
+    chase.resolved = true;
+    recordEvent({ type: 'steal', item: chase.item, caught });
+  };
+
+  /** The student takes its property back, out of the beak if it is still there. */
+  const returnStolenItem = (chase: ItemChase) => {
+    if (held?.target === 'item' && held.kind === chase.item) {
+      returnItemMesh(held.kind, held.mesh);
+      held = null;
+      heldGroundSeconds = 0;
+    }
+    // An item already thrown stays where it landed; the student is holding a
+    // replacement by the time it stops shouting.
+    chase.npc.item = chase.item;
+  };
+
+  const updateChases = (dt: number) => {
+    for (let index = itemChases.length - 1; index >= 0; index -= 1) {
+      const chase = itemChases[index];
+      const npc = chase.npc;
+      // A respawn or a crowd recycle can swap the chaser out from under us.
+      if (campusNpcs[npc.index] !== npc) {
+        resolveChase(chase, false);
+        itemChases.splice(index, 1);
+        continue;
+      }
+      chase.remaining -= dt;
+      const agl = state.position.y - state.ground;
+      if (state.mode === 'flying' && agl > CHASE_ESCAPE_ALTITUDE)
+        chase.airborneTime += dt;
+      else chase.airborneTime = 0;
+      const distance = Math.hypot(
+        npc.position.x - state.position.x,
+        npc.position.z - state.position.z,
+      );
+
+      if (
+        state.mode !== 'flying' &&
+        npc.mode === 'chase' &&
+        CAMPUS_CHASE_SECONDS - chase.remaining > CHASE_REACTION_SECONDS &&
+        distance <= CHASE_CATCH_DISTANCE
+      ) {
+        returnStolenItem(chase);
+        tumbleRemaining = Math.max(tumbleRemaining, 0.8);
+        tumbleAngularSpeed = 11 * (npc.position.x >= state.position.x ? -1 : 1);
+        cameraShakeRemaining = Math.max(cameraShakeRemaining, 0.24);
+        audio.thud(0.75);
+        triggerHitStop(0.75);
+        // Queued, not shown outright: the theft toast is usually still on
+        // screen, and the HUD drops an info toast that lands on top of one.
+        queueScoreToast(`CAUGHT · ${ITEM_NAMES[chase.item]} returned`);
+        resolveChase(chase, true);
+        endChase(index);
+        continue;
+      }
+
+      const gotAway =
+        distance > CHASE_ESCAPE_DISTANCE ||
+        chase.airborneTime >= CHASE_ESCAPE_SECONDS;
+      if (!gotAway && chase.remaining > 0) continue;
+      resolveChase(chase, false);
+      endChase(index);
+      // Queued for the same reason as the catch: it often lands right on the
+      // heels of the theft toast, and an info toast there is dropped.
+      if (gotAway) queueScoreToast(`Clean getaway · ${ITEM_NAMES[chase.item]}`);
+    }
+  };
+
+  const chaseContext: CampusChaseContext = {
+    target: state.position,
+    avoidBuildings: (point, radius) => {
+      resolvePropBuilding(point, radius);
+    },
+  };
+
+  /** Called once per fixed step, before the prop system integrates. */
+  const updateGrabAndSteal = (dt: number) => {
+    if (grabQueued) {
+      grabQueued = false;
+      if (held) releaseHeld(true);
+      else tryGrab();
+    }
+    // A tumbling goose has no beak to spare.
+    if (held && tumbleRemaining > 0) releaseHeld(false);
+    if (held) {
+      updateBeakPoint();
+      updateHoldIdeal();
+      springHoldPoint(dt);
+      if (held.target === 'prop') {
+        // A prop recycled out from under the beak simply stops being held.
+        if (!propSystem.hold(held.id, holdPoint)) held = null;
+        else if (state.mode === 'flying') heldGroundSeconds = 0;
+        else heldGroundSeconds += dt;
+        if (
+          held?.target === 'prop' &&
+          held.mass > HEAVY_PROP_MASS &&
+          heldGroundSeconds > TOO_HEAVY_GROUND_SECONDS
+        ) {
+          // Queued rather than shown: dropping a bench usually wrecks it, and
+          // the wreck award takes the toast slot in the same frame.
+          queueScoreToast(`Too heavy · dropped the ${PROP_NAMES[held.kind]}`);
+          releaseHeld(false);
+        }
+      } else {
+        held.mesh.position.copy(holdPoint);
+        held.mesh.quaternion.copy(goose.root.quaternion);
+      }
+    }
+    goose.head.rotation.x = moveToward(
+      goose.head.rotation.x,
+      held ? HOLD_HEAD_TILT : 0,
+      2.4 * dt,
+    );
+    updateChases(dt);
+    updateThrownItems(dt);
+  };
+
+  const setPhase3Visibility = (visible: boolean) => {
+    for (const kind of CAMPUS_ITEM_KINDS)
+      crowdFleet.items[kind].visible = visible;
+    if (held?.target === 'item') held.mesh.visible = visible;
+    for (const item of thrownItems) item.mesh.visible = visible;
+  };
+
+  /** Respawn and travel: let go of everything, and every theft counts as clean. */
+  const abandonGrabsForRespawn = () => {
+    if (held) releaseHeld(false);
+    for (const chase of itemChases) {
+      resolveChase(chase, false);
+      if (
+        campusNpcs[chase.npc.index] === chase.npc &&
+        chase.npc.mode === 'chase'
+      )
+        resumeCampusNpcRoute(chase.npc, npcTerrainAt);
+    }
+    itemChases.length = 0;
+    for (const item of thrownItems) returnItemMesh(item.kind, item.mesh);
+    thrownItems.length = 0;
+    goose.head.rotation.x = 0;
+  };
+
+  // ------------------------- end Phase 3: grab and steal -------------------
+
   const simulate = (dt: number) => {
     updateChaosTimers(dt);
+    // After the tumble timer has been decayed and before the flap check, so a
+    // held KeyR re-arms the tumble in the same step that would have ended it
+    // and beginFlapIfNeeded still refuses to fire mid-tumble.
+    updateRagdollKey();
     finalSurfaceSampleClock = Math.max(0, finalSurfaceSampleClock - dt);
     if (queuedHonks > 0 && honkCooldown <= 0) performHonk();
     beginFlapIfNeeded();
@@ -5964,7 +7257,7 @@ export function createGooseEngine(
       relocateNearbyCrowd();
     }
     campusNpcs.forEach((npc) =>
-      simulateCampusNpc(npc, dt, elapsedTime, npcTerrainAt),
+      simulateCampusNpc(npc, dt, elapsedTime, npcTerrainAt, chaseContext),
     );
     if (tumbleRemaining > 0) simulateTumble(dt);
     else if (state.mode === 'planing') simulateWaterPlaning(dt);
@@ -5975,8 +7268,18 @@ export function createGooseEngine(
     enforceSurfacePostcondition();
     ensureWaterEntrySplash(dt);
     resolveTrafficInteractions();
+    updateGrabAndSteal(dt);
+    // Props run after traffic so the goose velocity a prop reads is the one it
+    // will actually leave the step with.
+    goosePropProbe.radius =
+      (state.mode === 'flying' ? 0.68 : 0.58) * modifiers.gooseScale;
+    goosePropProbe.mode = state.mode;
+    propSystem.step(dt, goosePropProbe);
+    propSystem.collideCars(traffic);
+    propSystem.collideStudents(campusNpcs);
     resolveCrowdInteractions();
     recruitNearbyFlock();
+    finishFlightIfLanded();
     updateCampusSecrets(dt);
     if (state.flapRemaining > 0) {
       state.flapRemaining = Math.max(0, state.flapRemaining - dt);
@@ -6065,6 +7368,7 @@ export function createGooseEngine(
       );
       goose.root.quaternion.multiply(tumble).normalize();
     }
+    animateHalo(dt);
   };
 
   const updateCamera = (dt: number, pose: SimState, immediate = false) => {
@@ -6097,7 +7401,9 @@ export function createGooseEngine(
       .multiplyScalar(-1)
       .applyAxisAngle(UP, cameraOrbitYaw);
     const distance =
-      (isFlying ? 8.7 + 0.035 * speed : 5.65) * cameraDistanceScale;
+      (isFlying ? 8.7 + 0.035 * speed : 5.65) *
+      cameraDistanceScale *
+      modifiers.gooseScale ** 0.6;
     const desiredPosition = orbitOrigin
       .clone()
       .addScaledVector(radial, distance * Math.cos(cameraOrbitPitch))
@@ -6255,7 +7561,11 @@ export function createGooseEngine(
         Math.cos(secretBearing - cameraBearing),
       ) / DEG;
     const agl = Math.max(0, state.position.y - state.ground);
-    const altitudeBoost = altitudeBoostStrength(agl, altitudeBoostActive);
+    const altitudeBoost = altitudeBoostStrength(
+      agl,
+      altitudeBoostActive,
+      modifiers.jetstreamAlways,
+    );
     const recruitableGooseInRange = flockGeese.some((member) => {
       if (member.recruited || !member.terrainResolved) return false;
       return (
@@ -6278,6 +7588,9 @@ export function createGooseEngine(
       .clone()
       .applyMatrix4(camera.projectionMatrix);
     const mapCanvas = map.getCanvas();
+    const saved = progress.get();
+    const propStats = propSystem.stats();
+    mirrorHarnessAttributes();
     hooks.onTelemetry({
       speed:
         state.mode === 'flying' || state.mode === 'planing'
@@ -6337,12 +7650,35 @@ export function createGooseEngine(
       duckCouncilEast: duckCouncil?.position.x ?? 0,
       duckCouncilNorth: duckCouncil?.position.z ?? 0,
       duckCouncilVisible: duckCouncil?.group.visible ?? false,
+      paused,
+      tokens: saved.tokens,
+      questsCompleted: saved.completedQuests.length,
+      questsTotal: QUESTS.length,
+      props: propStats.props,
+      propsAwake: propStats.propsAwake,
+      holding: heldLabel(),
+      activeMutators: saved.activeMutators,
+      gooseScale: modifiers.gooseScale,
+      ragdolling: tumbleRemaining > 0,
+      timeScale,
     });
   };
 
-  const resetState = (clearProgress = false, updateView = true) => {
+  /**
+   * Drop the goose into the world at a spot, airborne and pointed somewhere.
+   * Shared by the respawn and by travelTo(), so a teleport gets exactly the same
+   * per-life cleanup: no leftover tumble, no stale water state, and the
+   * streaming anchors invalidated so the city rebuilds around the new spot.
+   */
+  const placeGoose = (
+    east: number,
+    north: number,
+    headingRadians: number,
+    altitudeAboveGround: number,
+  ) => {
     keys.clear();
-    const spawnPoint = new THREE.Vector2(0, 0);
+    abandonGrabsForRespawn();
+    const spawnPoint = new THREE.Vector2(east, north);
     for (let attempt = 0; attempt < 6; attempt += 1) {
       const containingBuilding = buildingColliders.find((building) =>
         pointInBuilding(spawnPoint.x, spawnPoint.y, building),
@@ -6371,12 +7707,12 @@ export function createGooseEngine(
     state.ground = spawnGround;
     state.position.set(
       spawnPoint.x,
-      spawnGround + SPAWN_ALTITUDE,
+      spawnGround + altitudeAboveGround,
       spawnPoint.y,
     );
-    state.velocity.set(0, -0.4, SPAWN_SPEED);
-    state.forward.set(0, 0, 1);
-    state.heading = 0;
+    state.forward.set(Math.sin(headingRadians), 0, Math.cos(headingRadians));
+    state.velocity.copy(state.forward).multiplyScalar(SPAWN_SPEED).setY(-0.4);
+    state.heading = headingRadians;
     state.bank = 0;
     state.alpha = FLIGHT.trimAlpha;
     state.stamina = 1;
@@ -6388,17 +7724,17 @@ export function createGooseEngine(
     queuedHonks = 0;
     gooseWaddlePhase = 0;
     honkCooldown = 0;
-    if (clearProgress) {
-      chaosScore = 0;
-      campusInfamyUnlocked = false;
-    }
     infamyPanicClock = 0;
-    chaosCombo = 1;
-    chaosComboEvents = 0;
-    chaosComboRemaining = 0;
     tumbleRemaining = 0;
     tumbleAngle = 0;
     tumbleAngularSpeed = 0;
+    // A respawn or a travel must not arrive already in slow motion, and a
+    // KeyR still held across it re-seeds its spin instead of continuing the
+    // old one. The one-time ragdoll hint stays shown: it is per session.
+    slowMotionRemaining = 0;
+    timeScale = 1;
+    ragdollLatched = false;
+    ragdollSplashLatched = false;
     hitCooldown = 0;
     buildingHitCooldown = 0;
     cameraShakeRemaining = 0;
@@ -6407,6 +7743,8 @@ export function createGooseEngine(
     slipperyRemaining = 0;
     airborneTime = 0;
     peakAgl = 0;
+    flightMeters = 0;
+    flightTopSpeed = 0;
     waterSurfaceY = spawnGround;
     terrainSurfaceY = spawnGround;
     finalSurfaceSampleClock = 0;
@@ -6417,12 +7755,7 @@ export function createGooseEngine(
     waterContactLatched = false;
     waterContactReleaseTime = 0;
     altitudeBoostActive = false;
-    cameraDistanceScale = DEFAULT_CAMERA_SCALE;
-    cameraDistanceTarget = DEFAULT_CAMERA_SCALE;
-    cameraOrbitYaw = 0;
-    cameraOrbitYawTarget = 0;
-    cameraOrbitPitch = 24 * DEG;
-    cameraOrbitPitchTarget = 24 * DEG;
+    jetstreamToastShown = false;
     crowdRelocationClock = 0;
     trafficAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
     buildingIngestAnchor.set(
@@ -6431,11 +7764,43 @@ export function createGooseEngine(
     );
     mappedWaterAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
     woodlandAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+    buildingRefreshRequested = true;
     woodlandScanNeedsRetry = false;
     woodlandScanRetryAt = 0;
     trafficRefreshClock = 0;
     accumulator = 0;
     relocateNearbyCrowd(true);
+    // Props follow the goose the way traffic and the crowd do: the authored
+    // table spawns around wherever it just landed, and the POI scan restarts.
+    propPoiAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+    propPoiClock = PROP_POI_REFRESH_SECONDS;
+    propPoiScans = 0;
+    refreshProps(spawnPoint.x, spawnPoint.y);
+    propSystem.updateVisuals(1, elapsedTime);
+    return spawnPoint;
+  };
+
+  const resetState = (clearProgress = false, updateView = true) => {
+    const spawnPoint = placeGoose(0, 0, 0, SPAWN_ALTITUDE);
+    // A new life stands every prop back up. Travel deliberately does not: the
+    // wreckage the goose left behind is still there when it comes back.
+    propSystem.resetAll();
+    propSystem.updateVisuals(1, elapsedTime);
+    if (clearProgress) {
+      chaosScore = 0;
+      campusInfamyUnlocked = false;
+    }
+    // A new life drops the combo; a travel (which also calls placeGoose) keeps
+    // whatever streak was running.
+    chaosCombo = 1;
+    chaosComboEvents = 0;
+    chaosComboRemaining = 0;
+    cameraDistanceScale = DEFAULT_CAMERA_SCALE;
+    cameraDistanceTarget = DEFAULT_CAMERA_SCALE;
+    cameraOrbitYaw = 0;
+    cameraOrbitYawTarget = 0;
+    cameraOrbitPitch = 24 * DEG;
+    cameraOrbitPitchTarget = 24 * DEG;
     campusNpcs.forEach((npc, index) => {
       campusNpcs[index] = createCampusNpc(
         index,
@@ -6485,6 +7850,66 @@ export function createGooseEngine(
     emitTelemetry();
   };
 
+  /** Replay the save into the world: found secrets stay found, flock stays flock. */
+  const restoreSavedWorld = () => {
+    const saved = progress.get();
+    if (saved.secretsFound.length > 0) {
+      const found = new Set(saved.secretsFound);
+      campusSecrets.forEach((secret) => {
+        if (found.has(secret.id)) markSecretFound(secret, true);
+      });
+    }
+    saved.recruitedGeese.forEach((roostIndex) => {
+      const member = flockGeese[roostIndex];
+      if (member) recruitFlockMember(member, true);
+    });
+    updateFlockVisuals(0, renderState);
+    setGameplayVisibility(playing);
+    emitTelemetry();
+  };
+
+  /** The other direction: a fresh goose, so the world forgets everything. */
+  const forgetSavedWorld = () => {
+    campusSecrets.forEach((secret) => {
+      secret.found = false;
+      secret.activation = 0;
+      secret.honkCount = 0;
+      secret.honkWindow = 0;
+      const baseY = secret.group.userData.baseY;
+      if (typeof baseY === 'number') secret.group.position.y = baseY;
+      secret.group.traverse((object) => {
+        if (!(object instanceof THREE.Mesh)) return;
+        const { basePosition, baseEmissive, baseEmissiveIntensity } =
+          object.userData;
+        if (basePosition instanceof THREE.Vector3)
+          object.position.copy(basePosition);
+        if (!(object.material instanceof THREE.MeshStandardMaterial)) return;
+        if (typeof baseEmissive === 'number')
+          object.material.emissive.setHex(baseEmissive);
+        if (typeof baseEmissiveIntensity === 'number')
+          object.material.emissiveIntensity = baseEmissiveIntensity;
+      });
+    });
+    secretsFound = 0;
+    recruitedFlockCount = 0;
+    flockGeese.forEach((member) => {
+      member.recruited = false;
+      member.waterContactLatched = false;
+      member.waterContactReleaseTime = 0;
+      member.position.set(member.home.x, member.ground + 0.04, member.home.y);
+      member.rig.root.position.copy(member.position);
+      setGooseLegStride(member.rig, 0);
+    });
+    chaosScore = 0;
+    chaosCombo = 1;
+    chaosComboEvents = 0;
+    chaosComboRemaining = 0;
+    campusInfamyUnlocked = false;
+    setGameplayVisibility(playing);
+    updateFlockVisuals(0, renderState);
+    emitTelemetry();
+  };
+
   const customLayer: CustomLayerInterface = {
     id: 'kalamazoo-goose-3d-world',
     type: 'custom',
@@ -6524,6 +7949,7 @@ export function createGooseEngine(
       buildingColliders.length === 0 ? buildTexturedBuildings() : false;
     const woodlandChanged = collectMappedWoodlandTrees();
     const treePlacementsChanged = refreshTreePlacementMask();
+    collectPropPois();
     if (trafficChanged) updateTrafficVisuals(1);
     if (
       trafficChanged ||
@@ -6578,7 +8004,21 @@ export function createGooseEngine(
     if (destroyed) return;
     const frameDt = Math.min(0.1, Math.max(0, (now - previousTime) / 1000));
     previousTime = now;
-    elapsedTime += frameDt;
+    // A paused game still renders and still lets the camera settle, but no
+    // simulated time passes: the world is exactly where it was on unpause.
+    const simulating = playing && !paused;
+    if (simulating) elapsedTime += frameDt;
+    drainPendingToasts(frameDt);
+    if (simulating) {
+      unsavedPlaySeconds += frameDt;
+      if (unsavedPlaySeconds >= 15) {
+        const banked = unsavedPlaySeconds;
+        unsavedPlaySeconds = 0;
+        progress.update((saved) => {
+          saved.stats.playSeconds += banked;
+        });
+      }
+    }
     buildingRefreshClock = Math.max(0, buildingRefreshClock - frameDt);
     trafficRefreshClock = Math.max(0, trafficRefreshClock - frameDt);
     if (
@@ -6605,7 +8045,7 @@ export function createGooseEngine(
         map.triggerRepaint();
       }
     }
-    if (playing && trafficRefreshClock <= 0) {
+    if (simulating && trafficRefreshClock <= 0) {
       trafficRefreshClock = 1;
       if (buildTraffic()) {
         collectPedestrianRoutes();
@@ -6615,8 +8055,11 @@ export function createGooseEngine(
         map.triggerRepaint();
       }
     }
-    if (playing) {
-      accumulator += frameDt;
+    if (simulating) {
+      // The only place the hit-stop bites: real time is scaled on the way into
+      // the fixed-step accumulator, so the simulation crawls while rendering,
+      // the camera, the toast timers and the ambient bed all keep real time.
+      accumulator += frameDt * timeScale;
       let steps = 0;
       while (accumulator >= fixedStep && steps < 5) {
         copyState(previousState, state);
@@ -6646,6 +8089,11 @@ export function createGooseEngine(
         cloudRefreshClock = 0.12;
         updateClouds();
       }
+      propPoiClock -= frameDt;
+      if (propPoiClock <= 0) {
+        propPoiClock = PROP_POI_REFRESH_SECONDS;
+        collectPropPois();
+      }
     }
     if (!playing) {
       treeRefreshClock -= frameDt;
@@ -6656,13 +8104,25 @@ export function createGooseEngine(
         updateTrees(false);
       }
     }
-    updateSplashes(frameDt);
-    updateHonkWaves(frameDt);
-    updateGoosePose(renderState, frameDt);
+    updateSplashes(simulating ? frameDt : 0);
+    updateHonkWaves(simulating ? frameDt : 0);
+    propSystem.updateVisuals(
+      simulating ? accumulator / fixedStep : 1,
+      elapsedTime,
+    );
+    updateGoosePose(renderState, simulating ? frameDt : 0);
     if (playing) {
-      updateFlockVisuals(frameDt, renderState);
+      if (simulating) updateFlockVisuals(frameDt, renderState);
       updateCamera(frameDt, renderState);
     }
+    // The ambient bed follows the goose every frame, not on the telemetry
+    // tick: a 10 Hz update is audible as stepping in the wind filter.
+    audio.setAmbient({
+      agl: Math.max(0, renderState.position.y - renderState.ground),
+      speed: renderState.velocity.length(),
+      mode: renderState.mode,
+      paused: paused || !playing,
+    });
     telemetryClock -= frameDt;
     if (telemetryClock <= 0) {
       telemetryClock = 0.1;
@@ -6673,12 +8133,250 @@ export function createGooseEngine(
     animationFrame = requestAnimationFrame(frame);
   };
 
+  // ---------------------------------------------------------------------
+  // Phase 4: mutators
+  // ---------------------------------------------------------------------
+  // Every mutator's behavior lives in this one region. The functions above
+  // (simulateFlight, simulateTumble, resolveBuildingInteractions,
+  // resolveCrowdInteractions, resolveTrafficInteractions, performHonk,
+  // updateCampusSecrets, updateGoosePose, updateCamera, emitTelemetry, and
+  // the goose prop probe in simulate()) each only gained a single line that
+  // reads `modifiers` or calls one of these; none of them were reordered or
+  // reformatted. `modifiers` is declared here, late in setup, but every
+  // reader above is a closure that is only ever invoked later (inside
+  // frame(), which does not run until the next animation frame), so the
+  // declaration order is safe.
+
+  /** The default Canada-goose palette, restored whenever no skin is active. */
+  const DEFAULT_GOOSE_COLORS: GooseColors = {
+    body: 0x6c5742,
+    breast: 0xf0ead8,
+    neck: 0x171b19,
+    wing: 0x4d4338,
+    beak: 0x171b19,
+  };
+
+  let modifiers: Modifiers = computeModifiers(progress.get().activeMutators);
+  let lastActiveMutatorsKey = progress.get().activeMutators.join(',');
+  // Ids already unlocked before this engine instance started never toast;
+  // only ids that newly appear in the save do.
+  let lastUnlockedMutators = new Set(progress.get().unlockedMutators);
+  let jetstreamToastShown = false;
+  let haloPhase = 0;
+
+  /**
+   * Everything a mutator changes that nothing else already reads live every
+   * frame: the goose's base scale, its material colors, and the halo's
+   * visibility. Called once at startup and again whenever activeMutators
+   * changes (including a reset, where it puts everything back to default).
+   */
+  const applyModifiers = () => {
+    goose.root.scale.setScalar(0.4 * modifiers.gooseScale);
+    const palette = modifiers.colors ?? DEFAULT_GOOSE_COLORS;
+    goose.materials.body.color.setHex(palette.body);
+    goose.materials.breast.color.setHex(palette.breast);
+    goose.materials.neck.color.setHex(palette.neck);
+    goose.materials.wing.color.setHex(palette.wing);
+    goose.materials.beak.color.setHex(palette.beak);
+    goose.halo.visible = modifiers.halo;
+    // Dropping Bronco Goose returns the horse's leash to its authored spot;
+    // while the mutator is active the bronco branch re-homes it every step.
+    if (!modifiers.broncoFollows && broncoSecret) {
+      broncoHome.set(broncoSecret.position.x, broncoSecret.position.z);
+    }
+  };
+
+  /**
+   * Jet Goose forces the jetstream boost on regardless of altitude, so the
+   * natural per-climb toast (armed each time altitudeBoostActive flips on)
+   * would otherwise fire every time the player dips under the release
+   * height and climbs back over it. Everyone else keeps the old behavior.
+   */
+  const announceJetstream = () => {
+    if (modifiers.jetstreamAlways && jetstreamToastShown) return;
+    jetstreamToastShown = true;
+    hooks.onToast('JETSTREAM · 50m altitude speed boost engaged');
+  };
+
+  /** Angel Goose's halo: hidden unless active, gently bobbing and turning. */
+  const animateHalo = (dt: number) => {
+    if (!goose.halo.visible) return;
+    haloPhase += dt * 1.4;
+    goose.halo.position.y = 1.93 + Math.sin(haloPhase) * 0.04;
+    goose.halo.rotation.z += dt * 0.6;
+  };
+
+  /** Party Goose's honk: the same shape as terrorizeCampusCrowd, but it
+   * starts a dance instead of a panic. Kept as its own function (rather than
+   * a flag on terrorizeCampusCrowd) so the grab branch's crowd work never
+   * has to touch this file's panic path. */
+  const partyCampusCrowd = (radius: number, awardable = true) => {
+    const nearby = campusNpcs
+      .map((npc) => ({
+        npc,
+        distance: Math.hypot(
+          npc.position.x - state.position.x,
+          npc.position.z - state.position.z,
+        ),
+      }))
+      .filter(
+        ({ npc, distance }) =>
+          distance <= radius &&
+          Math.abs(state.position.y - npc.ground) < 20 &&
+          npc.mode === 'walk' &&
+          npc.honkCooldown <= 0,
+      )
+      .sort((a, b) => a.distance - b.distance)
+      .slice(0, megaHonkRemaining > 0 ? 22 : 12);
+    let scored = 0;
+    nearby.forEach(({ npc }) => {
+      const canScore = awardable && npc.scoreCooldown <= 0;
+      if (startDanceCampusNpc(npc) && canScore) {
+        npc.scoreCooldown = 8;
+        scored += 1;
+      }
+    });
+    return { panicked: nearby.length, scored };
+  };
+
+  /** The chaosScore >= 10,000 auto-panic timer routes through here so Party
+   * Goose gets a dance floor instead of a stampede. */
+  const applyInfamyReaction = (npc: CampusNpc) => {
+    if (modifiers.honkStyle === 'party') startDanceCampusNpc(npc);
+    else panicCampusNpc(npc, state.position);
+  };
+
+  /** Bronco Goose: any walking student the horse steps within 1.1m of gets
+   * bowled over, same as the goose's own crowd collision. */
+  const trampleNearbyCrowd = (
+    secret: CampusSecret,
+    heading: number,
+    speed: number,
+  ) => {
+    for (const npc of campusNpcs) {
+      if (npc.mode !== 'walk') continue;
+      const dx = npc.position.x - secret.group.position.x;
+      const dz = npc.position.z - secret.group.position.z;
+      if (Math.hypot(dx, dz) > 1.1) continue;
+      const impulse = new THREE.Vector3(
+        Math.sin(heading),
+        0,
+        Math.cos(heading),
+      ).multiplyScalar(speed * 0.6);
+      impulse.y = 3.2;
+      if (!knockDownCampusNpc(npc, impulse)) continue;
+      if (npc.scoreCooldown <= 0) {
+        npc.scoreCooldown = 6;
+        triggerHitStop(0.8);
+        awardChaos(150, 'BRONCO BUSTER', { id: 'bronco-trample' });
+      }
+    }
+  };
+
+  /**
+   * Giga Goose flips who absorbs a car collision: the car eats the impulse
+   * (a hard wobble and a long reaction window) and the goose barely slows,
+   * instead of the goose tumbling. Everyone else keeps the old physics.
+   */
+  const applyTrafficImpact = (
+    car: TrafficCar,
+    normal: THREE.Vector3,
+    severity: number,
+    localX: number,
+    gigaBounce: boolean,
+  ) => {
+    if (gigaBounce) {
+      car.wobbleRemaining = Math.max(car.wobbleRemaining, 2.6);
+      car.reactionRemaining = Math.max(car.reactionRemaining, 2.6);
+      state.velocity.addScaledVector(normal, lerp(0.4, 1.2, severity));
+      state.velocity.multiplyScalar(0.94);
+    } else {
+      state.velocity.addScaledVector(normal, lerp(2, 7, severity));
+      state.velocity.y = Math.max(state.velocity.y, lerp(1.2, 3.5, severity));
+      tumbleRemaining = lerp(0.55, 1.35, severity);
+      tumbleAngularSpeed = lerp(8, 17, severity) * (localX >= 0 ? 1 : -1);
+    }
+  };
+
+  /**
+   * The "Unlocked: <name>" toast reuses the trick/quest-complete queue above
+   * instead of calling hooks.onToast directly: unlocking something that also
+   * completes 'new-feathers' fires a same-tick QUEST COMPLETE score toast via
+   * recordEvent, and the HUD silently drops an 'info' toast that lands right
+   * behind a fresh 'score' one. Queuing behind it (same discipline as a trick
+   * toast queuing behind a quest banner) is how everything else here avoids
+   * that exact collision, so this reuses it rather than fighting it.
+   */
+  const queueInfoToast = (message: string) => {
+    if (scoreToastCooldown <= 0 && pendingToasts.length === 0) {
+      hooks.onToast(message, 'info');
+      scoreToastCooldown = QUEST_TOAST_DELAY;
+      return;
+    }
+    pendingToasts.push({
+      message,
+      priority: 'info',
+      remaining: scoreToastCooldown + pendingToasts.length * QUEST_TOAST_DELAY,
+    });
+  };
+
+  applyModifiers();
+
   resetState(true, false);
+  restoreSavedWorld();
+  // The HUD owns the store, so a wipe can arrive from anywhere. Only a
+  // generation bump is a wipe; every other update is ordinary bookkeeping.
+  // Phase 4: mutators also live here; activeMutators/unlockedMutators are
+  // just more progress fields, and this is already the funnel that watches
+  // the whole store for changes made from anywhere (the HUD's Locker tab
+  // included).
+  const unsubscribeProgress = progress.subscribe((saved) => {
+    // Phase 5: the audio settings and the hit-stop toggle live in the same
+    // store the HUD writes them to, so this funnel is where they land. Both
+    // are cheap idempotent assignments; no diffing is worth the code.
+    audio.setEnabled(saved.settings.sound, saved.settings.ambient);
+    slowMotionEnabled = saved.settings.slowMotion;
+    if (!slowMotionEnabled) {
+      // Turning it off mid-dip should take effect now, not in 0.4 seconds.
+      slowMotionRemaining = 0;
+      timeScale = 1;
+    }
+    if (saved.generation !== progressGeneration) {
+      progressGeneration = saved.generation;
+      forgetSavedWorld();
+      hooks.onToast('Fresh goose · progress wiped');
+      // Fall through: a wipe also empties activeMutators/unlockedMutators,
+      // and the diffing below has to see that to reset modifiers and the
+      // "already announced" unlock set.
+    }
+    const activeKey = saved.activeMutators.join(',');
+    if (activeKey !== lastActiveMutatorsKey) {
+      lastActiveMutatorsKey = activeKey;
+      modifiers = computeModifiers(saved.activeMutators);
+      applyModifiers();
+    }
+    for (const id of saved.unlockedMutators) {
+      if (lastUnlockedMutators.has(id)) continue;
+      lastUnlockedMutators.add(id);
+      // recordEvent completes the 'new-feathers' quest (it listens for
+      // 'unlock') and toasts that through the normal quest path; this toast
+      // is just the separate "you got a new thing" announcement. It goes
+      // through queueInfoToast, and runs after recordEvent, so it queues
+      // behind a same-tick QUEST COMPLETE banner instead of being dropped.
+      recordEvent({ type: 'unlock', mutator: id });
+      queueInfoToast(`Unlocked: ${MUTATOR_BY_ID.get(id)?.name ?? id}`);
+    }
+    if (saved.unlockedMutators.length < lastUnlockedMutators.size) {
+      // A reset (or any other shrink) drops ids the save no longer lists,
+      // so unlocking the same mutator again in a future life still toasts.
+      lastUnlockedMutators = new Set(saved.unlockedMutators);
+    }
+  });
   animationFrame = requestAnimationFrame(frame);
 
   return {
     start() {
-      unlockAudio();
+      audio.unlock();
       playing = true;
       setGameplayVisibility(true);
       previousTime = performance.now();
@@ -6688,7 +8386,7 @@ export function createGooseEngine(
       );
     },
     reset() {
-      unlockAudio();
+      audio.unlock();
       playing = true;
       resetState();
       setGameplayVisibility(true);
@@ -6699,13 +8397,19 @@ export function createGooseEngine(
     },
     setKey(code, pressed) {
       if (pressed) {
-        if (code === 'Space' && !keys.has(code) && tumbleRemaining <= 0) {
-          queuedFlaps = Math.min(2, queuedFlaps + 1);
+        if (code === 'Space' && !keys.has(code)) {
+          // A tap during a tumble used to be dropped, which read as the game
+          // ignoring the player exactly when they wanted out. It now queues a
+          // single flap that fires the moment the tumble ends; flaps still do
+          // not fire during the tumble itself (beginFlapIfNeeded returns
+          // early), so this is a buffered takeoff, not an escape hatch.
+          queuedFlaps = tumbleRemaining > 0 ? 1 : Math.min(2, queuedFlaps + 1);
         }
         if ((code === 'KeyE' || code === 'KeyH') && !keys.has(code)) {
-          unlockAudio();
+          audio.unlock();
           queuedHonks = Math.min(1, queuedHonks + 1);
         }
+        if (code === 'KeyF' && !keys.has(code)) grabQueued = true;
         keys.add(code);
       } else {
         keys.delete(code);
@@ -6742,16 +8446,81 @@ export function createGooseEngine(
       updateCamera(1 / 60, renderState, true);
       map.triggerRepaint();
     },
+    setPaused(next) {
+      if (paused === next) return;
+      paused = next;
+      if (paused) {
+        // Held keys would otherwise still be held when the game comes back.
+        keys.clear();
+        queuedFlaps = 0;
+        queuedHonks = 0;
+        ragdollLatched = false;
+        ragdollSplashLatched = false;
+        // Unpausing into the tail of someone else's hit-stop would read as a
+        // stutter, so the pause spends it.
+        slowMotionRemaining = 0;
+        timeScale = 1;
+      } else {
+        // Whatever real time the pause took is not a physics debt to repay.
+        previousTime = performance.now();
+        accumulator = 0;
+      }
+      emitTelemetry();
+      map.triggerRepaint();
+    },
+    travelTo(secretId) {
+      const secret = campusSecrets.find(
+        (candidate) => candidate.id === secretId,
+      );
+      if (!secret?.found) return false;
+      const toSecretX = secret.position.x - state.position.x;
+      const toSecretZ = secret.position.z - state.position.z;
+      // Arrive on the approach the player is already on, so the landmark is
+      // straight ahead out of the gate rather than somewhere behind a wing.
+      const heading =
+        Math.hypot(toSecretX, toSecretZ) > 1
+          ? Math.atan2(toSecretX, toSecretZ)
+          : state.heading;
+      placeGoose(
+        secret.position.x - Math.sin(heading) * 30,
+        secret.position.z - Math.cos(heading) * 30,
+        heading,
+        28,
+      );
+      sampleSurface();
+      refreshActiveBuildingColliders(true);
+      updateTrees(false);
+      copyState(previousState, state);
+      copyState(renderState, state);
+      updateGoosePose(renderState);
+      updateFlockVisuals(0, renderState);
+      updateCamera(1 / 60, renderState, true);
+      previousTime = performance.now();
+      hooks.onToast(`Traveled to ${secret.group.name}`);
+      emitTelemetry();
+      map.triggerRepaint();
+      return true;
+    },
     destroy() {
       destroyed = true;
       cancelAnimationFrame(animationFrame);
+      unsubscribeProgress();
+      // Bank the tail of this session's play time before the store goes quiet.
+      if (unsavedPlaySeconds > 0) {
+        const banked = unsavedPlaySeconds;
+        unsavedPlaySeconds = 0;
+        progress.update((saved) => {
+          saved.stats.playSeconds += banked;
+        });
+      }
+      progress.flush();
       map.off('idle', onIdle);
       map.off('sourcedata', onSourceData);
       keys.clear();
-      if (audioContext) {
-        void audioContext.close().catch(() => undefined);
-        audioContext = null;
-      }
+      // Before the scene sweep below, so the prop meshes are already out of the
+      // graph and their shared material is only disposed once.
+      propSystem.dispose();
+      audio.dispose();
       scene.traverse((object) => {
         if (
           object instanceof THREE.Mesh ||

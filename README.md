@@ -15,7 +15,7 @@ npm install
 npm run dev
 ```
 
-Open the local address shown in the terminal. `npm run build:pages` produces the static GitHub Pages build in `dist-pages/`.
+Open the local address shown in the terminal. The game saves your progress in the browser. `npm run build:pages` produces the static GitHub Pages build in `dist-pages/`.
 
 ## Controls
 
@@ -26,10 +26,20 @@ Keyboard and mouse:
 - `Space`: tap for one wingbeat, hold for continuous flapping; takes off from the ground or water
 - `Shift`: flare and airbrake (softens landings); brakes while planing on water
 - `E` or `H`: honk (scatters students, stops traffic, recruits geese, triggers secrets)
+- `F`: grab a prop (cone, bench, trash can, bike, sign, flag) or steal a student's item (phone, coffee, sandwich, ID card, umbrella); press again to throw
+- `R`: ragdoll on demand
+- `Tab`: open the quest log
+- `Esc`: open the pause menu (quests, goose locker, fast travel, options); closes any open drawer first
 - Mouse drag: orbit the camera · scroll wheel or the camera buttons: zoom · double-click: reset the camera
 - Respawn button (top right): return to the WMU spawn without losing score or secrets
 
 Touch: on-screen controls appear on phones and tablets. Drag to orbit, pinch to zoom, double-tap to reset the camera.
+
+## Progression
+
+Kalamazoo Goose saves your progress automatically. Complete quests throughout the game to earn tokens, which you spend in the Goose Locker to unlock special abilities and skins. The Locker features five unlockable abilities (Jet, Angel, Giga, Party, Bronco Goose) and cosmetic skins purchased with tokens. Each game's best score, completed quests, and discovered secrets are remembered in your browser.
+
+If you want to start over, the pause menu (press Esc) includes a "Fresh goose" option in settings to wipe all saved progress.
 
 ## World data
 

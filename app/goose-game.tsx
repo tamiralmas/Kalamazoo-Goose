@@ -17,20 +17,26 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronUp,
+  Coins,
   Feather,
   Footprints,
   Gauge,
+  Hand,
+  ListChecks,
   MapPin,
   Mountain,
   Navigation,
+  Pause,
   RotateCcw,
   Radar,
   TriangleAlert,
   Trophy,
   Users,
+  Vault,
   Volume2,
   Waves,
   Wind,
+  X,
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
@@ -44,12 +50,25 @@ import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&ur
 import { Button } from '@/components/ui/button';
 import { TOTAL_CAMPUS_SECRETS } from '@/app/chaos-secrets';
 import { isTouchDevice } from '@/app/device';
+import { CONTROL_CODES } from '@/app/game-contract';
+import type {
+  MutatorDefinition,
+  ProgressState,
+  ProgressStore,
+} from '@/app/game-contract';
 import type {
   FlightMode,
   GameTelemetry,
   GooseEngine,
   ToastPriority,
 } from '@/app/game-engine';
+import { LockerPanel } from '@/app/hud/locker-panel';
+import { PauseMenu } from '@/app/hud/pause-menu';
+import { QuestDrawer } from '@/app/hud/quest-drawer';
+import { useProgress } from '@/app/hud/use-progress';
+import { MUTATOR_BY_ID } from '@/app/mutators';
+import { createProgressStore } from '@/app/progress';
+import { QUESTS } from '@/app/quests';
 import { WMU_SPAWN } from '@/app/world-config';
 import {
   AERIAL_ATTRIBUTION,
@@ -134,6 +153,17 @@ const INITIAL_TELEMETRY: GameTelemetry = {
   duckCouncilEast: 0,
   duckCouncilNorth: 0,
   duckCouncilVisible: false,
+  paused: false,
+  tokens: 0,
+  questsCompleted: 0,
+  questsTotal: QUESTS.length,
+  props: 0,
+  propsAwake: 0,
+  holding: null,
+  activeMutators: [],
+  gooseScale: 1,
+  ragdolling: false,
+  timeScale: 1,
 };
 
 const selectVisibleMinimapSecretIds = (
@@ -203,17 +233,7 @@ const selectVisibleMinimapSecretIds = (
     : next;
 };
 
-const CONTROL_CODES = [
-  'KeyW',
-  'KeyA',
-  'KeyS',
-  'KeyD',
-  'Space',
-  'ShiftLeft',
-  'ShiftRight',
-  'KeyE',
-  'KeyH',
-];
+const CONTROL_CODE_SET = new Set<string>(CONTROL_CODES);
 
 const modeCopy: Record<FlightMode, { label: string; hint: string }> = {
   flying: { label: 'Gliding', hint: 'Stunt, flap, and cause chaos' },
@@ -224,6 +244,23 @@ const modeCopy: Record<FlightMode, { label: string; hint: string }> = {
   waddling: { label: 'Waddling', hint: 'Cause extremely polite gridlock' },
   swimming: { label: 'Swimming', hint: 'Space to take off again' },
 };
+
+/** Display names for `telemetry.holding` (a PropKind | ItemKind id). */
+const HOLDING_NAMES: Record<string, string> = {
+  cone: 'cone',
+  bench: 'bench',
+  trash: 'trash can',
+  bike: 'bike',
+  sign: 'sign',
+  flag: 'flag',
+  phone: 'phone',
+  coffee: 'coffee',
+  sandwich: 'sandwich',
+  'id-card': 'ID card',
+  umbrella: 'umbrella',
+};
+
+const QUEST_PULSE_MS = 900;
 
 type CameraPointer = {
   x: number;
@@ -253,6 +290,11 @@ export function GooseGame() {
   const mapContainerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const engineRef = useRef<GooseEngine | null>(null);
+  const progressRef = useRef<ReturnType<typeof createProgressStore> | null>(
+    null,
+  );
+  const progressStore = (progressRef.current ??= createProgressStore());
+  const progress = useProgress(progressStore);
   const playingRef = useRef(false);
   const toastTimerRef = useRef<number | null>(null);
   const toastRef = useRef<GameToast | null>(null);
@@ -273,6 +315,11 @@ export function GooseGame() {
   >([]);
   const [telemetry, setTelemetry] = useState(INITIAL_TELEMETRY);
   const [toast, setToast] = useState<GameToast | null>(null);
+  const [questDrawerOpen, setQuestDrawerOpen] = useState(false);
+  const [pauseMenuOpen, setPauseMenuOpen] = useState(false);
+  const [launchLockerOpen, setLaunchLockerOpen] = useState(false);
+  const [questPulse, setQuestPulse] = useState(false);
+  const previousCompletedQuestsRef = useRef(progress.completedQuests.length);
 
   const handleTelemetry = useCallback((nextTelemetry: GameTelemetry) => {
     setTelemetry(nextTelemetry);
@@ -705,10 +752,17 @@ export function GooseGame() {
                 .then(({ createGooseEngine }) => {
                   if (cancelled) return;
                   try {
-                    engineRef.current = createGooseEngine(maplibre, map, {
-                      onTelemetry: handleTelemetry,
-                      onToast: showToast,
-                    });
+                    const progress = progressRef.current;
+                    if (!progress) throw new Error('Progress store missing.');
+                    engineRef.current = createGooseEngine(
+                      maplibre,
+                      map,
+                      {
+                        onTelemetry: handleTelemetry,
+                        onToast: showToast,
+                      },
+                      progress,
+                    );
                     setTerrainReady(hasTerrain);
                     setMapReady(true);
                     setMapError(false);
@@ -722,8 +776,17 @@ export function GooseGame() {
             };
 
             const tryTerrainReady = () => {
+              // MapLibre answers 0 until the first DEM tile has decoded, and a
+              // source declared with explicit tiles makes the terrain object
+              // exist immediately. Treat that placeholder like the engine
+              // does (WMU sits near 275 m, so anything under 20 m is not real)
+              // or the goose gets placed at sea level under the terrain.
               const elevation = map.queryTerrainElevation(WMU_SPAWN);
-              if (typeof elevation === 'number' && Number.isFinite(elevation))
+              if (
+                typeof elevation === 'number' &&
+                Number.isFinite(elevation) &&
+                Math.abs(elevation) >= 20
+              )
                 finishWorld(true);
             };
 
@@ -744,13 +807,13 @@ export function GooseGame() {
       });
 
     const onKeyDown = (event: KeyboardEvent) => {
-      if (!CONTROL_CODES.includes(event.code)) return;
+      if (!CONTROL_CODE_SET.has(event.code)) return;
       if (playingRef.current) event.preventDefault();
       keyboardCodesRef.current.add(event.code);
       engineRef.current?.setKey(event.code, true);
     };
     const onKeyUp = (event: KeyboardEvent) => {
-      if (!CONTROL_CODES.includes(event.code)) return;
+      if (!CONTROL_CODE_SET.has(event.code)) return;
       keyboardCodesRef.current.delete(event.code);
       engineRef.current?.setKey(
         event.code,
@@ -811,6 +874,81 @@ export function GooseGame() {
     };
   }, [clearAllControlInputs, handleTelemetry, releaseTouchPointer]);
 
+  // Tab opens/closes the quest drawer; Esc opens/closes the pause menu (or
+  // closes the drawer first, if that is what is open). Neither is wired to
+  // the CONTROL_CODES gameplay input path above.
+  useEffect(() => {
+    const onMenuKeyDown = (event: KeyboardEvent) => {
+      if (!playingRef.current) return;
+      if (event.code === 'Tab') {
+        event.preventDefault();
+        if (pauseMenuOpen) return;
+        setQuestDrawerOpen((open) => !open);
+        return;
+      }
+      if (event.code === 'Escape') {
+        if (questDrawerOpen) {
+          setQuestDrawerOpen(false);
+          return;
+        }
+        const next = !pauseMenuOpen;
+        setPauseMenuOpen(next);
+        engineRef.current?.setPaused(next);
+      }
+    };
+    window.addEventListener('keydown', onMenuKeyDown);
+    return () => window.removeEventListener('keydown', onMenuKeyDown);
+  }, [pauseMenuOpen, questDrawerOpen]);
+
+  // Esc also closes the pre-flight locker modal on the launch card.
+  useEffect(() => {
+    if (!launchLockerOpen) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.code === 'Escape') setLaunchLockerOpen(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [launchLockerOpen]);
+
+  // Brief gold-ring pulse on the Quests toggle whenever a quest finishes
+  // mid-flight. Ref holds the last seen count so a save loaded with quests
+  // already completed never pulses on mount.
+  useEffect(() => {
+    const count = progress.completedQuests.length;
+    const previous = previousCompletedQuestsRef.current;
+    previousCompletedQuestsRef.current = count;
+    if (!playing || count <= previous) return;
+    setQuestPulse(true);
+    const timer = window.setTimeout(() => setQuestPulse(false), QUEST_PULSE_MS);
+    return () => window.clearTimeout(timer);
+  }, [progress.completedQuests.length, playing]);
+
+  // A short debounce sits between an update() and its localStorage write;
+  // flush it immediately whenever the tab may never get another frame.
+  useEffect(() => {
+    const flush = () => progressStore.flush();
+    const onVisibilityChange = () => {
+      if (document.hidden) flush();
+    };
+    window.addEventListener('pagehide', flush);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      window.removeEventListener('pagehide', flush);
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+    };
+  }, [progressStore]);
+
+  const toggleQuestDrawer = () => setQuestDrawerOpen((open) => !open);
+  const closeQuestDrawer = () => setQuestDrawerOpen(false);
+  const openPauseMenu = () => {
+    setPauseMenuOpen(true);
+    engineRef.current?.setPaused(true);
+  };
+  const closePauseMenu = () => {
+    setPauseMenuOpen(false);
+    engineRef.current?.setPaused(false);
+  };
+
   const startGame = () => {
     if (!engineRef.current) return;
     clearAllControlInputs();
@@ -827,6 +965,12 @@ export function GooseGame() {
     setPlaying(true);
     engineRef.current.reset();
     mapContainerRef.current?.focus({ preventScroll: true });
+  };
+
+  const handlePauseRespawn = () => {
+    resetGame();
+    setPauseMenuOpen(false);
+    engineRef.current?.setPaused(false);
   };
 
   const setTouchKey = (
@@ -935,9 +1079,12 @@ export function GooseGame() {
     const previous = cameraPointersRef.current.get(event.pointerId);
     if (!previous) return;
     event.preventDefault();
+    const sensitivity = progress.settings.cameraSensitivity;
     if (cameraPointersRef.current.size === 1) {
-      const yawSensitivity = event.pointerType === 'touch' ? 0.0036 : 0.0045;
-      const pitchSensitivity = event.pointerType === 'touch' ? 0.0028 : 0.0035;
+      const yawSensitivity =
+        (event.pointerType === 'touch' ? 0.0036 : 0.0045) * sensitivity;
+      const pitchSensitivity =
+        (event.pointerType === 'touch' ? 0.0028 : 0.0035) * sensitivity;
       cameraPointersRef.current.set(event.pointerId, {
         ...previous,
         x: event.clientX,
@@ -969,8 +1116,8 @@ export function GooseGame() {
       after[1].y - after[0].y,
     );
     engineRef.current?.orbitCamera(
-      -(newCenterX - oldCenterX) * 0.0045,
-      -(newCenterY - oldCenterY) * 0.0035,
+      -(newCenterX - oldCenterX) * 0.0045 * sensitivity,
+      -(newCenterY - oldCenterY) * 0.0035 * sensitivity,
     );
     if (oldDistance > 1 && newDistance > 1) {
       engineRef.current?.scaleCameraZoom(oldDistance / newDistance);
@@ -984,6 +1131,14 @@ export function GooseGame() {
   };
 
   const mode = modeCopy[telemetry.mode];
+  const holdingName = telemetry.holding
+    ? (HOLDING_NAMES[telemetry.holding] ?? telemetry.holding)
+    : null;
+  const activeAbilityMutators = telemetry.activeMutators
+    .map((id) => MUTATOR_BY_ID.get(id))
+    .filter(
+      (mutator): mutator is MutatorDefinition => mutator?.kind === 'ability',
+    );
   const glideRatio =
     telemetry.glideRatio === null
       ? '—'
@@ -1062,10 +1217,25 @@ export function GooseGame() {
   const secretCompassStyle = {
     '--secret-bearing': `${telemetry.nearestSecretDirection}deg`,
   } as CSSProperties;
+  const touchControlsSetting = progress.settings.touchControls;
+  const dataInput =
+    touchControlsSetting === 'on'
+      ? 'touch'
+      : touchControlsSetting === 'off'
+        ? 'pointer'
+        : undefined;
+  const hasSave =
+    progress.bestScore > 0 ||
+    progress.secretsFound.length > 0 ||
+    progress.completedQuests.length > 0;
+  const equippedNames = progress.activeMutators
+    .map((id) => MUTATOR_BY_ID.get(id)?.name ?? id)
+    .join(', ');
 
   return (
     <main
       className={`game-shell ${playing ? 'is-playing' : 'is-launching'}${minimapOpen ? ' is-minimap-open' : ''}`}
+      data-input={dataInput}
       data-campus-students={telemetry.students}
       data-nearby-students={telemetry.studentsNearby}
       data-students-on-mapped-walkways={telemetry.studentsOnMappedWalkways}
@@ -1095,6 +1265,15 @@ export function GooseGame() {
       }
       data-tree-instances={telemetry.trees}
       data-tree-visuals={playing ? telemetry.trees : 0}
+      data-props={telemetry.props}
+      data-props-awake={telemetry.propsAwake}
+      data-paused={telemetry.paused}
+      data-tokens={telemetry.tokens}
+      data-holding={telemetry.holding ?? ''}
+      data-goose-scale={telemetry.gooseScale.toFixed(2)}
+      data-active-mutators={telemetry.activeMutators.join(' ')}
+      data-ragdolling={telemetry.ragdolling}
+      data-time-scale={telemetry.timeScale.toFixed(2)}
       data-tree-terrain-resolved={telemetry.treesResolved}
       data-flock-size={telemetry.flockSize}
       data-altitude-boost={telemetry.altitudeBoost.toFixed(3)}
@@ -1134,6 +1313,14 @@ export function GooseGame() {
         </div>
         {playing && (
           <div className="top-actions">
+            <button
+              type="button"
+              className="pause-button-touch"
+              aria-label="Pause"
+              onClick={openPauseMenu}
+            >
+              <Pause aria-hidden="true" />
+            </button>
             <div className="camera-toolbar" aria-label="Camera controls">
               <button
                 type="button"
@@ -1210,6 +1397,42 @@ export function GooseGame() {
                 ? 'Map is reconnecting…'
                 : 'Loading 3D campus…'}
           </Button>
+          <Button
+            variant="secondary"
+            className="launch-locker-button"
+            onClick={() => setLaunchLockerOpen(true)}
+          >
+            <Vault /> Goose locker
+          </Button>
+          {hasSave && (
+            <div className="launch-save-summary" aria-label="Saved progress">
+              <span>
+                <Trophy />
+                <strong>{progress.bestScore.toLocaleString()}</strong>
+                <em>Best chaos</em>
+              </span>
+              <span>
+                <Radar />
+                <strong>
+                  {progress.secretsFound.length}/{TOTAL_CAMPUS_SECRETS}
+                </strong>
+                <em>Secrets</em>
+              </span>
+              <span>
+                <ListChecks />
+                <strong>{progress.completedQuests.length}</strong>
+                <em>Quests</em>
+              </span>
+              <span>
+                <Coins />
+                <strong>{progress.tokens}</strong>
+                <em>Tokens</em>
+              </span>
+            </div>
+          )}
+          {hasSave && progress.activeMutators.length > 0 && (
+            <p className="launch-equipped">Equipped: {equippedNames}</p>
+          )}
           <div className="launch-features" aria-label="World data">
             <span>
               <Building2 />
@@ -1230,8 +1453,8 @@ export function GooseGame() {
             ) : (
               <>
                 <span className="desktop-instructions">
-                  Tap Space for one wingbeat · Hold it to climb · E honks ·
-                  Shift flares
+                  Tap Space for one wingbeat · Hold it to climb · E honks · F
+                  grabs · Tab opens quests
                 </span>
                 <span className="touch-instructions">
                   Use the on-screen controls · Hold Flap for continuous
@@ -1241,6 +1464,14 @@ export function GooseGame() {
             )}
           </p>
         </section>
+      )}
+
+      {!playing && launchLockerOpen && (
+        <LaunchLockerModal
+          progress={progress}
+          progressStore={progressStore}
+          onClose={() => setLaunchLockerOpen(false)}
+        />
       )}
 
       {playing && (
@@ -1309,6 +1540,13 @@ export function GooseGame() {
               <small>Chaos</small>
               <strong>{telemetry.score.toLocaleString()}</strong>
             </span>
+            {activeAbilityMutators.length > 0 && (
+              <div className="mobile-abilities-row">
+                {activeAbilityMutators
+                  .map((mutator) => mutator.name)
+                  .join(' · ')}
+              </div>
+            )}
           </section>
 
           <div className="right-hud-stack">
@@ -1367,96 +1605,137 @@ export function GooseGame() {
                   : `COMBO ×${telemetry.combo}`}
               </em>
             </div>
-          </div>
 
-          <aside
-            className={`campus-minimap${minimapOpen ? ' is-open' : ''}`}
-            aria-label="Campus minimap"
-          >
-            <div className="minimap-desktop-title">
-              <span>
-                <MapPin /> Kalamazoo map
-              </span>
-              <small>North up</small>
-            </div>
-            <button
-              type="button"
-              className="minimap-mobile-toggle"
-              aria-expanded={minimapOpen}
-              aria-controls="campus-minimap-panel"
-              onClick={toggleMinimap}
-            >
-              <MapPin />
-              <span>
-                <strong>Kalamazoo map</strong>
-                <small>{minimapOpen ? 'Tap to close' : 'Tap to open'}</small>
-              </span>
-              <ChevronDown className="minimap-toggle-chevron" />
-            </button>
-            <div className="minimap-panel" id="campus-minimap-panel">
-              <figure
-                className="minimap-viewport"
-                aria-label={`Aerial map centered on the goose with ${minimapSecretMarkers.length} nearby secret markers. ${telemetry.nearestSecretDistance === null ? 'All Kalamazoo anomalies found.' : `Nearest anomaly ${nearestSecretLabel}, ${Math.round(telemetry.nearestSecretDistance)} meters away.`}`}
-              >
-                <div
-                  className="minimap-tiles"
-                  style={minimapTileStyle}
-                  aria-hidden="true"
-                >
-                  {minimapTilesEnabled &&
-                    minimapTiles.map((tile) => (
-                      <span
-                        key={tile.key}
-                        className="minimap-tile"
-                        aria-hidden="true"
-                        style={tile.style}
-                      />
-                    ))}
-                </div>
-                <span className="minimap-north" aria-hidden="true">
-                  N
-                </span>
-                {minimapSecretMarkers.map(({ secret, isOffscreen, style }) => (
-                  <span
-                    key={secret.id}
-                    className={`minimap-secret-marker${isOffscreen ? ' is-offscreen' : ''}`}
-                    style={style}
-                    aria-hidden="true"
-                    title={secret.label}
-                  >
-                    <Radar />
+            {activeAbilityMutators.length > 0 && (
+              <div className="abilities-strip" aria-label="Active abilities">
+                {activeAbilityMutators.map((mutator) => (
+                  <span key={mutator.id} className="locker-chip">
+                    {mutator.name}
                   </span>
                 ))}
-                <span
-                  className="minimap-goose-marker"
-                  style={{
-                    transform: `translate(-50%, -50%) rotate(${minimapHeadingDegrees}deg)`,
-                  }}
-                  aria-hidden="true"
-                >
-                  <Bird />
+              </div>
+            )}
+
+            <button
+              type="button"
+              className={`quest-toggle-desktop${questPulse ? ' is-pulse' : ''}`}
+              onClick={toggleQuestDrawer}
+              aria-haspopup="dialog"
+              aria-expanded={questDrawerOpen}
+            >
+              <ListChecks aria-hidden="true" />
+              <span>
+                <small>Quests</small>
+                <strong>
+                  {progress.completedQuests.length}/{QUESTS.length}
+                </strong>
+              </span>
+              <kbd>TAB</kbd>
+            </button>
+          </div>
+
+          <div className="minimap-dock">
+            <button
+              type="button"
+              className={`quest-toggle-touch${questPulse ? ' is-pulse' : ''}`}
+              onClick={toggleQuestDrawer}
+              aria-haspopup="dialog"
+              aria-expanded={questDrawerOpen}
+              aria-label="Quest log"
+            >
+              <ListChecks aria-hidden="true" />
+            </button>
+            <aside
+              className={`campus-minimap${minimapOpen ? ' is-open' : ''}`}
+              aria-label="Campus minimap"
+            >
+              <div className="minimap-desktop-title">
+                <span>
+                  <MapPin /> Kalamazoo map
                 </span>
-                <figcaption className="sr-only">
-                  <span>Secret markers:</span>
-                  <ul>
-                    {minimapSecretMarkers.map(({ secret }) => (
-                      <li key={secret.id}>
-                        {secret.label} — nearby and undiscovered
-                      </li>
-                    ))}
-                  </ul>
-                </figcaption>
-              </figure>
-              <a
-                className="minimap-attribution"
-                href={AERIAL_INFORMATION_URL}
-                target="_blank"
-                rel="noreferrer"
+                <small>North up</small>
+              </div>
+              <button
+                type="button"
+                className="minimap-mobile-toggle"
+                aria-expanded={minimapOpen}
+                aria-controls="campus-minimap-panel"
+                onClick={toggleMinimap}
               >
-                MiSAIL imagery · State of Michigan
-              </a>
-            </div>
-          </aside>
+                <MapPin />
+                <span>
+                  <strong>Kalamazoo map</strong>
+                  <small>{minimapOpen ? 'Tap to close' : 'Tap to open'}</small>
+                </span>
+                <ChevronDown className="minimap-toggle-chevron" />
+              </button>
+              <div className="minimap-panel" id="campus-minimap-panel">
+                <figure
+                  className="minimap-viewport"
+                  aria-label={`Aerial map centered on the goose with ${minimapSecretMarkers.length} nearby secret markers. ${telemetry.nearestSecretDistance === null ? 'All Kalamazoo anomalies found.' : `Nearest anomaly ${nearestSecretLabel}, ${Math.round(telemetry.nearestSecretDistance)} meters away.`}`}
+                >
+                  <div
+                    className="minimap-tiles"
+                    style={minimapTileStyle}
+                    aria-hidden="true"
+                  >
+                    {minimapTilesEnabled &&
+                      minimapTiles.map((tile) => (
+                        <span
+                          key={tile.key}
+                          className="minimap-tile"
+                          aria-hidden="true"
+                          style={tile.style}
+                        />
+                      ))}
+                  </div>
+                  <span className="minimap-north" aria-hidden="true">
+                    N
+                  </span>
+                  {minimapSecretMarkers.map(
+                    ({ secret, isOffscreen, style }) => (
+                      <span
+                        key={secret.id}
+                        className={`minimap-secret-marker${isOffscreen ? ' is-offscreen' : ''}`}
+                        style={style}
+                        aria-hidden="true"
+                        title={secret.label}
+                      >
+                        <Radar />
+                      </span>
+                    ),
+                  )}
+                  <span
+                    className="minimap-goose-marker"
+                    style={{
+                      transform: `translate(-50%, -50%) rotate(${minimapHeadingDegrees}deg)`,
+                    }}
+                    aria-hidden="true"
+                  >
+                    <Bird />
+                  </span>
+                  <figcaption className="sr-only">
+                    <span>Secret markers:</span>
+                    <ul>
+                      {minimapSecretMarkers.map(({ secret }) => (
+                        <li key={secret.id}>
+                          {secret.label} — nearby and undiscovered
+                        </li>
+                      ))}
+                    </ul>
+                  </figcaption>
+                </figure>
+                <a
+                  className="minimap-attribution"
+                  href={AERIAL_INFORMATION_URL}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  MiSAIL imagery · State of Michigan
+                </a>
+              </div>
+            </aside>
+          </div>
 
           {telemetry.altitudeBoost > 0 && (
             <div className="jetstream-indicator">
@@ -1477,6 +1756,14 @@ export function GooseGame() {
               )}
               {mode.label}
             </span>
+            {holdingName && (
+              <span className="carry-chip">
+                <Hand aria-hidden="true" />
+                Carrying {holdingName}
+                <b className="desktop-instructions">· F to throw</b>
+                <b className="touch-instructions">· Grab to throw</b>
+              </span>
+            )}
             <span>{mode.hint}</span>
           </div>
 
@@ -1505,12 +1792,25 @@ export function GooseGame() {
             <span>
               <kbd>E</kbd> honk
             </span>
+            <span>
+              <kbd>F</kbd> grab / throw
+            </span>
+            <span>
+              <kbd>R</kbd> ragdoll
+            </span>
             <i />
             <span>
               <kbd>DRAG</kbd> camera
             </span>
             <span>
               <kbd>SCROLL</kbd> zoom
+            </span>
+            <i />
+            <span>
+              <kbd>TAB</kbd> quests
+            </span>
+            <span>
+              <kbd>ESC</kbd> menu
             </span>
           </div>
 
@@ -1608,6 +1908,31 @@ export function GooseGame() {
             <div className="touch-actions">
               <button
                 type="button"
+                className="grab-action"
+                aria-label="Grab"
+                aria-pressed="false"
+                data-control-code="KeyF"
+                data-control-group="action"
+                data-pressed="false"
+                data-holding={telemetry.holding ? 'true' : 'false'}
+                onPointerDown={(event) =>
+                  setTouchKey(event, 'KeyF', 'action', true)
+                }
+                onPointerUp={(event) =>
+                  setTouchKey(event, 'KeyF', 'action', false)
+                }
+                onPointerCancel={(event) =>
+                  setTouchKey(event, 'KeyF', 'action', false)
+                }
+                onLostPointerCapture={(event) =>
+                  setTouchKey(event, 'KeyF', 'action', false)
+                }
+              >
+                <Hand />
+                <span>Grab</span>
+              </button>
+              <button
+                type="button"
                 className="honk-action"
                 aria-label="Honk"
                 aria-pressed="false"
@@ -1679,6 +2004,24 @@ export function GooseGame() {
               </button>
             </div>
           </div>
+
+          <QuestDrawer
+            open={questDrawerOpen}
+            progress={progress}
+            onClose={closeQuestDrawer}
+          />
+          <PauseMenu
+            open={pauseMenuOpen}
+            progress={progress}
+            progressStore={progressStore}
+            secretMarkers={telemetry.secretMarkers}
+            onClose={closePauseMenu}
+            onRespawn={handlePauseRespawn}
+            onResetCamera={() => engineRef.current?.resetCamera()}
+            travelTo={(secretId) =>
+              engineRef.current?.travelTo(secretId) ?? false
+            }
+          />
         </>
       )}
 
@@ -1753,5 +2096,58 @@ export function GooseGame() {
         </span>
       </footer>
     </main>
+  );
+}
+
+/**
+ * Pre-flight locker: same store and panel as the pause menu's Locker tab,
+ * reusing its card styling. No engine to pause here, so this is just a modal.
+ */
+function LaunchLockerModal({
+  progress,
+  progressStore,
+  onClose,
+}: {
+  progress: ProgressState;
+  progressStore: ProgressStore;
+  onClose: () => void;
+}) {
+  return (
+    <div className="pause-menu-backdrop">
+      {/* A styled div rather than a native <dialog>: see the same note in
+          app/hud/pause-menu.tsx. */}
+      {/* oxlint-disable jsx-a11y/prefer-tag-over-role -- see note above */}
+      <div
+        className="pause-menu-card"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Goose locker"
+      >
+        {/* oxlint-enable jsx-a11y/prefer-tag-over-role */}
+        <header className="pause-menu-head">
+          <h2>Goose locker</h2>
+          <button
+            type="button"
+            className="pause-menu-close"
+            onClick={onClose}
+            aria-label="Close goose locker"
+          >
+            <X aria-hidden="true" />
+          </button>
+        </header>
+        <div className="pause-menu-body" role="tabpanel">
+          <LockerPanel progress={progress} progressStore={progressStore} />
+        </div>
+        <footer className="pause-menu-actions">
+          <button
+            type="button"
+            className="pause-menu-primary"
+            onClick={onClose}
+          >
+            Close
+          </button>
+        </footer>
+      </div>
+    </div>
   );
 }

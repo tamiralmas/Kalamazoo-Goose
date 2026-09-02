@@ -1,5 +1,7 @@
 import * as THREE from 'three';
 
+import type { ItemKind } from './game-contract';
+
 export const MAX_CAMPUS_NPCS = 84;
 
 export type CrowdRoute = {
@@ -10,7 +12,15 @@ export type CrowdRoute = {
   isMappedWalkway?: boolean;
 };
 
-export type CampusNpcMode = 'walk' | 'flee' | 'ragdoll' | 'recover';
+// 'chase' is the Phase 3 theft reaction and 'dance' the Phase 4 Party Goose
+// reaction; both are additive to the walk/flee/ragdoll/recover machinery.
+export type CampusNpcMode =
+  | 'walk'
+  | 'flee'
+  | 'ragdoll'
+  | 'recover'
+  | 'chase'
+  | 'dance';
 
 export type GroundSampler = (
   east: number,
@@ -53,6 +63,8 @@ export type CampusNpc = {
   trousersColor: number;
   skinColor: number;
   paletteKey: number;
+  /** Phase 3: what this student is carrying, or null once the goose has it. */
+  item: ItemKind | null;
 };
 
 export type CrowdFleet = {
@@ -64,6 +76,8 @@ export type CrowdFleet = {
   leftLegs: THREE.InstancedMesh;
   rightLegs: THREE.InstancedMesh;
   colorKeys: Int32Array;
+  /** Phase 3: one instanced mesh per carried item kind. */
+  items: Record<ItemKind, THREE.InstancedMesh>;
 };
 
 const WALK_ACCELERATION = 2.8;
@@ -238,6 +252,301 @@ function beginRecovery(npc: CampusNpc, groundAt: GroundSampler) {
   npc.ragdollAngularVelocity.set(0, 0, 0);
 }
 
+// ---------------------------------------------------------------------------
+// Phase 3: carried items and the chase after a theft.
+//
+// Everything below is self-contained: item art, the deterministic "who carries
+// what" roll, and the chase mode a robbed student runs in. The engine supplies
+// the goose position and a building resolver the same way it already supplies
+// groundAt, so this file still knows nothing about the world.
+// ---------------------------------------------------------------------------
+
+/** Draw order for the per-kind instanced meshes; also the engine's iteration order. */
+export const CAMPUS_ITEM_KINDS: readonly ItemKind[] = [
+  'phone',
+  'coffee',
+  'sandwich',
+  'id-card',
+  'umbrella',
+];
+
+/** Share of students carrying anything at all. */
+const ITEM_CARRY_CHANCE = 0.7;
+/** Cumulative shares within the carriers: phone 30%, coffee 25%, and so on. */
+const ITEM_SHARES: ReadonlyArray<{ kind: ItemKind; upTo: number }> = [
+  { kind: 'phone', upTo: 0.3 },
+  { kind: 'coffee', upTo: 0.55 },
+  { kind: 'sandwich', upTo: 0.75 },
+  { kind: 'id-card', upTo: 0.9 },
+  { kind: 'umbrella', upTo: 1 },
+];
+
+const CHASE_SPEED = 4.6;
+/** How long a robbed student is willing to run before giving up. */
+export const CAMPUS_CHASE_SECONDS = 8;
+/** Backstop: a chase whose owner forgot about it still ends on its own. */
+const CHASE_HARD_LIMIT = CAMPUS_CHASE_SECONDS + 2;
+const CHASE_ACCELERATION = 8.5;
+/** Half a shoulder width; keeps a sprinting student out of walls. */
+const CHASE_BODY_RADIUS = 0.45;
+
+/** How far past the shoulder joint the hand (and whatever is in it) sits. */
+const ITEM_HAND_DROP = 0.34;
+/** Resting tilt in the hand, so a phone reads as a screen and a card as a card. */
+const ITEM_HAND_TILT: Record<ItemKind, number> = {
+  phone: 0.32,
+  coffee: 0,
+  sandwich: 0.1,
+  'id-card': 0.26,
+  umbrella: 0.12,
+};
+
+const chaseHeading = new THREE.Vector3();
+const itemPartPosition = new THREE.Vector3();
+const itemPartEuler = new THREE.Euler();
+const itemPartQuaternion = new THREE.Quaternion();
+const itemPartScale = new THREE.Vector3(1, 1, 1);
+const itemPartMatrix = new THREE.Matrix4();
+
+type ItemPart = {
+  geometry: THREE.BufferGeometry;
+  color: number;
+  x?: number;
+  y?: number;
+  z?: number;
+  rotationX?: number;
+  rotationZ?: number;
+};
+
+/**
+ * Bakes a two-tone item into one geometry with vertex colors, so a phone is a
+ * dark slab with a bright face and still costs exactly one instanced draw for
+ * every phone on campus. Same trick props.ts uses for its street furniture;
+ * duplicated rather than shared because props.ts imports this file, and a
+ * circular import for forty lines of geometry is a bad trade.
+ */
+function mergeItemParts(parts: ItemPart[]) {
+  const chunks = parts.map((part) => {
+    const source = part.geometry;
+    const geometry = source.index ? source.toNonIndexed() : source;
+    itemPartPosition.set(part.x ?? 0, part.y ?? 0, part.z ?? 0);
+    itemPartEuler.set(part.rotationX ?? 0, 0, part.rotationZ ?? 0, 'XYZ');
+    itemPartQuaternion.setFromEuler(itemPartEuler);
+    itemPartMatrix.compose(itemPartPosition, itemPartQuaternion, itemPartScale);
+    geometry.applyMatrix4(itemPartMatrix);
+    if (geometry !== source) source.dispose();
+    return { geometry, color: new THREE.Color(part.color) };
+  });
+
+  let total = 0;
+  for (const chunk of chunks) {
+    total += chunk.geometry.getAttribute('position').count;
+  }
+  const positions = new Float32Array(total * 3);
+  const normals = new Float32Array(total * 3);
+  const colors = new Float32Array(total * 3);
+  let offset = 0;
+  for (const chunk of chunks) {
+    const position = chunk.geometry.getAttribute('position');
+    const normal = chunk.geometry.getAttribute('normal');
+    for (let index = 0; index < position.count; index += 1) {
+      const write = (offset + index) * 3;
+      positions[write] = position.getX(index);
+      positions[write + 1] = position.getY(index);
+      positions[write + 2] = position.getZ(index);
+      normals[write] = normal ? normal.getX(index) : 0;
+      normals[write + 1] = normal ? normal.getY(index) : 1;
+      normals[write + 2] = normal ? normal.getZ(index) : 0;
+      colors[write] = chunk.color.r;
+      colors[write + 1] = chunk.color.g;
+      colors[write + 2] = chunk.color.b;
+    }
+    offset += position.count;
+    chunk.geometry.dispose();
+  }
+
+  const merged = new THREE.BufferGeometry();
+  merged.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  merged.setAttribute('normal', new THREE.BufferAttribute(normals, 3));
+  merged.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  return merged;
+}
+
+/** Item origin is the middle of the grip, so the same mesh works in a hand or a beak. */
+export function buildCampusItemGeometry(kind: ItemKind) {
+  if (kind === 'phone') {
+    return mergeItemParts([
+      { geometry: new THREE.BoxGeometry(0.07, 0.14, 0.01), color: 0x1b1e22 },
+      {
+        geometry: new THREE.BoxGeometry(0.056, 0.118, 0.002),
+        color: 0x9fd8e8,
+        z: 0.007,
+      },
+    ]);
+  }
+  if (kind === 'coffee') {
+    return mergeItemParts([
+      {
+        geometry: new THREE.CylinderGeometry(0.05, 0.042, 0.1, 9),
+        color: 0xf4f1ea,
+      },
+      {
+        geometry: new THREE.CylinderGeometry(0.052, 0.05, 0.032, 9),
+        color: 0x6b4227,
+        y: -0.01,
+      },
+      {
+        geometry: new THREE.CylinderGeometry(0.052, 0.052, 0.012, 9),
+        color: 0x2f2723,
+        y: 0.056,
+      },
+    ]);
+  }
+  if (kind === 'sandwich') {
+    return mergeItemParts([
+      { geometry: new THREE.BoxGeometry(0.12, 0.05, 0.12), color: 0xd8b072 },
+      {
+        geometry: new THREE.BoxGeometry(0.126, 0.014, 0.126),
+        color: 0x8fae5c,
+        y: 0.004,
+      },
+    ]);
+  }
+  if (kind === 'id-card') {
+    return mergeItemParts([
+      { geometry: new THREE.BoxGeometry(0.09, 0.055, 0.004), color: 0xd7a12c },
+      {
+        geometry: new THREE.BoxGeometry(0.09, 0.014, 0.006),
+        color: 0x4b2e19,
+        y: 0.016,
+      },
+    ]);
+  }
+  // A closed umbrella: a long thin canopy on a stick, 0.35 m end to end.
+  return mergeItemParts([
+    { geometry: new THREE.ConeGeometry(0.045, 0.24, 7), color: 0x35507e },
+    {
+      geometry: new THREE.CylinderGeometry(0.008, 0.008, 0.14, 6),
+      color: 0x2c2723,
+      y: -0.18,
+    },
+  ]);
+}
+
+export function createCampusItemMaterial() {
+  return new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    roughness: 0.78,
+    metalness: 0.05,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
+  });
+}
+
+/**
+ * Who carries what, decided from the NPC index alone: the same student always
+ * has the same phone, across a recycle, a respawn and a reload.
+ */
+export function chooseCampusNpcItem(index: number): ItemKind | null {
+  // Salt 35 on purpose: the crowd is a fixed 84 indices, and over exactly those
+  // this salt lands 59 carriers (70%) with all five kinds represented in
+  // roughly the intended split. A prettier-looking salt leaves a third of the
+  // campus empty-handed.
+  const roll = random01(index, 35);
+  if (roll >= ITEM_CARRY_CHANCE) return null;
+  const share = roll / ITEM_CARRY_CHANCE;
+  for (const entry of ITEM_SHARES) {
+    if (share < entry.upTo) return entry.kind;
+  }
+  return 'umbrella';
+}
+
+export type CampusChaseContext = {
+  /** Where the thief is right now. */
+  target: THREE.Vector3;
+  /** Shove a sprinting student back out of any building it runs into. */
+  avoidBuildings?: (point: THREE.Vector3, radius: number) => void;
+};
+
+/** Rob a student: it leaves its route and comes after the goose. */
+export function startCampusNpcChase(npc: CampusNpc) {
+  if (npc.mode === 'ragdoll' || npc.mode === 'recover') return false;
+  npc.mode = 'chase';
+  npc.modeTime = 0;
+  npc.speed = Math.max(npc.speed, npc.walkSpeed);
+  // A student sprinting after its own phone is not going to be scattered by a
+  // honk on the way, so hold the panic cooldown open for the whole chase.
+  npc.honkCooldown = Math.max(npc.honkCooldown, CAMPUS_CHASE_SECONDS);
+  return true;
+}
+
+/**
+ * Give up and walk back. The route distance the student left from is stale
+ * after a sprint, so sample a spread of distances around it and rejoin at
+ * whichever one is actually closest, then let the existing recovery slide
+ * carry the body back onto the path.
+ */
+export function resumeCampusNpcRoute(npc: CampusNpc, groundAt: GroundSampler) {
+  let bestDistance = npc.distance;
+  let bestOffset = Number.POSITIVE_INFINITY;
+  for (let step = -8; step <= 8; step += 1) {
+    const candidate = clamp(npc.distance + step * 5, 0, npc.route.total);
+    sampleCrowdRoute(npc.route, candidate, samplePosition, sampleDirection);
+    const dx = samplePosition.x - npc.position.x;
+    const dz = samplePosition.z - npc.position.z;
+    const offset = dx * dx + dz * dz;
+    if (offset >= bestOffset) continue;
+    bestOffset = offset;
+    bestDistance = candidate;
+  }
+  npc.distance = bestDistance;
+  // The chaser is on its feet, so the recovery starts from an upright pose
+  // rather than from whatever a ragdoll left behind.
+  uprightEuler.set(0, Math.atan2(npc.direction.x, npc.direction.z), 0, 'YXZ');
+  npc.ragdollRotation.setFromEuler(uprightEuler);
+  npc.previousRagdollRotation.copy(npc.ragdollRotation);
+  beginRecovery(npc, groundAt);
+}
+
+/** Straight-line pursuit off the route, at a speed a goose can only just beat. */
+function updateChaseNpc(
+  npc: CampusNpc,
+  step: number,
+  groundAt: GroundSampler,
+  chase: CampusChaseContext | undefined,
+) {
+  if (!chase || npc.modeTime > CHASE_HARD_LIMIT) {
+    resumeCampusNpcRoute(npc, groundAt);
+    return;
+  }
+  chaseHeading.copy(chase.target).sub(npc.position);
+  chaseHeading.y = 0;
+  if (chaseHeading.lengthSq() > 0.0004) {
+    chaseHeading.normalize();
+    npc.direction.copy(chaseHeading);
+  }
+  npc.speed = moveToward(npc.speed, CHASE_SPEED, CHASE_ACCELERATION * step);
+  npc.position.addScaledVector(npc.direction, npc.speed * step);
+  chase.avoidBuildings?.(npc.position, CHASE_BODY_RADIUS);
+
+  npc.groundRefreshRemaining -= step;
+  if (npc.groundRefreshRemaining <= 0) {
+    npc.groundRefreshRemaining = 0.2 + random01(npc.index, 31) * 0.1;
+    npc.targetGround = safeGround(
+      groundAt,
+      npc.position.x,
+      npc.position.z,
+      npc.targetGround,
+    );
+  }
+  npc.ground += (npc.targetGround - npc.ground) * (1 - Math.exp(-12 * step));
+  npc.position.y = npc.ground;
+  npc.gaitPhase = (npc.gaitPhase + npc.speed * step * 7.4) % TWO_PI;
+}
+
 export function createCrowdFleet(capacity: number): CrowdFleet {
   const safeCapacity = Math.max(1, Math.floor(capacity));
   const skinMaterial = new THREE.MeshStandardMaterial({
@@ -319,6 +628,27 @@ export function createCrowdFleet(capacity: number): CrowdFleet {
 
   const colorKeys = new Int32Array(safeCapacity);
   colorKeys.fill(-1);
+
+  // Phase 3: carried items. One mesh per kind, all sharing a material; a kind
+  // nobody is carrying this frame simply draws zero instances.
+  const itemMaterial = createCampusItemMaterial();
+  const items = {} as Record<ItemKind, THREE.InstancedMesh>;
+  for (const kind of CAMPUS_ITEM_KINDS) {
+    const mesh = new THREE.InstancedMesh(
+      buildCampusItemGeometry(kind),
+      itemMaterial,
+      safeCapacity,
+    );
+    mesh.name = `Campus items (${kind})`;
+    mesh.count = 0;
+    mesh.frustumCulled = false;
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    mesh.castShadow = false;
+    mesh.receiveShadow = false;
+    mesh.visible = false;
+    items[kind] = mesh;
+  }
+
   return {
     capacity: safeCapacity,
     heads,
@@ -328,6 +658,7 @@ export function createCrowdFleet(capacity: number): CrowdFleet {
     leftLegs,
     rightLegs,
     colorKeys,
+    items,
   };
 }
 
@@ -413,6 +744,7 @@ export function createCampusNpc(
     trousersColor: TROUSERS_COLORS[trousersIndex],
     skinColor: SKIN_COLORS[skinIndex],
     paletteKey,
+    item: chooseCampusNpcItem(index),
   };
 }
 
@@ -433,6 +765,23 @@ export function panicCampusNpc(npc: CampusNpc, source: THREE.Vector3) {
   npc.modeTime = 0;
   npc.panicDuration = 2.8 + random01(npc.index, 37) * 1.9;
   npc.speed = Math.max(npc.speed, npc.walkSpeed * 1.5);
+  npc.honkCooldown = Math.max(npc.honkCooldown, 5.5);
+  return true;
+}
+
+/**
+ * Phase 4: mutators, Party Goose. A calm walker starts dancing in place for
+ * 4 seconds; simulateCampusNpc's own 'dance' branch returns it to 'walk'.
+ * Additive: only ever called from the party honk path, never from panic.
+ */
+export function startDanceCampusNpc(npc: CampusNpc) {
+  if (npc.mode !== 'walk') return false;
+  npc.mode = 'dance';
+  npc.modeTime = 0;
+  // Reuse the flee-duration field as the dance timer; nothing else reads it
+  // while the mode is 'dance'.
+  npc.panicDuration = 4;
+  npc.speed = 0;
   npc.honkCooldown = Math.max(npc.honkCooldown, 5.5);
   return true;
 }
@@ -471,6 +820,7 @@ export function simulateCampusNpc(
   dt: number,
   elapsed: number,
   groundAt: GroundSampler,
+  chase?: CampusChaseContext,
 ) {
   const step = clamp(dt, 0, 0.05);
   if (step <= 0) return;
@@ -566,6 +916,23 @@ export function simulateCampusNpc(
     return;
   }
 
+  if (npc.mode === 'chase') {
+    updateChaseNpc(npc, step, groundAt, chase);
+    return;
+  }
+
+  // Phase 4: mutators, Party Goose. Stationary for its duration, then back
+  // to walking; the visual (bob, raised arms, slow spin) lives in
+  // updateCrowdVisuals below.
+  if (npc.mode === 'dance') {
+    if (npc.modeTime > npc.panicDuration) {
+      npc.mode = 'walk';
+      npc.modeTime = 0;
+    }
+    npc.gaitPhase = (npc.gaitPhase + step * 3.2) % TWO_PI;
+    return;
+  }
+
   if (npc.mode === 'flee' && npc.modeTime >= npc.panicDuration) {
     npc.mode = 'walk';
     npc.modeTime = 0;
@@ -626,6 +993,40 @@ export function updateCrowdVisuals(
     localMatrix.compose(localPosition, localRotation, localScale);
     finalMatrix.multiplyMatrices(worldMatrix, localMatrix);
     mesh.setMatrixAt(index, finalMatrix);
+  };
+
+  // Phase 3: carried items. Each kind fills its own instanced mesh from the
+  // front, so the draw count is exactly the number of students carrying that
+  // thing right now and a stolen item disappears by not being written.
+  const itemSlots: Record<ItemKind, number> = {
+    phone: 0,
+    coffee: 0,
+    sandwich: 0,
+    'id-card': 0,
+    umbrella: 0,
+  };
+  const placeCarriedItem = (
+    npc: CampusNpc,
+    x: number,
+    y: number,
+    z: number,
+    rotationX: number,
+  ) => {
+    const kind = npc.item;
+    if (!kind) return;
+    const mesh = fleet.items[kind];
+    const slot = itemSlots[kind];
+    if (slot >= fleet.capacity) return;
+    itemSlots[kind] = slot + 1;
+    // A cup stays upright however hard its owner is running.
+    placePart(
+      mesh,
+      slot,
+      x,
+      y,
+      z,
+      kind === 'coffee' ? 0 : rotationX + ITEM_HAND_TILT[kind],
+    );
   };
 
   for (let index = 0; index < count; index += 1) {
@@ -710,6 +1111,33 @@ export function updateCrowdVisuals(
         0,
         -ragdollAmount * 0.28,
       );
+      placeCarriedItem(npc, 0.3, -0.05, 0.06, flail);
+      continue;
+    }
+
+    // Phase 4: mutators, Party Goose. Stationary bob, arms up, slow spin.
+    if (npc.mode === 'dance') {
+      rootPosition.lerpVectors(
+        npc.previousPosition,
+        npc.position,
+        interpolation,
+      );
+      rootScale.setScalar(npc.heightScale);
+      const bob =
+        Math.abs(Math.sin(elapsed * 6 + npc.index * 1.3)) *
+        0.12 *
+        npc.heightScale;
+      rootPosition.y += bob;
+      rootEuler.set(0, npc.modeTime * 1.8 + npc.index, 0, 'YXZ');
+      rootRotation.setFromEuler(rootEuler);
+      worldMatrix.compose(rootPosition, rootRotation, rootScale);
+      const wave = Math.sin(elapsed * 9 + npc.index * 1.7) * 0.3;
+      placePart(fleet.torsos, index, 0, 1.1, 0);
+      placePart(fleet.heads, index, 0, 1.58, 0.015, 0, wave * 0.3, 0);
+      placePart(fleet.leftArms, index, -0.25, 1.11, 0, -2.6 + wave, 0, 0.08);
+      placePart(fleet.rightArms, index, 0.25, 1.11, 0, -2.6 - wave, 0, -0.08);
+      placePart(fleet.leftLegs, index, -0.11, 0.8, 0, 0);
+      placePart(fleet.rightLegs, index, 0.11, 0.8, 0, 0);
       continue;
     }
 
@@ -722,7 +1150,8 @@ export function updateCrowdVisuals(
     if (rootDirection.lengthSq() < 0.0001) rootDirection.copy(npc.direction);
     rootDirection.normalize();
     const heading = Math.atan2(rootDirection.x, rootDirection.z);
-    const fleeing = npc.mode === 'flee';
+    const chasing = npc.mode === 'chase';
+    const fleeing = npc.mode === 'flee' || chasing;
     const gait = Math.sin(npc.gaitPhase + interpolation * npc.speed * 0.08);
     const bob = Math.abs(gait) * (fleeing ? 0.035 : 0.018) * npc.heightScale;
     rootPosition.y += bob;
@@ -734,7 +1163,7 @@ export function updateCrowdVisuals(
     );
     rootRotation.setFromEuler(rootEuler);
     worldMatrix.compose(rootPosition, rootRotation, rootScale);
-    const limbSwing = gait * (fleeing ? 0.72 : 0.42);
+    const limbSwing = gait * (chasing ? 1.05 : fleeing ? 0.72 : 0.42);
     placePart(fleet.torsos, index, 0, 1.1, 0);
     placePart(
       fleet.heads,
@@ -750,6 +1179,13 @@ export function updateCrowdVisuals(
     placePart(fleet.rightArms, index, 0.25, 1.11, 0, -limbSwing, 0, -0.08);
     placePart(fleet.leftLegs, index, -0.11, 0.8, 0, -limbSwing);
     placePart(fleet.rightLegs, index, 0.11, 0.8, 0, limbSwing);
+    placeCarriedItem(
+      npc,
+      0.24,
+      1.11 - ITEM_HAND_DROP * Math.cos(limbSwing),
+      ITEM_HAND_DROP * Math.sin(limbSwing),
+      -limbSwing,
+    );
   }
 
   const meshes = [
@@ -764,6 +1200,11 @@ export function updateCrowdVisuals(
     mesh.count = count;
     mesh.instanceMatrix.needsUpdate = true;
   });
+  for (const kind of CAMPUS_ITEM_KINDS) {
+    const mesh = fleet.items[kind];
+    mesh.count = itemSlots[kind];
+    mesh.instanceMatrix.needsUpdate = true;
+  }
   if (headColorsChanged && fleet.heads.instanceColor) {
     fleet.heads.instanceColor.needsUpdate = true;
   }
