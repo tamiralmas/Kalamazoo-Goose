@@ -24,7 +24,7 @@ import type {
 } from './game-contract';
 
 /** Total live bodies across every kind. Sized for the perf budget, not the art. */
-const PROP_CAPACITY = 160;
+export const PROP_CAPACITY = 240;
 /** Mirrors FLIGHT.mass in game-engine.ts; the impulse split needs both masses. */
 const GOOSE_MASS = 4.5;
 const GRAVITY = 9.81;
@@ -46,8 +46,26 @@ const POI_RECYCLE_DISTANCE = 1_600;
 const POI_RECYCLE_INTERVAL = 0.8;
 const GROUND_REFRESH_SECONDS = 0.09;
 const BUILDING_REFRESH_SECONDS = 0.12;
-/** Sleeping props re-sample terrain a couple at a time so a late DEM lands them. */
-const SETTLE_PER_STEP = 2;
+/**
+ * Sleeping props re-sample terrain in a rolling sweep, so a DEM tile that
+ * decodes a minute after spawn still lands every prop it covers. The whole
+ * population is covered once per this many seconds no matter how many props
+ * there are.
+ */
+const SETTLE_SWEEP_SECONDS = 2;
+/** A ground change smaller than this is DEM noise, not a new surface. */
+const SETTLE_GROUND_EPSILON = 0.05;
+/**
+ * How long after spawning (or after a reset) an untouched prop keeps
+ * re-anchoring its home to wherever the world puts it. Settling on a slope,
+ * being shoved out of a wall by resolveBuilding() or dropping onto terrain
+ * that resolved late are all the world moving the prop, not chaos.
+ */
+const SETTLE_SECONDS = 2;
+/** Hand-placed and POI props keep this far clear of a mapped road corridor. */
+const ROAD_PROP_CLEARANCE = 2.5;
+/** Cones belong on the shoulder, so they only refuse the lane centerline. */
+const CONE_LANE_CLEARANCE = 1.2;
 const TWO_PI = Math.PI * 2;
 
 const KIND_ORDER: readonly PropKind[] = [
@@ -143,6 +161,20 @@ export type PropSystemOptions = {
   groundAt: PropGroundSampler;
   isWater: (east: number, north: number) => boolean;
   resolveBuilding: PropBuildingResolver;
+  /**
+   * True when a prop at (east, north) would stand within `clearance` meters of
+   * a mapped vehicle road corridor. A bench parked on the shoulder gets plowed
+   * by traffic all game and hands the player points it never earned, so
+   * spawning refuses those spots outright. The engine owns the corridor
+   * geometry; the clearances are prop policy and are passed in.
+   */
+  isRoad?: (east: number, north: number, clearance: number) => boolean;
+  /**
+   * True when (east, north) is within `clearance` meters of a traffic lane
+   * centerline. Cones are the one kind that belongs beside a road, so they ask
+   * this narrower question instead and end up on the shoulder.
+   */
+  isTrafficLane?: (east: number, north: number, clearance: number) => boolean;
   awardChaos: (
     points: number,
     label: string,
@@ -207,6 +239,14 @@ export type PropSystem = {
   dispose: () => void;
 };
 
+/**
+ * What last set a prop moving. Chaos is only ever awarded for motion the
+ * player caused: `none` covers everything the world does on its own (settling
+ * on a slope, being pushed out of a wall, riding a late DEM), and a prop with
+ * `none` can travel as far as it likes without scoring a point.
+ */
+type PropDisturbance = 'none' | 'goose' | 'thrown' | 'car';
+
 type Prop = {
   id: string;
   kind: PropKind;
@@ -232,6 +272,15 @@ type Prop = {
   holdTarget: THREE.Vector3 | null;
   gooseCooldown: number;
   carCooldown: number;
+  disturbedBy: PropDisturbance;
+  /**
+   * A car only pays out when the player is the reason it is driving badly.
+   * Latched at the moment of the hit, because the hit itself sets the car
+   * reacting and would otherwise always look player-caused.
+   */
+  carHitWasPlayerCaused: boolean;
+  /** Seconds left of the post-spawn window where `home` follows the prop. */
+  settleRemaining: number;
 };
 
 type PropPart = {
@@ -484,6 +533,8 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
   let nextPropId = 0;
   let clock = 0;
   let settleCursor = 0;
+  /** Fractional props owed to the settle sweep, carried between steps. */
+  let settleCredit = 0;
   let poiRecycleClock = 0;
   let coneComboStart = -CONE_COMBO_SECONDS;
   let coneComboCount = 0;
@@ -530,8 +581,22 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
     }
   };
 
+  /**
+   * Whether chaos from this prop belongs to the player. Goose contact and a
+   * goose-thrown prop always do; a car hit only when the goose is what put
+   * that car out of shape in the first place.
+   */
+  const isPlayerCaused = (prop: Prop) =>
+    prop.disturbedBy === 'goose' ||
+    prop.disturbedBy === 'thrown' ||
+    (prop.disturbedBy === 'car' && prop.carHitWasPlayerCaused);
+
   const checkWreck = (prop: Prop) => {
     if (prop.wrecked) return;
+    // Settling is not a trick. A prop the player has never touched can slide
+    // down a slope, get shoved out of a wall or drop onto terrain that
+    // resolved late without any of it counting.
+    if (!isPlayerCaused(prop)) return;
     const dx = prop.position.x - prop.home.x;
     const dy = prop.position.y - prop.home.y;
     const dz = prop.position.z - prop.home.z;
@@ -698,6 +763,7 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
     // Lever arm: body center out to the contact point on its own surface.
     scratchLever.copy(scratchB).multiplyScalar(-profile.radius);
     addSpin(prop, scratchLever, scratchImpulse);
+    prop.disturbedBy = 'goose';
     wake(prop);
     // One shove per contact, not one per frame of overlap.
     prop.gooseCooldown = 0.35;
@@ -718,9 +784,26 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
     checkWreck(prop);
   };
 
-  const settleSleepingProps = () => {
+  /**
+   * Sleeping props follow the terrain the way building colliders do. The DEM
+   * under a prop can change minutes after it spawned (a tile decodes, or a
+   * roof under it resolves), and a prop that stayed at the old elevation would
+   * either float or sink. The sweep covers every prop once per
+   * SETTLE_SWEEP_SECONDS regardless of how many there are, and a prop it moves
+   * is never woken and never counted: its home moves with it.
+   */
+  const settleSleepingProps = (dt: number) => {
     if (props.length === 0) return;
-    for (let sample = 0; sample < SETTLE_PER_STEP; sample += 1) {
+    // Bounded so a long stall (or a sudden drop in prop count) can never bank
+    // a sweep large enough to walk the whole population twice in one step.
+    settleCredit = Math.min(
+      props.length,
+      settleCredit + (props.length * dt) / SETTLE_SWEEP_SECONDS,
+    );
+    let samples = Math.floor(settleCredit);
+    if (samples <= 0) return;
+    settleCredit -= samples;
+    for (; samples > 0; samples -= 1) {
       settleCursor = (settleCursor + 1) % props.length;
       const prop = props[settleCursor];
       if (prop.awake || prop.held) continue;
@@ -730,13 +813,12 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
         prop.ground,
       );
       const delta = ground - prop.ground;
-      if (Math.abs(delta) < 0.05) continue;
+      if (Math.abs(delta) < SETTLE_GROUND_EPSILON) continue;
       // The home moves with the ground so a late DEM never reads as a wreck.
       prop.ground = ground;
       prop.position.y += delta;
       prop.home.y += delta;
       prop.previousPosition.y = prop.position.y;
-      return;
     }
   };
 
@@ -782,6 +864,16 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
   ) => {
     if (props.length >= PROP_CAPACITY) return null;
     if (options.isWater(east, north)) return null;
+    // Street furniture standing in traffic is a chaos fountain: the cars plow
+    // it every lap and the score climbs while the goose does nothing. Cones
+    // are the exception, because a cone beside a road is the joke -- they only
+    // refuse the lane itself.
+    if (kind === 'cone') {
+      if (options.isTrafficLane?.(east, north, CONE_LANE_CLEARANCE))
+        return null;
+    } else if (options.isRoad?.(east, north, ROAD_PROP_CLEARANCE)) {
+      return null;
+    }
     const profile = PROFILES[kind];
     let ground = sampleGround(east, north, groundHint);
     scratchA.set(east, ground + profile.groundOffset, north);
@@ -815,6 +907,9 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
       holdTarget: null,
       gooseCooldown: 0,
       carCooldown: 0,
+      disturbedBy: 'none',
+      carHitWasPlayerCaused: false,
+      settleRemaining: SETTLE_SECONDS,
     };
     // A deterministic resting yaw keeps a row of cones from looking stamped.
     prop.quaternion.setFromAxisAngle(
@@ -957,6 +1052,8 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
       prop.previousQuaternion.copy(prop.quaternion);
       if (prop.carCooldown > 0)
         prop.carCooldown = Math.max(0, prop.carCooldown - dt);
+      if (prop.settleRemaining > 0)
+        prop.settleRemaining = Math.max(0, prop.settleRemaining - dt);
 
       if (prop.held) {
         followHeld(prop, dt);
@@ -969,15 +1066,28 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
         prop.sleepTime += dt;
         if (prop.wrecked && prop.sleepTime >= REWRECK_SLEEP_SECONDS) {
           // Settled somewhere new for long enough: this is its home now, and
-          // knocking it over again is a fresh trick.
+          // knocking it over again is a fresh trick. It is scenery again too,
+          // so the world may keep moving it around for free.
           prop.home.copy(prop.position);
           prop.wrecked = false;
+          prop.disturbedBy = 'none';
+          prop.carHitWasPlayerCaused = false;
         }
+      }
+      // Nothing the player did has moved this prop, so wherever the world put
+      // it is where it lives. Freezing home only once, at spawn, is what used
+      // to hand out a BENCH PRESS the instant the bench finished settling.
+      if (
+        prop.disturbedBy === 'none' &&
+        (!prop.awake || prop.settleRemaining > 0) &&
+        !prop.home.equals(prop.position)
+      ) {
+        prop.home.copy(prop.position);
       }
       collideGoose(prop, dt, goose, gooseRadius);
     }
 
-    settleSleepingProps();
+    settleSleepingProps(dt);
     poiRecycleClock -= dt;
     if (poiRecycleClock <= 0) {
       poiRecycleClock = POI_RECYCLE_INTERVAL;
@@ -1018,6 +1128,13 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
         scratchLever.set(-localX * rightX, -0.25, -localX * rightZ);
         if (scratchLever.lengthSq() < 1e-6) scratchLever.set(0.1, -0.25, 0);
         addSpin(prop, scratchLever, scratchImpulse);
+        // Latched before the hit sets the car reacting: a car that was already
+        // swerving or honking is one the goose scared, and the wreckage it
+        // leaves is the player's. A car driving its route normally is just
+        // traffic, and mowing down a roadside bench earns nothing.
+        prop.carHitWasPlayerCaused =
+          car.reactionRemaining > 0 || car.wobbleRemaining > 0;
+        prop.disturbedBy = 'car';
         wake(prop);
         prop.carCooldown = 0.5;
         car.wobbleRemaining = Math.max(car.wobbleRemaining, 0.9);
@@ -1054,7 +1171,11 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
           );
         scratchImpulse.y = Math.max(scratchImpulse.y, 2.4);
         if (!knockDownCampusNpc(npc, scratchImpulse)) continue;
-        options.awardChaos(220, 'FRIENDLY FIRE', { id: 'friendly-fire' });
+        // The student still goes down whatever launched the prop; only the
+        // points are the player's to earn.
+        if (isPlayerCaused(prop)) {
+          options.awardChaos(220, 'FRIENDLY FIRE', { id: 'friendly-fire' });
+        }
         options.recordEvent({
           type: 'prop',
           kind: prop.kind,
@@ -1120,6 +1241,11 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
       prop.holdTarget = null;
       prop.gooseCooldown = 0;
       prop.carCooldown = 0;
+      // A fresh life starts every prop untouched, with another settle window:
+      // whatever the world does to it while it stands back up is free.
+      prop.disturbedBy = 'none';
+      prop.carHitWasPlayerCaused = false;
+      prop.settleRemaining = SETTLE_SECONDS;
     }
     coneComboCount = 0;
     coneComboStart = -CONE_COMBO_SECONDS;
@@ -1159,6 +1285,7 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
     prop.held = true;
     prop.holdTarget = target;
     prop.angularVelocity.set(0, 0, 0);
+    prop.disturbedBy = 'goose';
     wake(prop);
     return true;
   };
@@ -1169,6 +1296,7 @@ export function createPropSystem(options: PropSystemOptions): PropSystem {
     prop.held = false;
     prop.holdTarget = null;
     prop.velocity.copy(velocity);
+    prop.disturbedBy = 'thrown';
     wake(prop);
     scratchB.set(0.2, 0, 0.2);
     addSpin(prop, scratchB, prop.velocity);

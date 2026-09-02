@@ -163,6 +163,7 @@ export type Settings = {
   cameraSensitivity: number; // 0.5 .. 2, default 1
   sound: boolean;
   ambient: boolean;
+  music: boolean;
   slowMotion: boolean;
 };
 
@@ -250,11 +251,19 @@ export const CONTROL_CODES = [
   'KeyR', // ragdoll on demand (Phase 5)
 ] as const;
 
+/**
+ * How much faster the goose flies in the jetstream, as a percentage, so the
+ * HUD can print the number the engine actually applies instead of its own
+ * copy. The engine's ALTITUDE_BOOST_* speeds are derived from this.
+ */
+export const JETSTREAM_BOOST_PERCENT = 10;
+
 export const DEFAULT_SETTINGS: Settings = {
   touchControls: 'auto',
   cameraSensitivity: 1,
   sound: true,
   ambient: true,
+  music: true,
   slowMotion: true,
 };
 

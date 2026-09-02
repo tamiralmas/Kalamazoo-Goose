@@ -50,7 +50,7 @@ import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&ur
 import { Button } from '@/components/ui/button';
 import { TOTAL_CAMPUS_SECRETS } from '@/app/chaos-secrets';
 import { isTouchDevice } from '@/app/device';
-import { CONTROL_CODES } from '@/app/game-contract';
+import { CONTROL_CODES, JETSTREAM_BOOST_PERCENT } from '@/app/game-contract';
 import type {
   MutatorDefinition,
   ProgressState,
@@ -81,16 +81,22 @@ import {
   getAerialTileUrl,
 } from '@/app/world-imagery';
 
-const MINIMAP_ZOOM = 16;
+// Zoom 15 (~4.8 m/px at Kalamazoo's latitude) rather than 16 (~2.4 m/px): at
+// 16 the minimap's edge-clamp radius only covered ~150m, so nearly every
+// unfound secret sat pinned to a small ring around the goose. At 15 the
+// ~198px desktop viewport shows roughly 900m across, wide enough that most
+// nearby secrets render at their true position instead of on the edge.
+const MINIMAP_ZOOM = 15;
 const MINIMAP_TILE_SIZE = 256;
 const MINIMAP_GRID_RADIUS = 1;
 const MINIMAP_GRID_SIZE = MINIMAP_GRID_RADIUS * 2 + 1;
 const MINIMAP_WORLD_SIZE = MINIMAP_TILE_SIZE * 2 ** MINIMAP_ZOOM;
-const MINIMAP_SECRET_EDGE_RADIUS = 62;
-const MINIMAP_SECRET_ENTER_DISTANCE = 350;
-const MINIMAP_SECRET_EXIT_DISTANCE = 425;
-const MINIMAP_SECRET_PRIORITY_DISTANCE = 120;
-const MINIMAP_SECRET_LIMIT = 4;
+// Edge indicators clamp to the viewport rectangle, inset this many px from
+// the true edge, and a marker within this margin of the true edge still
+// counts as "in view" (so it never renders half-clipped before flipping).
+const MINIMAP_EDGE_INSET_PX = 8;
+const MINIMAP_IN_VIEW_MARGIN_PX = 9;
+const MINIMAP_EDGE_MARKER_LIMIT = 3;
 const EARTH_CIRCUMFERENCE_METERS = 40_075_016.686;
 
 const lngLatToMinimapPixel = (longitude: number, latitude: number) => {
@@ -143,6 +149,7 @@ const INITIAL_TELEMETRY: GameTelemetry = {
   north: 0,
   heading: 0,
   buildings: 0,
+  buildingsResolved: 0,
   cameraZoom: 15.9,
   cameraScale: 10 / 7,
   insideBuilding: false,
@@ -164,73 +171,6 @@ const INITIAL_TELEMETRY: GameTelemetry = {
   gooseScale: 1,
   ragdolling: false,
   timeScale: 1,
-};
-
-const selectVisibleMinimapSecretIds = (
-  current: string[],
-  telemetry: GameTelemetry,
-) => {
-  const availableSecrets = telemetry.secretMarkers
-    .filter((secret) => !secret.found)
-    .map((secret) => ({
-      secret,
-      distance: Math.hypot(
-        secret.east - telemetry.east,
-        secret.north - telemetry.north,
-      ),
-    }));
-  const byId = new Map(
-    availableSecrets.map((entry) => [entry.secret.id, entry]),
-  );
-  const next = current
-    .filter(
-      (id) =>
-        byId.has(id) &&
-        (byId.get(id)?.distance ?? Infinity) <= MINIMAP_SECRET_EXIT_DISTANCE,
-    )
-    .slice(0, MINIMAP_SECRET_LIMIT);
-  const closestSecret = availableSecrets.reduce<
-    (typeof availableSecrets)[number] | null
-  >(
-    (closest, entry) =>
-      closest === null || entry.distance < closest.distance ? entry : closest,
-    null,
-  );
-  if (
-    closestSecret &&
-    closestSecret.distance <= MINIMAP_SECRET_PRIORITY_DISTANCE &&
-    !next.includes(closestSecret.secret.id)
-  ) {
-    if (next.length < MINIMAP_SECRET_LIMIT) {
-      next.push(closestSecret.secret.id);
-    } else {
-      const farthestIndex = next.reduce((selectedIndex, id, index) => {
-        const selectedDistance =
-          byId.get(next[selectedIndex])?.distance ?? -Infinity;
-        const distance = byId.get(id)?.distance ?? -Infinity;
-        return distance > selectedDistance ? index : selectedIndex;
-      }, 0);
-      next[farthestIndex] = closestSecret.secret.id;
-    }
-  }
-  const retained = new Set(next);
-  availableSecrets
-    .filter(
-      (entry) =>
-        entry.distance <= MINIMAP_SECRET_ENTER_DISTANCE &&
-        !retained.has(entry.secret.id),
-    )
-    .sort(
-      (first, second) =>
-        first.distance - second.distance ||
-        first.secret.id.localeCompare(second.secret.id),
-    )
-    .slice(0, MINIMAP_SECRET_LIMIT - next.length)
-    .forEach((entry) => next.push(entry.secret.id));
-  return next.length === current.length &&
-    next.every((id, index) => id === current[index])
-    ? current
-    : next;
 };
 
 const CONTROL_CODE_SET = new Set<string>(CONTROL_CODES);
@@ -310,9 +250,25 @@ export function GooseGame() {
   const [playing, setPlaying] = useState(false);
   const [minimapOpen, setMinimapOpen] = useState(false);
   const [minimapTilesEnabled, setMinimapTilesEnabled] = useState(false);
-  const [visibleMinimapSecretIds, setVisibleMinimapSecretIds] = useState<
-    string[]
-  >([]);
+  const minimapViewportRef = useRef<HTMLElement>(null);
+  // Measured px size of the (square) .minimap-viewport box, so the in-view
+  // vs. edge-indicator split below matches what actually renders -- the
+  // panel is 214px on desktop but 156px/190px collapsed/open on touch (see
+  // MINIMAP_IN_VIEW_MARGIN_PX etc. above), and this keeps the same geometry
+  // logic correct at every size without hard-coding per-breakpoint numbers.
+  const [minimapViewportPx, setMinimapViewportPx] = useState(198);
+  useEffect(() => {
+    const node = minimapViewportRef.current;
+    if (!node || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver((entries) => {
+      const entry = entries[0];
+      if (entry && entry.contentRect.width > 0) {
+        setMinimapViewportPx(entry.contentRect.width);
+      }
+    });
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
   const [telemetry, setTelemetry] = useState(INITIAL_TELEMETRY);
   const [toast, setToast] = useState<GameToast | null>(null);
   const [questDrawerOpen, setQuestDrawerOpen] = useState(false);
@@ -323,9 +279,6 @@ export function GooseGame() {
 
   const handleTelemetry = useCallback((nextTelemetry: GameTelemetry) => {
     setTelemetry(nextTelemetry);
-    setVisibleMinimapSecretIds((current) =>
-      selectVisibleMinimapSecretIds(current, nextTelemetry),
-    );
   }, []);
 
   const syncTouchControls = useCallback(() => {
@@ -1191,26 +1144,85 @@ export function GooseGame() {
   const minimapTileStyle = {
     transform: `translate3d(${-minimapGooseGridX}px, ${-minimapGooseGridY}px, 0)`,
   } as CSSProperties;
-  const visibleMinimapSecretSet = new Set(visibleMinimapSecretIds);
-  const minimapSecretMarkers = telemetry.secretMarkers
-    .filter((secret) => visibleMinimapSecretSet.has(secret.id))
-    .sort(
-      (first, second) =>
-        visibleMinimapSecretIds.indexOf(first.id) -
-        visibleMinimapSecretIds.indexOf(second.id),
-    )
-    .map((secret) => {
-      const offsetX = (secret.east - telemetry.east) * minimapPixelsPerMeter;
-      const offsetY = -(secret.north - telemetry.north) * minimapPixelsPerMeter;
-      const distance = Math.hypot(offsetX, offsetY);
-      const isOffscreen = distance > MINIMAP_SECRET_EDGE_RADIUS;
-      const scale = isOffscreen ? MINIMAP_SECRET_EDGE_RADIUS / distance : 1;
+  // Every unfound secret inside the viewport shows at its true position, no
+  // limit and no enter/exit hysteresis (see the header comment on
+  // MINIMAP_ZOOM). Secrets outside the viewport show as at most 3 edge
+  // indicators, nearest first, clamped to the viewport rectangle. The
+  // overall-nearest unfound secret (the objective card's target) gets a
+  // distinct highlighted marker whichever bucket it lands in.
+  const minimapHalfPx = minimapViewportPx / 2;
+  const minimapInViewHalfPx = Math.max(
+    0,
+    minimapHalfPx - MINIMAP_IN_VIEW_MARGIN_PX,
+  );
+  const minimapEdgeHalfPx = Math.max(0, minimapHalfPx - MINIMAP_EDGE_INSET_PX);
+  const minimapSecretEntries = telemetry.secretMarkers.map((secret) => {
+    const offsetX = (secret.east - telemetry.east) * minimapPixelsPerMeter;
+    const offsetY = -(secret.north - telemetry.north) * minimapPixelsPerMeter;
+    return {
+      secret,
+      offsetX,
+      offsetY,
+      distance: Math.hypot(
+        secret.east - telemetry.east,
+        secret.north - telemetry.north,
+      ),
+      inView:
+        Math.abs(offsetX) <= minimapInViewHalfPx &&
+        Math.abs(offsetY) <= minimapInViewHalfPx,
+    };
+  });
+  const nearestUnfoundSecretId = minimapSecretEntries
+    .filter((entry) => !entry.secret.found)
+    .reduce<(typeof minimapSecretEntries)[number] | null>(
+      (closest, entry) =>
+        closest === null || entry.distance < closest.distance ? entry : closest,
+      null,
+    )?.secret.id;
+  const minimapFoundMarkers = minimapSecretEntries
+    .filter((entry) => entry.secret.found && entry.inView)
+    .map((entry) => ({
+      secret: entry.secret,
+      style: {
+        left: `calc(50% + ${entry.offsetX}px)`,
+        top: `calc(50% + ${entry.offsetY}px)`,
+      } as CSSProperties,
+    }));
+  const minimapUnfoundEntries = minimapSecretEntries.filter(
+    (entry) => !entry.secret.found,
+  );
+  const minimapInViewMarkers = minimapUnfoundEntries
+    .filter((entry) => entry.inView)
+    .map((entry) => ({
+      secret: entry.secret,
+      isNearest: entry.secret.id === nearestUnfoundSecretId,
+      style: {
+        left: `calc(50% + ${entry.offsetX}px)`,
+        top: `calc(50% + ${entry.offsetY}px)`,
+      } as CSSProperties,
+    }));
+  const minimapEdgeMarkers = minimapUnfoundEntries
+    .filter((entry) => !entry.inView)
+    .sort((first, second) => first.distance - second.distance)
+    .slice(0, MINIMAP_EDGE_MARKER_LIMIT)
+    .map((entry) => {
+      // Rectangle raycast from the center: scale (dx, dy) down just enough
+      // that the larger axis lands on the inset viewport edge.
+      const dx = entry.offsetX === 0 ? 0.0001 : entry.offsetX;
+      const dy = entry.offsetY === 0 ? 0.0001 : entry.offsetY;
+      const edgeScale = Math.min(
+        minimapEdgeHalfPx / Math.abs(dx),
+        minimapEdgeHalfPx / Math.abs(dy),
+      );
+      const angleDegrees = (Math.atan2(dy, dx) * 180) / Math.PI + 90;
       return {
-        secret,
-        isOffscreen,
+        secret: entry.secret,
+        isNearest: entry.secret.id === nearestUnfoundSecretId,
+        distanceLabel: `${Math.round(entry.distance)}m`,
         style: {
-          left: `calc(50% + ${offsetX * scale}px)`,
-          top: `calc(50% + ${offsetY * scale}px)`,
+          left: `calc(50% + ${dx * edgeScale}px)`,
+          top: `calc(50% + ${dy * edgeScale}px)`,
+          '--minimap-edge-angle': `${angleDegrees}deg`,
         } as CSSProperties,
       };
     });
@@ -1671,8 +1683,9 @@ export function GooseGame() {
               </button>
               <div className="minimap-panel" id="campus-minimap-panel">
                 <figure
+                  ref={minimapViewportRef}
                   className="minimap-viewport"
-                  aria-label={`Aerial map centered on the goose with ${minimapSecretMarkers.length} nearby secret markers. ${telemetry.nearestSecretDistance === null ? 'All Kalamazoo anomalies found.' : `Nearest anomaly ${nearestSecretLabel}, ${Math.round(telemetry.nearestSecretDistance)} meters away.`}`}
+                  aria-label={`Aerial map centered on the goose with ${minimapInViewMarkers.length + minimapEdgeMarkers.length} nearby secret markers. ${telemetry.nearestSecretDistance === null ? 'All Kalamazoo anomalies found.' : `Nearest anomaly ${nearestSecretLabel}, ${Math.round(telemetry.nearestSecretDistance)} meters away.`}`}
                 >
                   <div
                     className="minimap-tiles"
@@ -1692,16 +1705,41 @@ export function GooseGame() {
                   <span className="minimap-north" aria-hidden="true">
                     N
                   </span>
-                  {minimapSecretMarkers.map(
-                    ({ secret, isOffscreen, style }) => (
+                  {minimapFoundMarkers.map(({ secret, style }) => (
+                    <span
+                      key={secret.id}
+                      className="minimap-secret-marker is-found"
+                      style={style}
+                      aria-hidden="true"
+                      title={`${secret.label}: found`}
+                    />
+                  ))}
+                  {minimapInViewMarkers.map(({ secret, isNearest, style }) => (
+                    <span
+                      key={secret.id}
+                      className={`minimap-secret-marker${isNearest ? ' is-nearest' : ''}`}
+                      style={style}
+                      aria-hidden="true"
+                      title={secret.label}
+                    >
+                      <Radar />
+                    </span>
+                  ))}
+                  {minimapEdgeMarkers.map(
+                    ({ secret, isNearest, distanceLabel, style }) => (
                       <span
                         key={secret.id}
-                        className={`minimap-secret-marker${isOffscreen ? ' is-offscreen' : ''}`}
+                        className={`minimap-edge-marker${isNearest ? ' is-nearest' : ''}`}
                         style={style}
                         aria-hidden="true"
-                        title={secret.label}
+                        title={`${secret.label}: ${distanceLabel} away`}
                       >
-                        <Radar />
+                        <ChevronUp
+                          style={{
+                            transform: 'rotate(var(--minimap-edge-angle))',
+                          }}
+                        />
+                        <small>{distanceLabel}</small>
                       </span>
                     ),
                   )}
@@ -1717,9 +1755,12 @@ export function GooseGame() {
                   <figcaption className="sr-only">
                     <span>Secret markers:</span>
                     <ul>
-                      {minimapSecretMarkers.map(({ secret }) => (
+                      {minimapInViewMarkers.map(({ secret }) => (
+                        <li key={secret.id}>{secret.label}: nearby, in view</li>
+                      ))}
+                      {minimapEdgeMarkers.map(({ secret, distanceLabel }) => (
                         <li key={secret.id}>
-                          {secret.label} — nearby and undiscovered
+                          {secret.label}: {distanceLabel} away, off screen
                         </li>
                       ))}
                     </ul>
@@ -1739,8 +1780,7 @@ export function GooseGame() {
 
           {telemetry.altitudeBoost > 0 && (
             <div className="jetstream-indicator">
-              <Wind /> JETSTREAM · +{Math.round(telemetry.altitudeBoost * 21)}%
-              TOP SPEED
+              <Wind /> JETSTREAM · +{JETSTREAM_BOOST_PERCENT}% TOP SPEED
             </div>
           )}
 
@@ -1759,9 +1799,8 @@ export function GooseGame() {
             {holdingName && (
               <span className="carry-chip">
                 <Hand aria-hidden="true" />
-                Carrying {holdingName}
+                Carrying: {holdingName}
                 <b className="desktop-instructions">· F to throw</b>
-                <b className="touch-instructions">· Grab to throw</b>
               </span>
             )}
             <span>{mode.hint}</span>
@@ -1909,7 +1948,7 @@ export function GooseGame() {
               <button
                 type="button"
                 className="grab-action"
-                aria-label="Grab"
+                aria-label={holdingName ? 'Throw' : 'Grab'}
                 aria-pressed="false"
                 data-control-code="KeyF"
                 data-control-group="action"
@@ -1929,7 +1968,7 @@ export function GooseGame() {
                 }
               >
                 <Hand />
-                <span>Grab</span>
+                <span>{holdingName ? 'Throw' : 'Grab'}</span>
               </button>
               <button
                 type="button"
@@ -1957,6 +1996,7 @@ export function GooseGame() {
               </button>
               <button
                 type="button"
+                className="flare-action"
                 aria-label="Flare and airbrake"
                 aria-pressed="false"
                 data-control-code="ShiftLeft"

@@ -95,6 +95,7 @@ export const sanitizeProgress = (raw: unknown): ProgressState => {
       ),
       sound: settings.sound !== false,
       ambient: settings.ambient !== false,
+      music: settings.music !== false,
       slowMotion: settings.slowMotion !== false,
     },
     stats: {

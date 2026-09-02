@@ -241,6 +241,12 @@ function OptionsTab({
       state.settings = { ...state.settings, ...patch };
     });
   };
+  const musicOn = settings.music;
+  const setMusic = (music: boolean) => {
+    progressStore.update((state) => {
+      state.settings = { ...state.settings, music };
+    });
+  };
 
   return (
     <div className="options-tab">
@@ -285,6 +291,7 @@ function OptionsTab({
         value={settings.sound}
         onChange={(value) => setSettings({ sound: value })}
       />
+      <ToggleRow label="Music" value={musicOn} onChange={setMusic} />
       <ToggleRow
         label="Ambient"
         value={settings.ambient}

@@ -723,11 +723,24 @@
   position: absolute;
   z-index: 5;
   bottom: 54px;
-  left: 50%;
+  /* left: 0; right: 0; width: fit-content; margin-inline: auto -- NOT
+     left: 50%; transform: translateX(-50%) -- because with only `left` set
+     an absolutely positioned box's shrink-to-fit width is bounded by the
+     space from `left` to the containing block's edge, i.e. half the
+     viewport at left: 50%. flex-wrap then wraps against that halved
+     budget well before the deck is actually out of room. left/right: 0
+     gives it the full viewport to shrink-to-fit (then clamp on)
+     against instead. */
+  left: 0;
+  right: 0;
+  width: fit-content;
+  margin-inline: auto;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
-  transform: translateX(-50%);
+  justify-content: center;
+  gap: 8px 12px;
+  max-width: calc(100vw - 56px);
   border: 1px solid rgba(255, 255, 255, 0.2);
   border-radius: 15px;
   background: rgba(58, 32, 19, 0.74);
@@ -1369,13 +1382,92 @@ kbd {
     left 120ms linear;
 }
 
-.minimap-secret-marker.is-offscreen {
-  border-style: dashed;
+/* Found secrets (fast-travel destinations): a faint grey dot, no icon. */
+.minimap-secret-marker.is-found {
+  width: 6px;
+  height: 6px;
+  border: none;
+  background: rgba(255, 255, 255, 0.4);
+  box-shadow: none;
+}
+
+/* The nearest unfound secret -- the objective card's target -- gets a
+   pulsing gold ring, in view or on the edge. */
+.minimap-secret-marker.is-nearest {
+  border-color: #f1c500;
+  background: rgba(241, 197, 0, 0.24);
+  color: #532e1f;
+  animation: minimap-nearest-pulse 1600ms ease-in-out infinite;
+}
+
+@keyframes minimap-nearest-pulse {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 0 rgba(241, 197, 0, 0.55),
+      0 4px 12px rgba(34, 18, 3, 0.36);
+  }
+  50% {
+    box-shadow:
+      0 0 0 6px rgba(241, 197, 0, 0),
+      0 4px 12px rgba(34, 18, 3, 0.36);
+  }
 }
 
 .minimap-secret-marker svg {
   width: 8px;
   height: 8px;
+}
+
+/* Edge indicators: secrets outside the viewport, clamped to its rectangle
+   and rendered as a small outward-pointing chevron with a distance label,
+   dimmer and smaller than an in-view marker. */
+.minimap-edge-marker {
+  position: absolute;
+  z-index: 5;
+  top: 50%;
+  left: 50%;
+  display: grid;
+  justify-items: center;
+  gap: 1px;
+  transform: translate(-50%, -50%);
+  color: rgba(255, 208, 112, 0.62);
+  pointer-events: none;
+  transition:
+    top 120ms linear,
+    left 120ms linear;
+}
+
+.minimap-edge-marker svg {
+  width: 11px;
+  height: 11px;
+  filter: drop-shadow(0 2px 3px rgba(34, 18, 3, 0.55));
+}
+
+.minimap-edge-marker small {
+  font-size: 6px;
+  font-weight: 800;
+  line-height: 1;
+  color: rgba(255, 255, 255, 0.68);
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.6);
+}
+
+.minimap-edge-marker.is-nearest {
+  color: #f1c500;
+}
+
+.minimap-edge-marker.is-nearest svg {
+  animation: minimap-nearest-pulse-edge 1600ms ease-in-out infinite;
+}
+
+@keyframes minimap-nearest-pulse-edge {
+  0%,
+  100% {
+    transform: rotate(var(--minimap-edge-angle)) scale(1);
+  }
+  50% {
+    transform: rotate(var(--minimap-edge-angle)) scale(1.3);
+  }
 }
 
 .minimap-attribution {
@@ -2511,12 +2603,17 @@ kbd {
       bottom: calc(170px + env(safe-area-inset-bottom));
     }
 
+    /* This whole touch chrome cluster (mobile-controls through the
+       attribution reposition) is sized to fit down to a 360px-wide phone
+       in portrait -- see the comment above scenarios/p6-hud.mjs in the
+       harness for the exact numbers checked. The d-pad gives up some size
+       so the four action buttons can hold their fixed 48/56/48/64px sizes. */
     & .mobile-controls {
       position: absolute;
       z-index: 7;
-      right: calc(14px + env(safe-area-inset-right));
-      bottom: calc(18px + env(safe-area-inset-bottom));
-      left: calc(14px + env(safe-area-inset-left));
+      right: calc(10px + env(safe-area-inset-right));
+      bottom: calc(10px + env(safe-area-inset-bottom));
+      left: calc(10px + env(safe-area-inset-left));
       display: flex;
       align-items: flex-end;
       justify-content: space-between;
@@ -2526,9 +2623,9 @@ kbd {
 
     & .touch-pad {
       display: grid;
-      width: 150px;
-      grid-template-columns: repeat(3, 48px);
-      grid-template-rows: repeat(2, 48px);
+      width: 96px;
+      grid-template-columns: repeat(3, 30px);
+      grid-template-rows: repeat(2, 30px);
       gap: 3px;
       pointer-events: auto;
     }
@@ -2570,30 +2667,35 @@ kbd {
       border-radius: 7px 13px 13px 7px;
     }
     & .touch-pad svg {
-      width: 18px;
+      width: 14px;
     }
 
+    /* Grab/Flare 48px, Honk 56px, Flap 64px (the big primary): fixed sizes
+       that fit the 4-button row at a 360px-wide viewport with the tighter
+       4px gap below. */
     & .touch-actions {
       display: flex;
       align-items: flex-end;
-      gap: 7px;
+      gap: 4px;
       pointer-events: auto;
     }
 
     & .touch-actions button {
-      width: 54px;
-      height: 54px;
+      width: 48px;
+      height: 48px;
       border-radius: 50%;
     }
-    & .touch-actions .flap-action {
-      width: 70px;
-      height: 70px;
-      background: rgba(241, 197, 0, 0.95);
-      color: #532e1f;
-    }
     & .touch-actions .honk-action {
+      width: 56px;
+      height: 56px;
       background: rgba(94, 55, 27, 0.94);
       color: #ffd070;
+    }
+    & .touch-actions .flap-action {
+      width: 64px;
+      height: 64px;
+      background: rgba(241, 197, 0, 0.95);
+      color: #532e1f;
     }
     & .touch-actions .grab-action[data-holding='true'] {
       border-color: rgba(241, 197, 0, 0.9);
@@ -2602,11 +2704,11 @@ kbd {
         0 7px 18px rgba(47, 26, 16, 0.16);
     }
     & .touch-actions svg {
-      width: 18px;
+      width: 17px;
     }
     & .touch-actions span {
       display: block;
-      margin-top: -5px;
+      margin-top: -4px;
       font-size: 7px;
       font-weight: 800;
       letter-spacing: 0.06em;
@@ -2614,20 +2716,20 @@ kbd {
     }
 
     & .camera-toolbar button {
-      width: 44px;
-      height: 44px;
+      width: 38px;
+      height: 38px;
     }
     & .camera-toolbar svg {
-      width: 17px;
-      height: 17px;
+      width: 15px;
+      height: 15px;
     }
     & .camera-zoom-readout {
-      min-width: 34px;
+      min-width: 28px;
       font-size: 8px;
     }
     & .map-reset-button {
-      min-width: 44px;
-      min-height: 44px;
+      min-width: 38px;
+      min-height: 38px;
     }
     & .mode-stack {
       bottom: calc(122px + env(safe-area-inset-bottom));
@@ -2638,9 +2740,14 @@ kbd {
     & .is-playing .game-footer {
       display: none;
     }
+    /* Repositioned above the mode badge/carry chip (MapLibre's own default
+       corner box is a fixed 44x44 touch target around the 24px "i" icon --
+       too tall to fit in the gap below the badge and above the d-pad) so it
+       never overlaps the badge. Pinned to the left edge, it stays clear of
+       the centered camera-hint text above it too. */
     & .real-map-canvas .maplibregl-ctrl-bottom-right {
       right: auto;
-      bottom: calc(122px + env(safe-area-inset-bottom));
+      bottom: calc(156px + env(safe-area-inset-bottom));
       left: calc(6px + env(safe-area-inset-left));
       max-width: calc(
         100vw - 190px - env(safe-area-inset-left) - env(safe-area-inset-right)
@@ -2883,9 +2990,9 @@ kbd {
   & .mobile-controls {
     position: absolute;
     z-index: 7;
-    right: calc(14px + env(safe-area-inset-right));
-    bottom: calc(18px + env(safe-area-inset-bottom));
-    left: calc(14px + env(safe-area-inset-left));
+    right: calc(10px + env(safe-area-inset-right));
+    bottom: calc(10px + env(safe-area-inset-bottom));
+    left: calc(10px + env(safe-area-inset-left));
     display: flex;
     align-items: flex-end;
     justify-content: space-between;
@@ -2895,9 +3002,9 @@ kbd {
 
   & .touch-pad {
     display: grid;
-    width: 150px;
-    grid-template-columns: repeat(3, 48px);
-    grid-template-rows: repeat(2, 48px);
+    width: 96px;
+    grid-template-columns: repeat(3, 30px);
+    grid-template-rows: repeat(2, 30px);
     gap: 3px;
     pointer-events: auto;
   }
@@ -2939,30 +3046,32 @@ kbd {
     border-radius: 7px 13px 13px 7px;
   }
   & .touch-pad svg {
-    width: 18px;
+    width: 14px;
   }
 
   & .touch-actions {
     display: flex;
     align-items: flex-end;
-    gap: 7px;
+    gap: 4px;
     pointer-events: auto;
   }
 
   & .touch-actions button {
-    width: 54px;
-    height: 54px;
+    width: 48px;
+    height: 48px;
     border-radius: 50%;
   }
-  & .touch-actions .flap-action {
-    width: 70px;
-    height: 70px;
-    background: rgba(241, 197, 0, 0.95);
-    color: #532e1f;
-  }
   & .touch-actions .honk-action {
+    width: 56px;
+    height: 56px;
     background: rgba(94, 55, 27, 0.94);
     color: #ffd070;
+  }
+  & .touch-actions .flap-action {
+    width: 64px;
+    height: 64px;
+    background: rgba(241, 197, 0, 0.95);
+    color: #532e1f;
   }
   & .touch-actions .grab-action[data-holding='true'] {
     border-color: rgba(241, 197, 0, 0.9);
@@ -2971,11 +3080,11 @@ kbd {
       0 7px 18px rgba(47, 26, 16, 0.16);
   }
   & .touch-actions svg {
-    width: 18px;
+    width: 17px;
   }
   & .touch-actions span {
     display: block;
-    margin-top: -5px;
+    margin-top: -4px;
     font-size: 7px;
     font-weight: 800;
     letter-spacing: 0.06em;
@@ -2983,20 +3092,20 @@ kbd {
   }
 
   & .camera-toolbar button {
-    width: 44px;
-    height: 44px;
+    width: 38px;
+    height: 38px;
   }
   & .camera-toolbar svg {
-    width: 17px;
-    height: 17px;
+    width: 15px;
+    height: 15px;
   }
   & .camera-zoom-readout {
-    min-width: 34px;
+    min-width: 28px;
     font-size: 8px;
   }
   & .map-reset-button {
-    min-width: 44px;
-    min-height: 44px;
+    min-width: 38px;
+    min-height: 38px;
   }
   & .mode-stack {
     bottom: calc(122px + env(safe-area-inset-bottom));
@@ -3009,7 +3118,7 @@ kbd {
   }
   & .real-map-canvas .maplibregl-ctrl-bottom-right {
     right: auto;
-    bottom: calc(122px + env(safe-area-inset-bottom));
+    bottom: calc(156px + env(safe-area-inset-bottom));
     left: calc(6px + env(safe-area-inset-left));
     max-width: calc(
       100vw - 190px - env(safe-area-inset-left) - env(safe-area-inset-right)
@@ -3293,7 +3402,11 @@ kbd {
   .mode-stack > span:last-child {
     display: none;
   }
-  .camera-hint {
+  /* Phones: the orbit hint is noise next to the touch controls. The touch
+     blocks above enable it with a three-class selector, so this needs the
+     same specificity (plus source order) to actually win. */
+  .game-shell:not([data-input='pointer']) .camera-hint,
+  .game-shell[data-input='touch'] .camera-hint {
     display: none;
   }
   .game-toast {
@@ -3383,26 +3496,9 @@ kbd {
   .brand-lockup > span:last-child {
     display: none;
   }
-  .mobile-controls {
-    right: calc(10px + env(safe-area-inset-right));
-    left: calc(10px + env(safe-area-inset-left));
-  }
-  .touch-actions {
-    gap: 3px;
-  }
-  .touch-pad {
-    width: 138px;
-    grid-template-columns: repeat(3, 44px);
-    grid-template-rows: repeat(2, 44px);
-  }
-  .touch-actions button {
-    width: 48px;
-    height: 48px;
-  }
-  .touch-actions .flap-action {
-    width: 56px;
-    height: 56px;
-  }
+  /* .mobile-controls / .touch-pad / .touch-actions are not overridden here
+     any more -- the base touch sizes (see the coarse-pointer block and the
+     [data-input='touch'] block above) already fit down to 360px. */
   .mobile-status-strip > span {
     padding-inline: 4px;
   }
@@ -3471,7 +3567,8 @@ kbd {
   .mode-stack {
     bottom: calc(109px + env(safe-area-inset-bottom));
   }
-  .camera-hint {
+  .game-shell:not([data-input='pointer']) .camera-hint,
+  .game-shell[data-input='touch'] .camera-hint {
     display: none;
   }
   .mobile-controls {
@@ -3532,6 +3629,7 @@ kbd {
   .campus-minimap,
   .minimap-tiles,
   .minimap-secret-marker,
+  .minimap-edge-marker,
   .minimap-toggle-chevron,
   .quest-drawer,
   .quest-drawer-scrim,
@@ -3549,7 +3647,9 @@ kbd {
   .pause-menu-backdrop,
   .pause-menu-card,
   .quest-toggle-desktop.is-pulse,
-  .quest-toggle-touch.is-pulse {
+  .quest-toggle-touch.is-pulse,
+  .minimap-secret-marker.is-nearest,
+  .minimap-edge-marker.is-nearest svg {
     animation: none;
   }
 }

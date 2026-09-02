@@ -26,14 +26,27 @@ import {
   type CampusNpc,
   type CrowdRoute,
 } from './campus-crowd';
+import {
+  COLLIDER_SAMPLE_COUNT,
+  MIN_COLLIDER_HEIGHT,
+  resolveColliderTerrain,
+  writeColliderSamplePoints,
+  type ColliderTerrain,
+  type ColliderTerrainSample,
+} from './building-terrain';
 import { BONUS_CHAOS_SECRETS, type BonusChaosSecret } from './chaos-secrets';
 import { isTouchDevice } from './device';
-import { createPropSystem, type PropPoi, type PropSystem } from './props';
+import {
+  PROP_CAPACITY,
+  createPropSystem,
+  type PropPoi,
+  type PropSystem,
+} from './props';
 import { PROP_PLACEMENTS } from './props-placement';
 import { WMU_TREE_POINTS } from './wmu-trees';
 import { WMU_SPAWN } from './world-config';
 import { TERRAIN_MAX_ZOOM, getAerialTileUrl } from './world-imagery';
-import { slugifyLabel } from './game-contract';
+import { JETSTREAM_BOOST_PERCENT, slugifyLabel } from './game-contract';
 import type {
   FlightMode,
   GameEvent,
@@ -98,6 +111,12 @@ export type GameTelemetry = {
   north: number;
   heading: number;
   buildings: number;
+  /**
+   * How many of those buildings have a collision box fitted to real terrain.
+   * While this trails `buildings`, the rest are flat placeholder boxes waiting
+   * on a DEM tile.
+   */
+  buildingsResolved: number;
   cameraZoom: number;
   cameraScale: number;
   insideBuilding: boolean;
@@ -199,6 +218,8 @@ type Route = {
   total: number;
   cruise: number;
   laneWidth: number;
+  /** OSM class the line came from; '' for a synthesised route. */
+  roadClass: string;
 };
 
 type TrafficCar = {
@@ -341,17 +362,57 @@ const TREE_PLACEMENT_ANCHOR_TOLERANCE = 300;
 const PROP_POI_RADIUS = 1_100;
 const PROP_POI_RESCAN_DISTANCE = 220;
 const PROP_POI_REFRESH_SECONDS = 2.5;
+// Campus clutter: furniture generated from the mapped walkway and service-road
+// network so the whole city feels lived in without a hand-authored table.
+/** One trash can per this many meters of walkway. */
+const WALKWAY_TRASH_SPACING = 90;
+/** One bench per this many meters of walkway. */
+const WALKWAY_BENCH_SPACING = 140;
+const WALKWAY_CLUTTER_CADENCE = [
+  ['trash', WALKWAY_TRASH_SPACING],
+  ['bench', WALKWAY_BENCH_SPACING],
+] as const satisfies ReadonlyArray<readonly [PropKind, number]>;
+/** How far to the side of the walkway centerline furniture stands. */
+const WALKWAY_PROP_OFFSET = 1.6;
+/** Ceiling on generated walkway props, before the capacity headroom bites. */
+const WALKWAY_PROP_LIMIT = 120;
+/** Bodies left free for the authored table and the OSM POIs. */
+const CLUTTER_HEADROOM = 40;
+/** Generated furniture keeps this far clear of a mapped traffic corridor. */
+const CLUTTER_ROAD_CLEARANCE = 2.5;
+const CLUTTER_RESCAN_DISTANCE = 220;
+const SERVICE_CONE_COUNT = 4;
+const SERVICE_CONE_SPACING = 3.2;
+/**
+ * Cones sit this far outside the lane edge: a shoulder, not a roadblock. Wide
+ * enough that a car driving its lane never clips one, because a cone the
+ * traffic can reach is a cone that never gets to go back to sleep.
+ */
+const SERVICE_CONE_SHOULDER = 2;
+const SERVICE_CONE_MIN_LENGTH = 60;
+const SERVICE_CONE_RADIUS = 600;
+const SERVICE_CONE_ROW_LIMIT = 40;
+// The jetstream is advertised as "a 10% boost above 50 m", and these are the
+// numbers that make that literally true. The ramp is short on purpose: the
+// boost has to be all the way in a few meters above the arming height, or the
+// HUD reads "+3%" for the whole climb and the promise looks like a lie.
 const ALTITUDE_BOOST_HEIGHT = 50;
-const ALTITUDE_BOOST_FULL_HEIGHT = 100;
+const ALTITUDE_BOOST_FULL_HEIGHT = 58;
 const ALTITUDE_BOOST_RELEASE_HEIGHT = 47;
-const ALTITUDE_BOOST_CRUISE_SPEED = 27;
-const ALTITUDE_BOOST_ACCELERATION = 2.7;
+const BASE_CRUISE_SPEED = 18.5;
 const BASE_MAX_FLIGHT_SPEED = 38;
-const ALTITUDE_BOOST_MAX_SPEED = 46;
+const JETSTREAM_SPEED_SCALE = 1 + JETSTREAM_BOOST_PERCENT / 100;
+const ALTITUDE_BOOST_CRUISE_SPEED = BASE_CRUISE_SPEED * JETSTREAM_SPEED_SCALE;
+const ALTITUDE_BOOST_ACCELERATION = 2.7;
+const ALTITUDE_BOOST_MAX_SPEED = BASE_MAX_FLIGHT_SPEED * JETSTREAM_SPEED_SCALE;
 const BUILDING_ACTIVE_RADIUS = 150;
 const BUILDING_INGEST_RADIUS = 950;
 const BUILDING_RETENTION_RADIUS = 1_800;
 const BUILDING_RESCAN_DISTANCE = 240;
+/** How far out colliders keep chasing a DEM that had not decoded yet. */
+const UNRESOLVED_COLLIDER_RADIUS = 1_400;
+/** Seconds between sweeps of those colliders while playing. */
+const UNRESOLVED_COLLIDER_INTERVAL = 0.25;
 const TEXTURED_ROOF_RADIUS = 760;
 const BUILDING_TEXTURE_MAX_ZOOM = 18;
 const BUILDING_TEXTURE_MIN_ZOOM = 15;
@@ -744,6 +805,7 @@ function routeFromPoints(
   points: THREE.Vector3[],
   cruise = 7,
   laneWidth = 1.35,
+  roadClass = '',
 ) {
   const cumulative = [0];
   for (let index = 1; index < points.length; index += 1) {
@@ -757,6 +819,7 @@ function routeFromPoints(
     total: cumulative[cumulative.length - 1],
     cruise,
     laneWidth,
+    roadClass,
   } satisfies Route;
 }
 
@@ -1016,15 +1079,39 @@ export function createGooseEngine(
   // A chase camera that sits below the real terrain (which happens whenever
   // the DEM resolves after the goose was placed at the sea-level fallback)
   // sees no terrain tiles and reads 0 forever, so the world can never climb
-  // to the real ground. Sampling the DEM directly at its own max zoom does not
-  // depend on the camera at all; it returns 0 only while no tile has decoded.
+  // to the real ground. Sampling the DEM directly does not depend on the
+  // camera at all; it returns 0 only while no tile has decoded.
+  //
+  // The zoom asked for is one *above* the source maxzoom on purpose.
+  // MapLibre's TerrainTileManager resolves a query tile to a DEM tile with
+  // `z = overscaledZ - deltaZoom` (deltaZoom is 1) and only then clamps to the
+  // source maxzoom, so asking for TERRAIN_MAX_ZOOM (16) reads the zoom-15 DEM
+  // at 2.2 m/px while MapLibre renders the terrain mesh and the extruded
+  // buildings from the zoom-16 DEM at 1.1 m/px. Asking for 17 lands on the
+  // same zoom-16 tile the map draws, so a collider roof and the building
+  // under it agree instead of disagreeing by a metre of interpolation.
   const queryGroundElevation = (lngLat: LngLatLike): number | null => {
     const terrain = map.terrain;
     if (!terrain) return null;
     return terrain.getElevationForLngLatZoom(
       maplibre.LngLat.convert(lngLat),
-      TERRAIN_MAX_ZOOM,
+      TERRAIN_MAX_ZOOM + 1,
     );
+  };
+
+  // The unresolved-collider pass reads five DEM points per building per tick.
+  // localToLngLat() builds a MercatorCoordinate and a LngLat every call, so
+  // this variant writes one shared LngLat instead: the inverse web-mercator
+  // below is exactly what MercatorCoordinate.toLngLat() computes.
+  const terrainSampleLngLat = new maplibre.LngLat(0, 0);
+  const sampleGroundElevationAtLocal = (east: number, north: number) => {
+    const mercatorY = origin.y - north * meterScale;
+    terrainSampleLngLat.lng = (origin.x + east * meterScale) * 360 - 180;
+    terrainSampleLngLat.lat =
+      (360 / Math.PI) *
+        Math.atan(Math.exp(((180 - mercatorY * 360) * Math.PI) / 180)) -
+      90;
+    return queryGroundElevation(terrainSampleLngLat);
   };
 
   const keys = new Set<string>();
@@ -1733,6 +1820,90 @@ export function createGooseEngine(
     return false;
   };
 
+  // Scratch for the collider terrain fit: one sample-point buffer, one
+  // readings buffer and one result object, shared by the ingestion path and by
+  // the resolve pass below so neither allocates per building.
+  const colliderSamplePoints: number[] = Array.from(
+    { length: COLLIDER_SAMPLE_COUNT * 2 },
+    () => 0,
+  );
+  const colliderSamples: ColliderTerrainSample[] = Array.from(
+    { length: COLLIDER_SAMPLE_COUNT },
+    () => null,
+  );
+  const colliderTerrainScratch: ColliderTerrain = {
+    centerGround: 0,
+    ground: 0,
+    height: 0,
+    terrainResolved: false,
+  };
+
+  /**
+   * Fit a collision box to the DEM under a footprint. A reading the DEM cannot
+   * answer yet stays null rather than falling back to the campus elevation:
+   * that is the whole fix for the floating roof. On a hillside the fallback is
+   * the ground under the goose, which in the Valleys is up to 25 m above the
+   * building, and one fallback corner among four real ones was enough to bake
+   * a 12 m box onto a 5 m building forever.
+   */
+  const readColliderTerrain = (
+    minX: number,
+    minZ: number,
+    maxX: number,
+    maxZ: number,
+    renderHeight: number,
+    renderMinHeight: number,
+  ) => {
+    writeColliderSamplePoints(colliderSamplePoints, minX, minZ, maxX, maxZ);
+    for (let index = 0; index < COLLIDER_SAMPLE_COUNT; index += 1) {
+      if (!terrainEnabled) {
+        colliderSamples[index] = campusGroundFallback;
+        continue;
+      }
+      const elevation = sampleGroundElevationAtLocal(
+        colliderSamplePoints[index * 2],
+        colliderSamplePoints[index * 2 + 1],
+      );
+      colliderSamples[index] =
+        typeof elevation === 'number' && isUsableTerrainElevation(elevation)
+          ? elevation
+          : null;
+    }
+    return resolveColliderTerrain(
+      colliderSamples,
+      renderHeight,
+      renderMinHeight,
+      campusGroundFallback,
+      colliderTerrainScratch,
+    );
+  };
+
+  /**
+   * Carry the goose with a roof whose height just changed under its feet, so a
+   * late DEM never drops it through a roof it is standing on or leaves it
+   * hovering above one. `previousRoof` is the surface it was standing on.
+   */
+  const keepGooseOnRoof = (
+    building: BuildingCollider,
+    previousRoof: number,
+    nextRoof: number,
+  ) => {
+    const roofDelta = nextRoof - previousRoof;
+    // A correction this large is a different building, not a settling DEM.
+    if (!Number.isFinite(roofDelta) || Math.abs(roofDelta) >= 30) return;
+    if (
+      state.mode !== 'waddling' ||
+      Math.abs(state.ground - previousRoof) >= 0.45 ||
+      Math.abs(state.position.y - (previousRoof + 0.04)) >= 0.65 ||
+      !pointInBuilding(state.position.x, state.position.z, building)
+    )
+      return;
+    state.position.y += roofDelta;
+    previousState.position.y += roofDelta;
+    renderState.position.y += roofDelta;
+    state.ground = nextRoof;
+  };
+
   const refreshActiveBuildingColliders = (force = false) => {
     if (
       !force &&
@@ -2003,12 +2174,16 @@ export function createGooseEngine(
           existingCollider !== undefined &&
           campusGroundResolved &&
           Math.abs(existingCollider.centerGround - campusGroundFallback) > 120;
+        // Colliders whose DEM was not ready at ingestion are no longer
+        // re-sampled here: refreshUnresolvedColliderTerrain() sweeps those by
+        // distance on its own cadence, which reaches the whole valley instead
+        // of only what is already under the goose's nose. What is left for
+        // this pass is ingesting new footprints and re-anchoring a box the
+        // campus fallback moved out from under (a travel across town).
         const needsTerrainRefresh =
           terrainEnabled &&
           terrainQueryBudget > 0 &&
-          (!existingCollider ||
-            (nearPlayer &&
-              (!existingCollider.terrainResolved || staleAgainstCampus)));
+          (!existingCollider || (nearPlayer && staleAgainstCampus));
 
         if (existingCollider && !wantsTexturedRoof && !needsTerrainRefresh)
           return;
@@ -2017,72 +2192,33 @@ export function createGooseEngine(
           existingCollider?.centerGround ?? campusGroundFallback;
         let colliderGround =
           existingCollider?.ground ?? campusGroundFallback + renderMinHeight;
-        let colliderHeight = existingCollider?.height ?? renderHeight;
+        let colliderHeight =
+          existingCollider?.height ??
+          Math.max(MIN_COLLIDER_HEIGHT, renderHeight);
         let colliderTerrainResolved =
           existingCollider?.terrainResolved ?? !terrainEnabled;
         if (needsTerrainRefresh) {
           terrainQueryBudget -= 1;
-          const terrainLocations: ReadonlyArray<readonly [number, number]> =
-            existingCollider
-              ? [[centerX, centerZ]]
-              : [
-                  [centerX, centerZ],
-                  [minX, minZ],
-                  [minX, maxZ],
-                  [maxX, minZ],
-                  [maxX, maxZ],
-                ];
-          const terrainReadings = terrainEnabled
-            ? terrainLocations.map(([east, north]) =>
-                queryGroundElevation(localToLngLat(east, north)),
-              )
-            : [];
-          colliderTerrainResolved =
-            !terrainEnabled ||
-            terrainReadings.every((elevation) =>
-              isUsableTerrainElevation(elevation),
-            );
-          centerGround =
-            terrainEnabled &&
-            typeof terrainReadings[0] === 'number' &&
-            isUsableTerrainElevation(terrainReadings[0])
-              ? terrainReadings[0]
-              : centerGround;
-          const terrainSamples = terrainEnabled
-            ? terrainReadings.map((elevation) =>
-                typeof elevation === 'number' &&
-                isUsableTerrainElevation(elevation)
-                  ? elevation
-                  : centerGround,
-              )
-            : terrainLocations.map(() => centerGround);
           if (existingCollider) {
-            const terrainDelta = centerGround - existingCollider.centerGround;
-            colliderGround = existingCollider.ground + terrainDelta;
-            colliderHeight = existingCollider.height;
-          } else {
-            const lowestTerrain = Math.min(...terrainSamples);
-            const highestTerrain = Math.max(...terrainSamples);
-            colliderGround = lowestTerrain + renderMinHeight;
-            colliderHeight = Math.max(
-              2.6,
-              highestTerrain + renderHeight - colliderGround,
-            );
-          }
-          if (existingCollider) {
+            // A stale box was already fitted to five real corners once, so a
+            // campus shift only needs the center delta to slide it; its height
+            // is still the right height for that hillside.
+            const reading = terrainEnabled
+              ? queryGroundElevation(localToLngLat(centerX, centerZ))
+              : campusGroundFallback;
+            if (
+              typeof reading === 'number' &&
+              isUsableTerrainElevation(reading)
+            ) {
+              centerGround = reading;
+              colliderGround =
+                existingCollider.ground +
+                (reading - existingCollider.centerGround);
+              colliderHeight = existingCollider.height;
+            }
             const previousRoof =
               existingCollider.ground + existingCollider.height;
             const nextRoof = colliderGround + colliderHeight;
-            const roofDelta = nextRoof - previousRoof;
-            const supportsGoose =
-              state.mode === 'waddling' &&
-              Math.abs(state.ground - previousRoof) < 0.45 &&
-              Math.abs(state.position.y - (previousRoof + 0.04)) < 0.65 &&
-              pointInBuilding(
-                state.position.x,
-                state.position.z,
-                existingCollider,
-              );
             const terrainChanged =
               Math.abs(existingCollider.centerGround - centerGround) > 0.05 ||
               Math.abs(existingCollider.ground - colliderGround) > 0.05 ||
@@ -2092,16 +2228,25 @@ export function createGooseEngine(
             existingCollider.height = colliderHeight;
             existingCollider.renderHeight = renderHeight;
             existingCollider.renderMinHeight = renderMinHeight;
-            existingCollider.terrainResolved = colliderTerrainResolved;
-            if (supportsGoose && Math.abs(roofDelta) < 30) {
-              state.position.y += roofDelta;
-              previousState.position.y += roofDelta;
-              renderState.position.y += roofDelta;
-              state.ground = nextRoof;
-            }
+            keepGooseOnRoof(existingCollider, previousRoof, nextRoof);
             const roofMesh = texturedBuildingMeshByKey.get(footprintKey);
-            if (roofMesh) roofMesh.position.y = centerGround;
+            if (roofMesh && existingCollider.terrainResolved) {
+              roofMesh.position.y = centerGround;
+            }
             if (terrainChanged) changed = true;
+          } else {
+            const fit = readColliderTerrain(
+              minX,
+              minZ,
+              maxX,
+              maxZ,
+              renderHeight,
+              renderMinHeight,
+            );
+            centerGround = fit.centerGround;
+            colliderGround = fit.ground;
+            colliderHeight = fit.height;
+            colliderTerrainResolved = fit.terrainResolved;
           }
         }
 
@@ -2180,6 +2325,14 @@ export function createGooseEngine(
         const mesh = new THREE.Mesh(geometry, materials.roof);
         mesh.name = 'MiSAIL aerial roof overlay';
         mesh.position.y = centerGround;
+        // An overlay for a building whose terrain has not resolved would hang
+        // at the campus fallback elevation, which on a hillside is a roof
+        // floating tens of meters over its building. It is built now (the
+        // geometry is here and the polygon is not) but stays hidden until the
+        // resolve pass can put it at the real centerGround.
+        mesh.visible = existingCollider
+          ? existingCollider.terrainResolved
+          : colliderTerrainResolved;
         mesh.frustumCulled = true;
         mesh.renderOrder = 1;
         texturedBuildingGroup.add(mesh);
@@ -2191,6 +2344,98 @@ export function createGooseEngine(
 
     if (changed) settleFlockRoosts();
     return changed;
+  };
+
+  const resolvedBuildingColliderCount = () => {
+    let resolved = 0;
+    for (const building of buildingColliders) {
+      if (building.terrainResolved) resolved += 1;
+    }
+    return resolved;
+  };
+
+  /** Colliders still waiting on a DEM tile, refilled every pass. */
+  const unresolvedColliders: BuildingCollider[] = [];
+  const unresolvedColliderBudget = coarsePointer ? 24 : 48;
+  let unresolvedColliderClock = 0;
+
+  const colliderCenterDistanceSquared = (building: BuildingCollider) => {
+    const dx = (building.minX + building.maxX) * 0.5 - state.position.x;
+    const dz = (building.minZ + building.maxZ) * 0.5 - state.position.z;
+    return dx * dx + dz * dz;
+  };
+
+  /**
+   * Re-fit every collider that was ingested before its DEM tile had decoded.
+   *
+   * Buildings stream in far faster than the terrain under them, so on a first
+   * flight most of the valley is ingested against the campus fallback. Without
+   * this pass those boxes kept the wrong height forever (the feature-driven
+   * refresh only ever slid `ground`), which is what put the goose 7 m above the
+   * roofs it landed on and left aerial overlays hanging over the Valleys.
+   *
+   * Cheap enough to run four times a second: a DEM read is a lookup into an
+   * already-decoded tile, and nothing here allocates per building.
+   */
+  const refreshUnresolvedColliderTerrain = (
+    budget = unresolvedColliderBudget,
+  ) => {
+    if (!terrainEnabled || buildingColliders.length === 0) return false;
+    unresolvedColliders.length = 0;
+    const maximumDistanceSquared = UNRESOLVED_COLLIDER_RADIUS ** 2;
+    for (const building of buildingColliders) {
+      if (building.terrainResolved) continue;
+      if (colliderCenterDistanceSquared(building) > maximumDistanceSquared)
+        continue;
+      unresolvedColliders.push(building);
+    }
+    if (unresolvedColliders.length === 0) return false;
+    // Nearest first: the roof the goose is about to land on matters more than
+    // one on the far side of the valley.
+    unresolvedColliders.sort(
+      (a, b) =>
+        colliderCenterDistanceSquared(a) - colliderCenterDistanceSquared(b),
+    );
+    let changed = false;
+    const attempts = Math.min(budget, unresolvedColliders.length);
+    for (let index = 0; index < attempts; index += 1) {
+      const building = unresolvedColliders[index];
+      const fit = readColliderTerrain(
+        building.minX,
+        building.minZ,
+        building.maxX,
+        building.maxZ,
+        building.renderHeight,
+        building.renderMinHeight,
+      );
+      // Still a hole in the DEM: leave the flat box alone and try again next
+      // pass rather than freezing half an answer into it.
+      if (!fit.terrainResolved) continue;
+      const previousRoof = building.ground + building.height;
+      building.centerGround = fit.centerGround;
+      building.ground = fit.ground;
+      building.height = fit.height;
+      building.terrainResolved = true;
+      keepGooseOnRoof(
+        building,
+        previousRoof,
+        building.ground + building.height,
+      );
+      // The overlay was built hidden at the fallback elevation (or not at all,
+      // if the building was out of roof range when it was ingested, in which
+      // case buildTexturedBuildings creates it later already resolved). Now it
+      // has somewhere true to sit.
+      const roofMesh = texturedBuildingMeshByKey.get(building.sourceKey);
+      if (roofMesh) {
+        roofMesh.position.y = fit.centerGround;
+        roofMesh.visible = true;
+      }
+      changed = true;
+    }
+    if (!changed) return false;
+    buildingCollectionGeneration += 1;
+    refreshActiveBuildingColliders(true);
+    return true;
   };
 
   const createCampusSecrets = () => {
@@ -3174,17 +3419,63 @@ export function createGooseEngine(
       );
     });
 
+  /**
+   * Distance tests against the vehicle network only. Props deliberately do not
+   * use nearMappedCorridor(): that also counts footpaths, and campus clutter
+   * is supposed to line the footpaths. What a prop must stay out of is
+   * traffic, which is what plows it and hands out points nobody earned.
+   */
+  const nearTrafficCorridor = (
+    east: number,
+    north: number,
+    clearance: number,
+  ) =>
+    trafficRoutes.some((route) => {
+      const limit = route.laneWidth + clearance;
+      return distanceSquaredToRoute(route.points, east, north) < limit * limit;
+    });
+  /**
+   * The same test, ignoring one route. A cone row is deliberately parked on
+   * the shoulder of the drive it cones off, but where that drive crosses
+   * another road the row lands in the intersection, and traffic on the
+   * crossing road plows those cones down the street forever.
+   */
+  const nearCrossingTrafficCorridor = (
+    self: Route,
+    east: number,
+    north: number,
+    clearance: number,
+  ) =>
+    trafficRoutes.some((route) => {
+      if (route === self) return false;
+      const limit = route.laneWidth + clearance;
+      return distanceSquaredToRoute(route.points, east, north) < limit * limit;
+    });
+  const nearTrafficLaneCenter = (
+    east: number,
+    north: number,
+    clearance: number,
+  ) =>
+    trafficRoutes.some(
+      (route) =>
+        distanceSquaredToRoute(route.points, east, north) <
+        clearance * clearance,
+    );
+
+  const pointInsideAnyBuilding = (east: number, north: number) =>
+    buildingColliders.some(
+      (building) =>
+        east >= building.minX &&
+        east <= building.maxX &&
+        north >= building.minZ &&
+        north <= building.maxZ &&
+        pointInBuilding(east, north, building),
+    );
+
   const treePointBlocked = (x: number, z: number) => {
     if (isPointInMappedWater(x, z)) return true;
     if (nearMappedCorridor(x, z)) return true;
-    return buildingColliders.some(
-      (building) =>
-        x >= building.minX &&
-        x <= building.maxX &&
-        z >= building.minZ &&
-        z <= building.maxZ &&
-        pointInBuilding(x, z, building),
-    );
+    return pointInsideAnyBuilding(x, z);
   };
   const treePlacementBlocked = (index: number) => {
     const { x, z } = campusTreePoints[index].local;
@@ -3953,6 +4244,7 @@ export function createGooseEngine(
         points,
         cruiseByClass[roadClass] ?? 6.7,
         roadClass === 'service' ? 0.95 : 1.4,
+        roadClass,
       );
       if (route.total >= 45) routes.push(route);
     };
@@ -4795,6 +5087,8 @@ export function createGooseEngine(
     label: string,
     options?: { id?: string; subject?: string },
   ) => {
+    // The music dips under every trick call-out so the toast reads as an event.
+    audio.music.duck();
     chaosComboEvents += 1;
     chaosCombo = Math.min(5, 1 + Math.floor((chaosComboEvents - 1) / 3));
     chaosComboRemaining = CHAOS_COMBO_SECONDS;
@@ -4889,6 +5183,8 @@ export function createGooseEngine(
     groundAt: propGroundAt,
     isWater: isPointInMappedWater,
     resolveBuilding: resolvePropBuilding,
+    isRoad: nearTrafficCorridor,
+    isTrafficLane: nearTrafficLaneCenter,
     awardChaos,
     recordEvent,
     shake: (seconds) => {
@@ -4965,12 +5261,199 @@ export function createGooseEngine(
     if (propPoiBuffer.length > 0) propSystem.spawnFromPois(propPoiBuffer);
   };
 
+  // ---------------------------------------------------------------------
+  // Campus clutter: props derived from the walkway and service-road network.
+  // ---------------------------------------------------------------------
+  // Hand-authoring furniture for every quad in Kalamazoo is not a plan, and a
+  // campus with nothing loose on it is a campus with nothing to steal. These
+  // read the same OSM lines the crowd already walks and line them with trash
+  // cans, benches and the occasional roadworks cone row.
+
+  const clutterBuffer: PropPoi[] = [];
+  const clutterKeys = new Set<string>();
+  const clutterAnchor = new THREE.Vector2(
+    Number.POSITIVE_INFINITY,
+    Number.POSITIVE_INFINITY,
+  );
+  let clutterRouteGeneration = -1;
+  const clutterPoint = new THREE.Vector3();
+  const clutterDirection = new THREE.Vector3();
+
+  /** Position and tangent at `distance` along a polyline, written in place. */
+  const samplePolyline = (
+    points: THREE.Vector3[],
+    cumulative: number[],
+    distance: number,
+  ) => {
+    const total = cumulative[cumulative.length - 1] ?? 0;
+    const target = clamp(distance, 0, total);
+    let index = 1;
+    while (index < cumulative.length - 1 && cumulative[index] < target)
+      index += 1;
+    const startDistance = cumulative[index - 1];
+    const segment = Math.max(cumulative[index] - startDistance, 0.001);
+    const amount = (target - startDistance) / segment;
+    clutterPoint.copy(points[index - 1]).lerp(points[index], amount);
+    clutterDirection
+      .copy(points[index])
+      .sub(points[index - 1])
+      .normalize();
+  };
+
+  /** Somewhere a prop can stand without being furniture in a traffic lane. */
+  const clutterSpotBlocked = (east: number, north: number) =>
+    isPointInMappedWater(east, north) ||
+    nearTrafficCorridor(east, north, CLUTTER_ROAD_CLEARANCE) ||
+    pointInsideAnyBuilding(east, north);
+
+  const pushClutter = (kind: PropKind, east: number, north: number) => {
+    // Same rounding the prop system keys POI spawns by, so a spot that two
+    // overlapping walkway segments both nominate is only offered once.
+    const key = `${kind}:${Math.round(east)}:${Math.round(north)}`;
+    if (clutterKeys.has(key)) return false;
+    clutterKeys.add(key);
+    clutterBuffer.push({ east, north, kind });
+    return true;
+  };
+
+  /**
+   * Trash cans and benches along every mapped walkway, and a short cone row
+   * beside each long service road. Recycled like any other POI prop: they are
+   * spawned non-permanent, so walking away from a quad hands its budget to
+   * the next one.
+   */
+  const collectWalkwayClutter = (force = false) => {
+    if (pedestrianRoutes.length === 0 && trafficRoutes.length === 0) return;
+    const movedFromAnchor =
+      Math.hypot(
+        state.position.x - clutterAnchor.x,
+        state.position.z - clutterAnchor.y,
+      ) >= CLUTTER_RESCAN_DISTANCE;
+    if (
+      !force &&
+      !movedFromAnchor &&
+      clutterRouteGeneration === pedestrianRouteGeneration
+    )
+      return;
+    clutterAnchor.set(state.position.x, state.position.z);
+    clutterRouteGeneration = pedestrianRouteGeneration;
+    clutterBuffer.length = 0;
+    clutterKeys.clear();
+
+    // Whatever is left of the prop budget after the authored table and the
+    // OSM POIs, minus a little headroom so a walkway can never crowd out the
+    // furniture the placement table put next to the goose.
+    const budget = Math.max(
+      0,
+      Math.min(
+        WALKWAY_PROP_LIMIT,
+        PROP_CAPACITY - propSystem.stats().props - CLUTTER_HEADROOM,
+      ),
+    );
+    if (budget <= 0) return;
+
+    for (const route of pedestrianRoutes) {
+      if (!route.isMappedWalkway) continue;
+      if (clutterBuffer.length >= WALKWAY_PROP_LIMIT) break;
+      let side = 1;
+      for (const [kind, spacing] of WALKWAY_CLUTTER_CADENCE) {
+        for (
+          let distance = spacing * 0.5;
+          distance < route.total;
+          distance += spacing
+        ) {
+          if (clutterBuffer.length >= WALKWAY_PROP_LIMIT) break;
+          samplePolyline(route.points, route.cumulative, distance);
+          // Right-hand normal of the tangent, flipped every prop so a walkway
+          // reads as furnished on both sides rather than fenced on one.
+          const east =
+            clutterPoint.x + clutterDirection.z * WALKWAY_PROP_OFFSET * side;
+          const north =
+            clutterPoint.z - clutterDirection.x * WALKWAY_PROP_OFFSET * side;
+          side = -side;
+          if (
+            Math.hypot(east - state.position.x, north - state.position.z) >
+            PROP_POI_RADIUS
+          )
+            continue;
+          if (clutterSpotBlocked(east, north)) continue;
+          pushClutter(kind, east, north);
+        }
+      }
+    }
+
+    let coneRows = 0;
+    for (const route of trafficRoutes) {
+      if (coneRows >= SERVICE_CONE_ROW_LIMIT) break;
+      if (route.roadClass !== 'service') continue;
+      if (route.total < SERVICE_CONE_MIN_LENGTH) continue;
+      samplePolyline(route.points, route.cumulative, route.total * 0.5);
+      if (
+        Math.hypot(
+          clutterPoint.x - state.position.x,
+          clutterPoint.z - state.position.z,
+        ) > SERVICE_CONE_RADIUS
+      )
+        continue;
+      // Always the same side of the line, because roadworks coning off half a
+      // service drive is the look; scattering them reads as litter.
+      const shoulder = route.laneWidth + SERVICE_CONE_SHOULDER;
+      const start =
+        route.total * 0.5 -
+        (SERVICE_CONE_COUNT - 1) * 0.5 * SERVICE_CONE_SPACING;
+      let placed = 0;
+      for (let index = 0; index < SERVICE_CONE_COUNT; index += 1) {
+        samplePolyline(
+          route.points,
+          route.cumulative,
+          start + index * SERVICE_CONE_SPACING,
+        );
+        const east = clutterPoint.x + clutterDirection.z * shoulder;
+        const north = clutterPoint.z - clutterDirection.x * shoulder;
+        if (isPointInMappedWater(east, north)) continue;
+        if (pointInsideAnyBuilding(east, north)) continue;
+        if (
+          nearCrossingTrafficCorridor(
+            route,
+            east,
+            north,
+            CLUTTER_ROAD_CLEARANCE,
+          )
+        )
+          continue;
+        if (pushClutter('cone', east, north)) placed += 1;
+      }
+      if (placed > 0) coneRows += 1;
+    }
+
+    if (clutterBuffer.length === 0) return;
+    // Nearest first, then cut to the budget: whichever spots are closest to
+    // the goose are the ones worth spending the remaining bodies on, and the
+    // prop system evicts the farthest body when it is full anyway.
+    clutterBuffer.sort(
+      (a, b) =>
+        Math.hypot(a.east - state.position.x, a.north - state.position.z) -
+        Math.hypot(b.east - state.position.x, b.north - state.position.z),
+    );
+    propSystem.spawnFromPois(
+      clutterBuffer.length > budget
+        ? clutterBuffer.slice(0, budget)
+        : clutterBuffer,
+    );
+  };
+
+  /** Everything the world streams into the prop system, in one call. */
+  const collectStreamedProps = (force = false) => {
+    collectPropPois(force);
+    collectWalkwayClutter(force);
+  };
+
   const refreshProps = (focusX: number, focusZ: number) => {
     propSystem.spawnFromPlacements(PROP_PLACEMENTS, authoredToLocal, {
       x: focusX,
       z: focusZ,
     });
-    collectPropPois(true);
+    collectStreamedProps(true);
   };
 
   const launchGoose = (verticalSpeed: number, forwardBoost: number) => {
@@ -6190,7 +6673,7 @@ export function createGooseEngine(
       peakAgl = 0;
       if (!takeoffHintShown) {
         takeoffHintShown = true;
-        hooks.onToast('Wingbeat — you are airborne');
+        hooks.onToast('Wingbeat · you are airborne');
       }
     }
   };
@@ -6272,7 +6755,7 @@ export function createGooseEngine(
       }
       state.bank = 0;
       waterPlaningElapsed = 0;
-      hooks.onToast('Planing complete — now swimming');
+      hooks.onToast('Planing complete · now swimming');
     }
   };
 
@@ -6457,7 +6940,7 @@ export function createGooseEngine(
     if (altitudeBoost > 0) {
       const horizontalSpeed = Math.hypot(state.velocity.x, state.velocity.z);
       const boostedCruise = lerp(
-        18.5,
+        BASE_CRUISE_SPEED,
         ALTITUDE_BOOST_CRUISE_SPEED,
         altitudeBoost,
       );
@@ -6526,8 +7009,8 @@ export function createGooseEngine(
         } else {
           hooks.onToast(
             impact < 2.4
-              ? 'Clean water landing — splash!'
-              : `Big splash — ${flareHint} before touchdown`,
+              ? 'Clean water landing · splash!'
+              : `Big splash · ${flareHint} before touchdown`,
           );
         }
       } else if (roofKeyUnderGoose() !== null) {
@@ -6569,8 +7052,8 @@ export function createGooseEngine(
         } else {
           hooks.onToast(
             impact < 2.4
-              ? 'Touchdown — now waddle'
-              : `Bumpy landing — ${flareHint} to soften it`,
+              ? 'Touchdown · now waddle'
+              : `Bumpy landing · ${flareHint} to soften it`,
           );
         }
       }
@@ -6873,6 +7356,17 @@ export function createGooseEngine(
   const setMirror = (name: string, value: string) => {
     if (mirrorHost.dataset[name] !== value) mirrorHost.dataset[name] = value;
   };
+  // Some readouts are engine-only: no HUD prop carries them, so they are
+  // written straight onto the shell the harness reads its data attributes
+  // from. React never diffs an attribute it does not render, so writing here
+  // cannot fight the HUD.
+  let shellHost: HTMLElement | null = null;
+  const setShellMirror = (name: string, value: string) => {
+    shellHost ??= mirrorHost.closest('main.game-shell');
+    if (shellHost && shellHost.dataset[name] !== value) {
+      shellHost.dataset[name] = value;
+    }
+  };
   const mirrorHarnessAttributes = () => {
     setMirror('holding', heldLabel() ?? '');
     let target: CampusNpc | null = null;
@@ -6896,6 +7390,9 @@ export function createGooseEngine(
     // HUD to publish them on the shell.
     setMirror('ragdolling', tumbleRemaining > 0 ? 'true' : 'false');
     setMirror('timeScale', timeScale.toFixed(3));
+    const resolvedBuildings = String(resolvedBuildingColliderCount());
+    setMirror('buildingsResolved', resolvedBuildings);
+    setShellMirror('buildingsResolved', resolvedBuildings);
   };
 
   /**
@@ -7584,6 +8081,7 @@ export function createGooseEngine(
         pointInBuilding(state.position.x, state.position.z, building)
       );
     });
+    const resolvedBuildingCount = resolvedBuildingColliderCount();
     const projectedGoose = state.position
       .clone()
       .applyMatrix4(camera.projectionMatrix);
@@ -7640,6 +8138,7 @@ export function createGooseEngine(
       north: state.position.z,
       heading: visualHeading,
       buildings: buildingColliders.length,
+      buildingsResolved: resolvedBuildingCount,
       cameraZoom: map.getZoom(),
       cameraScale: cameraDistanceScale,
       insideBuilding,
@@ -7775,6 +8274,10 @@ export function createGooseEngine(
     propPoiAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
     propPoiClock = PROP_POI_REFRESH_SECONDS;
     propPoiScans = 0;
+    // A travel lands in a part of town whose colliders were ingested against
+    // the old campus elevation; sweep them before the goose can stand on one.
+    unresolvedColliderClock = 0;
+    refreshUnresolvedColliderTerrain();
     refreshProps(spawnPoint.x, spawnPoint.y);
     propSystem.updateVisuals(1, elapsedTime);
     return spawnPoint;
@@ -7949,7 +8452,7 @@ export function createGooseEngine(
       buildingColliders.length === 0 ? buildTexturedBuildings() : false;
     const woodlandChanged = collectMappedWoodlandTrees();
     const treePlacementsChanged = refreshTreePlacementMask();
-    collectPropPois();
+    collectStreamedProps();
     if (trafficChanged) updateTrafficVisuals(1);
     if (
       trafficChanged ||
@@ -7974,13 +8477,9 @@ export function createGooseEngine(
       buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
     }
     if (terrainSourceId && event.sourceId === terrainSourceId) {
-      refreshActiveBuildingColliders();
-      if (
-        activeBuildingColliders.some((building) => !building.terrainResolved)
-      ) {
-        buildingRefreshRequested = true;
-        buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
-      }
+      // A DEM tile just decoded, so the collider sweep is worth running now
+      // rather than on its next quarter-second tick.
+      unresolvedColliderClock = Math.min(unresolvedColliderClock, 0.05);
       treeRefreshClock = Math.min(treeRefreshClock, 0.12);
       campusSecrets.forEach((secret, index) => {
         secret.terrainRefreshRemaining = Math.min(
@@ -7999,6 +8498,9 @@ export function createGooseEngine(
   map.on('idle', onIdle);
   map.on('sourcedata', onSourceData);
   onIdle();
+  // The first ingestion happens while the DEM is still streaming, so give the
+  // colliders one sweep before anyone can look at a roof.
+  refreshUnresolvedColliderTerrain();
 
   const frame = (now: number) => {
     if (destroyed) return;
@@ -8031,11 +8533,11 @@ export function createGooseEngine(
       buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
     }
     if (!buildingRefreshRequested && buildingRefreshClock <= 0) {
+      // Unresolved terrain no longer re-triggers a full feature scan: that is
+      // refreshUnresolvedColliderTerrain()'s job now, and it costs five DEM
+      // lookups instead of a querySourceFeatures over the whole tile.
       refreshActiveBuildingColliders();
-      buildingRefreshRequested = activeBuildingColliders.some(
-        (building) => !building.terrainResolved,
-      );
-      if (!buildingRefreshRequested) buildingRefreshClock = 0.2;
+      buildingRefreshClock = 0.2;
     }
     if (buildingRefreshRequested && buildingRefreshClock <= 0) {
       buildingRefreshRequested = false;
@@ -8043,6 +8545,15 @@ export function createGooseEngine(
       if (buildTexturedBuildings()) {
         refreshTreePlacementMask();
         map.triggerRepaint();
+      }
+    }
+    // Buildings arrive long before the DEM under them. This is the pass that
+    // lands their collision boxes and roof overlays once it shows up.
+    if (playing) {
+      unresolvedColliderClock -= frameDt;
+      if (unresolvedColliderClock <= 0) {
+        unresolvedColliderClock = UNRESOLVED_COLLIDER_INTERVAL;
+        if (refreshUnresolvedColliderTerrain()) map.triggerRepaint();
       }
     }
     if (simulating && trafficRefreshClock <= 0) {
@@ -8092,7 +8603,7 @@ export function createGooseEngine(
       propPoiClock -= frameDt;
       if (propPoiClock <= 0) {
         propPoiClock = PROP_POI_REFRESH_SECONDS;
-        collectPropPois();
+        collectStreamedProps();
       }
     }
     if (!playing) {
@@ -8123,6 +8634,15 @@ export function createGooseEngine(
       mode: renderState.mode,
       paused: paused || !playing,
     });
+    // Combo (x2+) or the jetstream boost tops the backing track out; on the
+    // ground/water it settles to a calm 0.4, in the air a livelier 0.7.
+    audio.music.setIntensity(
+      chaosCombo >= 2 || altitudeBoostActive
+        ? 1
+        : renderState.mode === 'waddling' || renderState.mode === 'swimming'
+          ? 0.4
+          : 0.7,
+    );
     telemetryClock -= frameDt;
     if (telemetryClock <= 0) {
       telemetryClock = 0.1;
@@ -8195,7 +8715,9 @@ export function createGooseEngine(
   const announceJetstream = () => {
     if (modifiers.jetstreamAlways && jetstreamToastShown) return;
     jetstreamToastShown = true;
-    hooks.onToast('JETSTREAM · 50m altitude speed boost engaged');
+    hooks.onToast(
+      `JETSTREAM · +${JETSTREAM_BOOST_PERCENT}% speed above ${ALTITUDE_BOOST_HEIGHT}m`,
+    );
   };
 
   /** Angel Goose's halo: hidden unless active, gently bobbing and turning. */
@@ -8335,6 +8857,7 @@ export function createGooseEngine(
     // store the HUD writes them to, so this funnel is where they land. Both
     // are cheap idempotent assignments; no diffing is worth the code.
     audio.setEnabled(saved.settings.sound, saved.settings.ambient);
+    audio.music.setEnabled(saved.settings.music);
     slowMotionEnabled = saved.settings.slowMotion;
     if (!slowMotionEnabled) {
       // Turning it off mid-dip should take effect now, not in 0.4 seconds.
@@ -8377,12 +8900,13 @@ export function createGooseEngine(
   return {
     start() {
       audio.unlock();
+      audio.music.start();
       playing = true;
       setGameplayVisibility(true);
       previousTime = performance.now();
       updateCamera(1 / 60, renderState, true);
       hooks.onToast(
-        `${campusSecrets.length} Kalamazoo secrets are live — explore the city, find the runaway WMU Bronco, and build your flock`,
+        `${campusSecrets.length} Kalamazoo secrets are live · explore the city, find the runaway WMU Bronco, and build your flock`,
       );
     },
     reset() {
@@ -8392,7 +8916,7 @@ export function createGooseEngine(
       setGameplayVisibility(true);
       previousTime = performance.now();
       hooks.onToast(
-        'Respawned above WMU — your secret discoveries and score are safe',
+        'Respawned above WMU · your secret discoveries and score are safe',
       );
     },
     setKey(code, pressed) {
@@ -8449,6 +8973,7 @@ export function createGooseEngine(
     setPaused(next) {
       if (paused === next) return;
       paused = next;
+      audio.music.setPaused(paused);
       if (paused) {
         // Held keys would otherwise still be held when the game comes back.
         keys.clear();
