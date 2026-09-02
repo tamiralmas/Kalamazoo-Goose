@@ -432,6 +432,8 @@ const BUILDING_RESCAN_DISTANCE = 240;
  * the camera having moved on to a different chunking.
  */
 const STALE_CHUNK_SCANS = 3;
+/** Seconds between the steady building scans that feed that count. */
+const BUILDING_RESCAN_INTERVAL = 1.2;
 /** Tallest lip a goose on foot walks up rather than into, in metres. */
 const STEP_UP_HEIGHT = 0.7;
 /** How far out colliders keep chasing a DEM that had not decoded yet. */
@@ -1305,6 +1307,7 @@ export function createGooseEngine(
   let surfaceClock = 0;
   let telemetryClock = 0;
   let buildingRefreshClock = 0;
+  let buildingRescanClock = BUILDING_RESCAN_INTERVAL;
   let buildingRefreshRequested = true;
   let trafficRefreshClock = 0;
   let trafficBuilt = false;
@@ -2124,6 +2127,32 @@ export function createGooseEngine(
    * merely reloading does not drop the roof from under the goose; the roof it
    * is standing on is never dropped here at all.
    */
+  /**
+   * The highest other roof under the goose within 3 m of the one it stands
+   * on, or null. Used when that roof's chunk is retired so the goose can be
+   * moved onto the chunk that now draws the same building there.
+   */
+  const replacementRoofUnderGoose = (retiring: BuildingCollider) => {
+    let best: number | null = null;
+    for (const building of buildingColliders) {
+      if (building === retiring || building.missingScans >= STALE_CHUNK_SCANS)
+        continue;
+      if (
+        state.position.x < building.minX ||
+        state.position.x > building.maxX ||
+        state.position.z < building.minZ ||
+        state.position.z > building.maxZ
+      )
+        continue;
+      const roof = colliderRoof(building);
+      if (Math.abs(roof - state.ground) > 3) continue;
+      if (!pointInBuilding(state.position.x, state.position.z, building))
+        continue;
+      if (best === null || roof > best) best = roof;
+    }
+    return best;
+  };
+
   const pruneUnseenBuildingChunks = () => {
     const scanRadiusSquared = (BUILDING_INGEST_RADIUS - 60) ** 2;
     let changed = false;
@@ -2135,8 +2164,18 @@ export function createGooseEngine(
         state.mode !== 'flying' &&
         Math.abs(state.ground - colliderRoof(building)) < 0.5 &&
         pointInBuilding(state.position.x, state.position.z, building)
-      )
-        continue;
+      ) {
+        // The goose is standing on the chunk being retired. Hand it to the
+        // chunk that replaced it (the same roof, drawn a little higher or
+        // lower now) rather than dropping it; with no replacement under its
+        // feet the old box stays until it walks off.
+        const replacement = replacementRoofUnderGoose(building);
+        if (replacement === null) continue;
+        state.position.y = replacement + 0.04;
+        previousState.position.y = state.position.y;
+        renderState.position.y = state.position.y;
+        state.ground = replacement;
+      }
       removeBuildingCollider(index);
       changed = true;
     }
@@ -8691,6 +8730,17 @@ export function createGooseEngine(
     ) {
       buildingRefreshRequested = true;
       buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
+    }
+    // Tile loads and long moves request scans, but the chunk set MapLibre
+    // draws also changes when the camera merely orbits or zooms, and the
+    // stale-chunk pruning needs scans to keep counting after the last tile
+    // has landed. A slow steady cadence covers both.
+    if (playing) {
+      buildingRescanClock -= frameDt;
+      if (buildingRescanClock <= 0) {
+        buildingRescanClock = BUILDING_RESCAN_INTERVAL;
+        buildingRefreshRequested = true;
+      }
     }
     if (!buildingRefreshRequested && buildingRefreshClock <= 0) {
       // Unresolved terrain no longer re-triggers a full feature scan: that is
