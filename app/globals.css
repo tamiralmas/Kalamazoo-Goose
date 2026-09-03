@@ -117,6 +117,23 @@
   overscroll-behavior: none;
 }
 
+/* Mobile Safari can still start its long-press loupe on button contents even
+   when the game shell itself is not selectable. Apply the suppression to the
+   actual controls and make decorative button contents transparent to hit
+   testing so a held gesture always belongs to the button. */
+.game-shell button,
+.game-shell button * {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+.touch-pad button > *,
+.touch-actions button > * {
+  pointer-events: none;
+  -webkit-user-drag: none;
+}
+
 .game-canvas,
 .game-canvas canvas {
   width: 100%;
@@ -2457,7 +2474,7 @@ kbd {
     & .mobile-status-strip {
       position: absolute;
       z-index: 5;
-      top: calc(86px + env(safe-area-inset-top));
+      top: calc(72px + env(safe-area-inset-top));
       left: 50%;
       display: grid;
       width: min(
@@ -2518,7 +2535,7 @@ kbd {
     & .mobile-alert-stack {
       position: absolute;
       z-index: 7;
-      top: calc(138px + env(safe-area-inset-top));
+      top: calc(126px + env(safe-area-inset-top));
       right: calc(14px + env(safe-area-inset-right));
       left: calc(14px + env(safe-area-inset-left));
       display: flex;
@@ -2526,6 +2543,10 @@ kbd {
       align-items: center;
       gap: 7px;
       pointer-events: none;
+    }
+
+    & .mobile-alert-stack.has-abilities {
+      top: calc(148px + env(safe-area-inset-top));
     }
 
     & .mobile-discovery-chip {
@@ -2835,7 +2856,7 @@ kbd {
   & .mobile-status-strip {
     position: absolute;
     z-index: 5;
-    top: calc(86px + env(safe-area-inset-top));
+    top: calc(72px + env(safe-area-inset-top));
     left: 50%;
     display: grid;
     width: min(
@@ -2896,7 +2917,7 @@ kbd {
   & .mobile-alert-stack {
     position: absolute;
     z-index: 7;
-    top: calc(138px + env(safe-area-inset-top));
+    top: calc(126px + env(safe-area-inset-top));
     right: calc(14px + env(safe-area-inset-right));
     left: calc(14px + env(safe-area-inset-left));
     display: flex;
@@ -2904,6 +2925,10 @@ kbd {
     align-items: center;
     gap: 7px;
     pointer-events: none;
+  }
+
+  & .mobile-alert-stack.has-abilities {
+    top: calc(148px + env(safe-area-inset-top));
   }
 
   & .mobile-discovery-chip {
@@ -3370,14 +3395,20 @@ kbd {
     min-height: 48px;
   }
 
-  .mobile-status-strip {
-    top: calc(68px + env(safe-area-inset-top));
+  .game-shell:not([data-input='pointer']) .mobile-status-strip,
+  .game-shell[data-input='touch'] .mobile-status-strip {
+    top: calc(62px + env(safe-area-inset-top));
     width: calc(
       100vw - 24px - env(safe-area-inset-left) - env(safe-area-inset-right)
     );
   }
-  .mobile-alert-stack {
-    top: calc(119px + env(safe-area-inset-top));
+  .game-shell:not([data-input='pointer']) .mobile-alert-stack,
+  .game-shell[data-input='touch'] .mobile-alert-stack {
+    top: calc(116px + env(safe-area-inset-top));
+  }
+  .game-shell:not([data-input='pointer']) .mobile-alert-stack.has-abilities,
+  .game-shell[data-input='touch'] .mobile-alert-stack.has-abilities {
+    top: calc(138px + env(safe-area-inset-top));
   }
   .is-launching .mobile-alert-stack {
     top: calc(64px + env(safe-area-inset-top));
@@ -3497,6 +3528,12 @@ kbd {
 }
 
 @media (max-width: 380px) {
+  .game-shell.is-playing .game-topbar {
+    grid-template-columns: 1fr;
+  }
+  .game-shell.is-playing .brand-lockup {
+    display: none;
+  }
   .brand-lockup > span:last-child {
     display: none;
   }
@@ -3544,7 +3581,8 @@ kbd {
   .location-chip {
     display: none;
   }
-  .mobile-status-strip {
+  .game-shell:not([data-input='pointer']) .mobile-status-strip,
+  .game-shell[data-input='touch'] .mobile-status-strip {
     top: calc(57px + env(safe-area-inset-top));
     width: min(
       520px,
@@ -3553,8 +3591,13 @@ kbd {
       )
     );
   }
-  .mobile-alert-stack {
-    top: calc(98px + env(safe-area-inset-top));
+  .game-shell:not([data-input='pointer']) .mobile-alert-stack,
+  .game-shell[data-input='touch'] .mobile-alert-stack {
+    top: calc(107px + env(safe-area-inset-top));
+  }
+  .game-shell:not([data-input='pointer']) .mobile-alert-stack.has-abilities,
+  .game-shell[data-input='touch'] .mobile-alert-stack.has-abilities {
+    top: calc(129px + env(safe-area-inset-top));
   }
   .is-launching .mobile-alert-stack {
     top: calc(58px + env(safe-area-inset-top));

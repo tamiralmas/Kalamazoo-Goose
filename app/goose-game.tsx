@@ -1995,7 +1995,11 @@ export function GooseGame() {
             </span>
           </div>
 
-          <div className="mobile-controls" aria-label="Touch flight controls">
+          <div
+            className="mobile-controls"
+            aria-label="Touch flight controls"
+            onContextMenu={(event) => event.preventDefault()}
+          >
             <div className="touch-pad" onPointerMove={moveTouchDirection}>
               <button
                 type="button"
@@ -2207,7 +2211,9 @@ export function GooseGame() {
         </>
       )}
 
-      <div className="mobile-alert-stack">
+      <div
+        className={`mobile-alert-stack${playing && activeAbilityMutators.length > 0 ? ' has-abilities' : ''}`}
+      >
         {showMobileDiscoveryChip && (
           <div
             className="mobile-discovery-chip"
