@@ -4175,15 +4175,29 @@ export function createGooseEngine(
       const candidateLimit = Math.ceil(
         MAX_TREE_COUNT * (coarsePointer ? 1.25 : 1.75),
       );
-      const gridInspectionLimit = coarsePointer ? 6_000 : 12_000;
+      const gridInspectionLimit = coarsePointer ? 16_000 : 32_000;
       let gridInspections = 0;
 
+      // Collect every wood polygon that overlaps the ingest window first.
+      // The map no longer slices vector tiles (see goose-game.tsx), so a
+      // single feature can be a whole square kilometre of forest, and the
+      // old polygon-by-polygon walk spent its entire cell budget on the
+      // first big one it met, wherever that was, leaving the woods next to
+      // the goose bare. Walking cells outward from the goose instead means
+      // the budget always buys the nearest trees.
+      const windowMinX = state.position.x - WOODLAND_INGEST_RADIUS;
+      const windowMaxX = state.position.x + WOODLAND_INGEST_RADIUS;
+      const windowMinZ = state.position.z - WOODLAND_INGEST_RADIUS;
+      const windowMaxZ = state.position.z + WOODLAND_INGEST_RADIUS;
+      const woods: Array<{
+        outer: THREE.Vector2[];
+        holes: THREE.Vector2[][];
+        minX: number;
+        maxX: number;
+        minZ: number;
+        maxZ: number;
+      }> = [];
       features.forEach((feature) => {
-        if (
-          candidates.size >= candidateLimit ||
-          gridInspections >= gridInspectionLimit
-        )
-          return;
         if (feature.properties?.class !== 'wood') return;
         const polygonSets =
           feature.geometry.type === 'Polygon'
@@ -4192,17 +4206,29 @@ export function createGooseEngine(
               ? (feature.geometry.coordinates as number[][][][])
               : [];
         polygonSets.forEach((rings) => {
-          if (
-            candidates.size >= candidateLimit ||
-            gridInspections >= gridInspectionLimit
-          )
-            return;
           const outer = (rings[0] ?? [])
             .filter((coordinate) => coordinate.length >= 2)
             .map(([longitude, latitude]) => geoToLocal(longitude, latitude))
             .slice(0, -1)
             .map((point) => new THREE.Vector2(point.x, point.z));
           if (outer.length < 3) return;
+          let minX = Number.POSITIVE_INFINITY;
+          let maxX = Number.NEGATIVE_INFINITY;
+          let minZ = Number.POSITIVE_INFINITY;
+          let maxZ = Number.NEGATIVE_INFINITY;
+          for (const point of outer) {
+            if (point.x < minX) minX = point.x;
+            if (point.x > maxX) maxX = point.x;
+            if (point.y < minZ) minZ = point.y;
+            if (point.y > maxZ) maxZ = point.y;
+          }
+          if (
+            maxX < windowMinX ||
+            minX > windowMaxX ||
+            maxZ < windowMinZ ||
+            minZ > windowMaxZ
+          )
+            return;
           const holes = rings
             .slice(1)
             .map((ring) =>
@@ -4213,74 +4239,73 @@ export function createGooseEngine(
                 .map((point) => new THREE.Vector2(point.x, point.z)),
             )
             .filter((ring) => ring.length >= 3);
-          const minX = Math.max(
-            state.position.x - WOODLAND_INGEST_RADIUS,
-            Math.min(...outer.map((point) => point.x)),
-          );
-          const maxX = Math.min(
-            state.position.x + WOODLAND_INGEST_RADIUS,
-            Math.max(...outer.map((point) => point.x)),
-          );
-          const minZ = Math.max(
-            state.position.z - WOODLAND_INGEST_RADIUS,
-            Math.min(...outer.map((point) => point.y)),
-          );
-          const maxZ = Math.min(
-            state.position.z + WOODLAND_INGEST_RADIUS,
-            Math.max(...outer.map((point) => point.y)),
-          );
-          if (maxX <= minX || maxZ <= minZ) return;
-          const firstCellX = Math.floor(minX / spacing);
-          const lastCellX = Math.ceil(maxX / spacing);
-          const firstCellZ = Math.floor(minZ / spacing);
-          const lastCellZ = Math.ceil(maxZ / spacing);
-          for (
-            let cellZ = firstCellZ;
-            cellZ <= lastCellZ &&
-            candidates.size < candidateLimit &&
-            gridInspections < gridInspectionLimit;
-            cellZ += 1
-          ) {
-            for (
-              let cellX = firstCellX;
-              cellX <= lastCellX &&
-              candidates.size < candidateLimit &&
-              gridInspections < gridInspectionLimit;
-              cellX += 1
-            ) {
-              gridInspections += 1;
-              const key = `${cellX}:${cellZ}`;
-              if (woodlandTreeKeys.has(key) || candidates.has(key)) continue;
-              const hash =
-                Math.sin(cellX * 12.9898 + cellZ * 78.233) * 43758.5453;
-              const unit = hash - Math.floor(hash);
-              const secondHash =
-                Math.sin(cellX * 39.3467 - cellZ * 11.135) * 24634.6345;
-              const secondUnit = secondHash - Math.floor(secondHash);
-              const east = (cellX + 0.5) * spacing + (unit - 0.5) * 4.8;
-              const north = (cellZ + 0.5) * spacing + (secondUnit - 0.5) * 4.8;
-              if (
-                !pointInRing(east, north, outer) ||
-                holes.some((hole) => pointInRing(east, north, hole)) ||
-                mappedTrees.some(
-                  (tree) =>
-                    Math.hypot(tree.local.x - east, tree.local.z - north) < 6,
-                )
-              )
-                continue;
-              candidates.set(key, {
-                id:
-                  9_900_000_000 +
-                  Math.abs(cellX * 73_856_093 + cellZ * 19_349_663),
-                key,
-                local: new THREE.Vector3(east, 0, north),
-                supplemental: true,
-                scale: 0.76 + unit * 0.25,
-              });
-            }
-          }
+          woods.push({ outer, holes, minX, maxX, minZ, maxZ });
         });
       });
+
+      if (woods.length > 0) {
+        const centerCellX = Math.floor(state.position.x / spacing);
+        const centerCellZ = Math.floor(state.position.z / spacing);
+        const maxRing = Math.ceil(WOODLAND_INGEST_RADIUS / spacing);
+        const inspectCell = (cellX: number, cellZ: number) => {
+          gridInspections += 1;
+          const key = `${cellX}:${cellZ}`;
+          if (woodlandTreeKeys.has(key) || candidates.has(key)) return;
+          const hash = Math.sin(cellX * 12.9898 + cellZ * 78.233) * 43758.5453;
+          const unit = hash - Math.floor(hash);
+          const secondHash =
+            Math.sin(cellX * 39.3467 - cellZ * 11.135) * 24634.6345;
+          const secondUnit = secondHash - Math.floor(secondHash);
+          const east = (cellX + 0.5) * spacing + (unit - 0.5) * 4.8;
+          const north = (cellZ + 0.5) * spacing + (secondUnit - 0.5) * 4.8;
+          let wooded = false;
+          for (const wood of woods) {
+            if (
+              east < wood.minX ||
+              east > wood.maxX ||
+              north < wood.minZ ||
+              north > wood.maxZ ||
+              !pointInRing(east, north, wood.outer) ||
+              wood.holes.some((hole) => pointInRing(east, north, hole))
+            )
+              continue;
+            wooded = true;
+            break;
+          }
+          if (
+            !wooded ||
+            mappedTrees.some(
+              (tree) =>
+                Math.hypot(tree.local.x - east, tree.local.z - north) < 6,
+            )
+          )
+            return;
+          candidates.set(key, {
+            id:
+              9_900_000_000 + Math.abs(cellX * 73_856_093 + cellZ * 19_349_663),
+            key,
+            local: new THREE.Vector3(east, 0, north),
+            supplemental: true,
+            scale: 0.76 + unit * 0.25,
+          });
+        };
+        const budgetLeft = () =>
+          candidates.size < candidateLimit &&
+          gridInspections < gridInspectionLimit;
+        inspectCell(centerCellX, centerCellZ);
+        // Square rings outward: the top and bottom rows, then the two side
+        // columns without their corners, so every cell is visited once.
+        for (let ring = 1; ring <= maxRing && budgetLeft(); ring += 1) {
+          for (let dx = -ring; dx <= ring && budgetLeft(); dx += 1) {
+            inspectCell(centerCellX + dx, centerCellZ - ring);
+            if (budgetLeft()) inspectCell(centerCellX + dx, centerCellZ + ring);
+          }
+          for (let dz = -ring + 1; dz <= ring - 1 && budgetLeft(); dz += 1) {
+            inspectCell(centerCellX - ring, centerCellZ + dz);
+            if (budgetLeft()) inspectCell(centerCellX + ring, centerCellZ + dz);
+          }
+        }
+      }
 
       woodlandAnchor.set(state.position.x, state.position.z);
       woodlandScanNeedsRetry = !map.isSourceLoaded(landcoverSourceId);
