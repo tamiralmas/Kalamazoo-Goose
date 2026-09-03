@@ -40,3 +40,8 @@ next-env.d.ts
 
 # TypeScript incremental build info
 tsconfig.tsbuildinfo
+
+# Local documentation and development-only files
+/README.md
+/* outputs/
+/Playtest.cmd
