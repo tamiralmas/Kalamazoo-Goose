@@ -52,6 +52,13 @@ import type {
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 
 import { Button } from '@/components/ui/button';
+import {
+  BUILDING_SOURCE_LAYER,
+  BUILDING_TILE_TEMPLATE,
+  registerBuildingTileProtocol,
+  setOsmBuildingTileTemplate,
+} from '@/app/building-tiles';
+import { BUILDING_TILE_ZOOM } from '@/app/building-tiles-coverage';
 import { TOTAL_CAMPUS_SECRETS } from '@/app/chaos-secrets';
 import { isTouchDevice } from '@/app/device';
 import { CONTROL_CODES, JETSTREAM_BOOST_PERCENT } from '@/app/game-contract';
@@ -104,6 +111,10 @@ const MINIMAP_IN_VIEW_MARGIN_PX = 9;
 const MINIMAP_EDGE_MARKER_LIMIT = 3;
 /** How long the launch waits for the spawn DEM tile before starting flat. */
 const TERRAIN_READY_DEADLINE_MS = 12_000;
+/** The stitched building source (LiDAR tiles near campus, OpenFreeMap beyond). */
+const BUILDING_SOURCE_ID = 'wmug-buildings';
+const BUILDING_HEIGHT_ATTRIBUTION =
+  'Building heights © <a href="https://www.usgs.gov/3d-elevation-program" target="_blank">USGS 3DEP</a>';
 const EARTH_CIRCUMFERENCE_METERS = 40_075_016.686;
 
 const lngLatToMinimapPixel = (longitude: number, latitude: number) => {
@@ -563,104 +574,104 @@ export function GooseGame() {
               }
             });
 
-            let buildingLayer = layers.find(
+            // The style's own 3D buildings are replaced by one stitched
+            // source: the game's LiDAR-measured tiles around campus, and
+            // OpenFreeMap's buildings beyond them (see building-tiles.ts).
+            // The engine finds building geometry through the fill-extrusion
+            // layer's source, so the new layer takes the old one's slot.
+            const osmBuildingLayer =
+              layers.find(
+                (layer) =>
+                  layer.type === 'fill-extrusion' &&
+                  layer['source-layer'] === BUILDING_SOURCE_LAYER,
+              ) ??
+              layers.find(
+                (layer) =>
+                  'source-layer' in layer &&
+                  layer['source-layer'] === BUILDING_SOURCE_LAYER,
+              );
+            const osmBuildingSourceId =
+              osmBuildingLayer &&
+              'source' in osmBuildingLayer &&
+              typeof osmBuildingLayer.source === 'string'
+                ? osmBuildingLayer.source
+                : null;
+            if (!osmBuildingSourceId) {
+              throw new Error(
+                'The map style did not provide OSM building data.',
+              );
+            }
+            const osmBuildingSource = map.getSource(osmBuildingSourceId) as
+              | { tiles?: string[] }
+              | undefined;
+            setOsmBuildingTileTemplate(osmBuildingSource?.tiles?.[0] ?? null);
+            registerBuildingTileProtocol(
+              maplibre,
+              new URL('.', window.location.href).pathname,
+            );
+
+            const osmExtrusionIndex = layers.findIndex(
               (layer) =>
                 layer.type === 'fill-extrusion' &&
-                layer['source-layer'] === 'building',
+                layer['source-layer'] === BUILDING_SOURCE_LAYER,
             );
+            const buildingLayerBeforeId =
+              osmExtrusionIndex >= 0
+                ? layers[osmExtrusionIndex + 1]?.id
+                : layers.find((layer) => layer.type === 'symbol')?.id;
+            for (const layer of layers) {
+              if (
+                layer.type === 'fill-extrusion' &&
+                layer['source-layer'] === BUILDING_SOURCE_LAYER
+              )
+                map.removeLayer(layer.id);
+            }
+            map.addSource(BUILDING_SOURCE_ID, {
+              type: 'vector',
+              tiles: [BUILDING_TILE_TEMPLATE],
+              minzoom: BUILDING_TILE_ZOOM,
+              maxzoom: BUILDING_TILE_ZOOM,
+              attribution: BUILDING_HEIGHT_ATTRIBUTION,
+            });
             const hideBuildingOutlines: FilterSpecification = [
               '!=',
               ['get', 'hide_3d'],
               true,
             ];
-
-            if (!buildingLayer) {
-              const buildingSourceLayer = layers.find(
-                (layer) =>
-                  'source-layer' in layer &&
-                  layer['source-layer'] === 'building' &&
-                  'source' in layer &&
-                  typeof layer.source === 'string',
-              );
-              const firstSymbol = layers.find(
-                (layer) => layer.type === 'symbol',
-              )?.id;
-              const buildingSourceId =
-                buildingSourceLayer &&
-                'source' in buildingSourceLayer &&
-                typeof buildingSourceLayer.source === 'string'
-                  ? buildingSourceLayer.source
-                  : null;
-              if (!buildingSourceId) {
-                throw new Error(
-                  'The map style did not provide OSM building data.',
-                );
-              }
-              const fallbackBuildingLayer: FillExtrusionLayerSpecification = {
-                id: 'wmug-building-3d',
-                type: 'fill-extrusion',
-                source: buildingSourceId,
-                'source-layer': 'building',
-                minzoom: 14,
-                filter: hideBuildingOutlines,
-                paint: {
-                  'fill-extrusion-color': '#c7b99f',
-                  'fill-extrusion-height': [
-                    'coalesce',
-                    ['get', 'render_height'],
-                    5,
-                  ],
-                  'fill-extrusion-base': [
-                    'coalesce',
-                    ['get', 'render_min_height'],
-                    0,
-                  ],
-                  'fill-extrusion-opacity': 1,
-                  'fill-extrusion-vertical-gradient': true,
-                },
-              };
-              map.addLayer(fallbackBuildingLayer, firstSymbol);
-              buildingLayer = map
-                .getStyle()
-                .layers?.find((layer) => layer.id === 'wmug-building-3d');
-            }
-
-            if (!buildingLayer || buildingLayer.type !== 'fill-extrusion') {
-              throw new Error('The 3D building layer could not be created.');
-            }
-            const buildingFilter = (
-              buildingLayer.filter
-                ? ['all', buildingLayer.filter, hideBuildingOutlines]
-                : hideBuildingOutlines
-            ) as FilterSpecification;
-            map.setFilter(buildingLayer.id, buildingFilter);
-            map.setPaintProperty(buildingLayer.id, 'fill-extrusion-color', [
-              'interpolate',
-              ['linear'],
-              ['coalesce', ['get', 'render_height'], 5],
-              0,
-              '#aaa79f',
-              18,
-              '#cbc7bd',
-              52,
-              '#e7e2d7',
-            ]);
-            map.setPaintProperty(buildingLayer.id, 'fill-extrusion-height', [
-              'coalesce',
-              ['get', 'render_height'],
-              5,
-            ]);
-            map.setPaintProperty(buildingLayer.id, 'fill-extrusion-base', [
-              'coalesce',
-              ['get', 'render_min_height'],
-              0,
-            ]);
-            map.setPaintProperty(buildingLayer.id, 'fill-extrusion-opacity', 1);
-            map.setPaintProperty(
-              buildingLayer.id,
-              'fill-extrusion-vertical-gradient',
-              true,
-            );
+            const buildingLayer: FillExtrusionLayerSpecification = {
+              id: 'wmug-building-3d',
+              type: 'fill-extrusion',
+              source: BUILDING_SOURCE_ID,
+              'source-layer': BUILDING_SOURCE_LAYER,
+              minzoom: BUILDING_TILE_ZOOM,
+              filter: hideBuildingOutlines,
+              paint: {
+                'fill-extrusion-color': [
+                  'interpolate',
+                  ['linear'],
+                  ['coalesce', ['get', 'render_height'], 5],
+                  0,
+                  '#aaa79f',
+                  18,
+                  '#cbc7bd',
+                  52,
+                  '#e7e2d7',
+                ],
+                'fill-extrusion-height': [
+                  'coalesce',
+                  ['get', 'render_height'],
+                  5,
+                ],
+                'fill-extrusion-base': [
+                  'coalesce',
+                  ['get', 'render_min_height'],
+                  0,
+                ],
+                'fill-extrusion-opacity': 1,
+                'fill-extrusion-vertical-gradient': true,
+              },
+            };
+            map.addLayer(buildingLayer, buildingLayerBeforeId);
 
             // Symbol placement is the single largest main-thread cost with
             // a chase camera: MapLibre re-runs label collision every frame

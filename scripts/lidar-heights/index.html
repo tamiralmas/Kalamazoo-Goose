@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Kalamazoo Goose: LiDAR building heights</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 52rem; padding: 0 1rem; color: #222; }
+      pre { background: #f3f1ea; padding: 0.75rem; overflow: auto; max-height: 18rem; }
+      button { font: inherit; padding: 0.4rem 0.9rem; }
+      label { display: block; margin: 0.3rem 0; }
+      input { width: 6rem; }
+    </style>
+  </head>
+  <body>
+    <h1>LiDAR building heights</h1>
+    <p>
+      Builds the dataset that <code>scripts/build-building-tiles.mjs</code>
+      turns into the game's building tiles: every OpenStreetMap building
+      footprint in the box below, with the roof height measured from the
+      USGS 3DEP point cloud (Kalamazoo 2015 flight, served as Entwine Point
+      Tiles from the public <code>usgs-lidar-public</code> bucket). Both
+      sources allow this use: OSM under the ODbL (the game credits it), the
+      LiDAR as US public domain data.
+    </p>
+    <p>
+      Everything runs in this page: Overpass and the S3 bucket both send CORS
+      headers, and <code>laz-perf</code> decodes the LAZ chunks in WebAssembly.
+      Expect roughly 1.7 GB of point data for the default box; it takes a few
+      minutes on a fast connection and then downloads
+      <code>kalamazoo-buildings.json.gz</code>.
+    </p>
+    <fieldset>
+      <legend>Bounding box (WGS84)</legend>
+      <label>West <input id="west" value="-85.68" /></label>
+      <label>South <input id="south" value="42.225" /></label>
+      <label>East <input id="east" value="-85.54" /></label>
+      <label>North <input id="north" value="42.335" /></label>
+      <label>Extra EPT depth around campus (denser points) <input id="core" value="-85.64,42.27,-85.59,42.30" style="width: 16rem" /></label>
+    </fieldset>
+    <p><button id="run">Fetch footprints and measure heights</button></p>
+    <pre id="log">idle</pre>
+
+    <script src="https://cdn.jsdelivr.net/npm/laz-perf@0.0.6/lib/laz-perf.js"></script>
+    <script>
+      const EPT_BASE =
+        'https://s3-us-west-2.amazonaws.com/usgs-lidar-public/USGS_LPC_MI_Kalamazoo_2015_LAS_2018/';
+      const OVERPASS = 'https://overpass-api.de/api/interpreter';
+      const R = 6378137;
+      const toMerc = (lng, lat) => [
+        (lng * Math.PI) / 180 * R,
+        Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) * R,
+      ];
+      const logEl = document.getElementById('log');
+      const lines = [];
+      const log = (message) => {
+        lines.push(message);
+        if (lines.length > 200) lines.shift();
+        logEl.textContent = lines.join('\n');
+        logEl.scrollTop = logEl.scrollHeight;
+      };
+      const readBox = () =>
+        ['west', 'south', 'east', 'north'].map((id) =>
+          Number(document.getElementById(id).value),
+        );
+
+      // OSM ways come with their geometry; multipolygon relations come as
+      // member ways that are chained into closed rings here.
+      async function fetchFootprints(box) {
+        const bbox = `${box[1]},${box[0]},${box[3]},${box[2]}`;
+        const query = `[out:json][timeout:180];(way["building"](${bbox});relation["building"](${bbox}););out geom;`;
+        log('Overpass: requesting footprints…');
+        const response = await fetch(OVERPASS, {
+          method: 'POST',
+          body: 'data=' + encodeURIComponent(query),
+        });
+        if (!response.ok) throw new Error(`Overpass HTTP ${response.status}`);
+        const osm = await response.json();
+        log(`Overpass: ${osm.elements.length} elements`);
+        const closeRing = (points) => {
+          if (points.length < 4) return null;
+          const first = points[0];
+          const last = points[points.length - 1];
+          if (first[0] !== last[0] || first[1] !== last[1]) points.push(first);
+          return points.length >= 4 ? points : null;
+        };
+        const chain = (segments) => {
+          const rings = [];
+          const pool = segments.map((segment) => segment.slice());
+          while (pool.length) {
+            let ring = pool.shift();
+            for (let guard = 0; guard < 500; guard += 1) {
+              const first = ring[0];
+              const last = ring[ring.length - 1];
+              if (first[0] === last[0] && first[1] === last[1] && ring.length >= 4) break;
+              let joined = false;
+              for (let i = 0; i < pool.length; i += 1) {
+                const segment = pool[i];
+                const head = segment[0];
+                const tail = segment[segment.length - 1];
+                if (head[0] === last[0] && head[1] === last[1]) {
+                  ring = ring.concat(segment.slice(1));
+                } else if (tail[0] === last[0] && tail[1] === last[1]) {
+                  ring = ring.concat(segment.slice(0, -1).reverse());
+                } else continue;
+                pool.splice(i, 1);
+                joined = true;
+                break;
+              }
+              if (!joined) break;
+            }
+            const closed = closeRing(ring);
+            if (closed) rings.push(closed);
+          }
+          return rings;
+        };
+        const pickTags = (tags) => {
+          const kept = {};
+          for (const key of [
+            'building',
+            'building:levels',
+            'height',
+            'min_height',
+            'name',
+            'roof:shape',
+            'roof:levels',
+            'amenity',
+          ]) {
+            if (tags && tags[key] !== undefined) kept[key] = tags[key];
+          }
+          return kept;
+        };
+        const buildings = [];
+        for (const element of osm.elements) {
+          if (element.type === 'way' && element.geometry) {
+            const ring = closeRing(element.geometry.map((p) => [p.lon, p.lat]));
+            if (ring) buildings.push({ id: 'w' + element.id, rings: [ring], tags: pickTags(element.tags) });
+          } else if (element.type === 'relation' && element.members) {
+            const outers = [];
+            const inners = [];
+            for (const member of element.members) {
+              if (member.type !== 'way' || !member.geometry) continue;
+              const points = member.geometry.map((p) => [p.lon, p.lat]);
+              (member.role === 'inner' ? inners : outers).push(points);
+            }
+            const outerRings = chain(outers);
+            const innerRings = chain(inners);
+            if (outerRings.length === 1) {
+              buildings.push({ id: 'r' + element.id, rings: [outerRings[0], ...innerRings], tags: pickTags(element.tags) });
+            } else {
+              outerRings.forEach((outer, index) =>
+                buildings.push({ id: `r${element.id}_${index}`, rings: [outer], tags: pickTags(element.tags) }),
+              );
+            }
+          }
+        }
+        log(`Footprints: ${buildings.length}`);
+        return buildings;
+      }
+
+      // EPT nodes are an octree over the dataset cube; depth 7 gives about a
+      // point per square metre here, depth 8 four times that. Nodes whose
+      // square intersects the box are selected (Z is ignored: everything in
+      // Kalamazoo sits in one Z cell at these depths).
+      async function selectNodes(box, coreBox) {
+        const ept = await (await fetch(EPT_BASE + 'ept.json')).json();
+        const bounds = ept.bounds;
+        const span = bounds[3] - bounds[0];
+        const merc = [...toMerc(box[0], box[1]), ...toMerc(box[2], box[3])];
+        const core = coreBox ? [...toMerc(coreBox[0], coreBox[1]), ...toMerc(coreBox[2], coreBox[3])] : null;
+        const intersects = (key, target) => {
+          const [depth, x, y] = key.split('-').map(Number);
+          const size = span / 2 ** depth;
+          const x0 = bounds[0] + x * size;
+          const y0 = bounds[1] + y * size;
+          return !(x0 + size < target[0] || x0 > target[2] || y0 + size < target[1] || y0 > target[3]);
+        };
+        const selected = new Map();
+        const walk = async (hierarchyKey) => {
+          const hierarchy = await (await fetch(`${EPT_BASE}ept-hierarchy/${hierarchyKey}.json`)).json();
+          const subtrees = [];
+          for (const [key, count] of Object.entries(hierarchy)) {
+            const depth = Number(key.split('-')[0]);
+            const wanted =
+              (depth <= 7 && intersects(key, merc)) || (depth === 8 && core && intersects(key, core));
+            if (!wanted) continue;
+            if (count === -1) subtrees.push(key);
+            else if (count > 0) selected.set(key, count);
+          }
+          await Promise.all(subtrees.map(walk));
+        };
+        await walk('0-0-0-0');
+        const nodes = Array.from(selected.entries());
+        log(`EPT: ${nodes.length} nodes, ${nodes.reduce((sum, node) => sum + node[1], 0)} points`);
+        return nodes;
+      }
+
+      async function measure(buildings, nodes, box) {
+        const lazPerf = await window.createLazPerf({
+          locateFile: (file) => `https://cdn.jsdelivr.net/npm/laz-perf@0.0.6/lib/${file}`,
+        });
+        const A = [...toMerc(box[0], box[1]), ...toMerc(box[2], box[3])];
+        const CELL = 20;
+        const gridW = Math.ceil((A[2] - A[0]) / CELL);
+        const gridH = Math.ceil((A[3] - A[1]) / CELL);
+        const grid = new Map();
+        buildings.forEach((building, index) => {
+          building.merc = building.rings.map((ring) => ring.map(([lng, lat]) => toMerc(lng, lat)));
+          let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+          for (const [x, y] of building.merc[0]) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+          building.bbox = [minX, minY, maxX, maxY];
+          if (maxX < A[0] || minX > A[2] || maxY < A[1] || minY > A[3]) return;
+          building.n = 0;
+          building.cells = new Map();
+          const cx0 = Math.max(0, Math.floor((minX - A[0]) / CELL));
+          const cx1 = Math.min(gridW - 1, Math.floor((maxX - A[0]) / CELL));
+          const cy0 = Math.max(0, Math.floor((minY - A[1]) / CELL));
+          const cy1 = Math.min(gridH - 1, Math.floor((maxY - A[1]) / CELL));
+          for (let cy = cy0; cy <= cy1; cy += 1) {
+            for (let cx = cx0; cx <= cx1; cx += 1) {
+              const key = cy * gridW + cx;
+              let list = grid.get(key);
+              if (!list) grid.set(key, (list = []));
+              list.push(index);
+            }
+          }
+        });
+        const inside = (x, y, ring) => {
+          let odd = false;
+          for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+            const [xi, yi] = ring[i];
+            const [xj, yj] = ring[j];
+            if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) odd = !odd;
+          }
+          return odd;
+        };
+        // Lowest ground-classified point per 8 m cell, for the ground under
+        // each footprint (median of the cells around it).
+        const GC = 8;
+        const gW = Math.ceil((A[2] - A[0]) / GC);
+        const gH = Math.ceil((A[3] - A[1]) / GC);
+        const groundMin = new Float32Array(gW * gH).fill(NaN);
+        const RC = 2.5;
+        const fetchNode = async (key) => {
+          for (let attempt = 0; ; attempt += 1) {
+            try {
+              const response = await fetch(`${EPT_BASE}ept-data/${key}.laz`);
+              if (!response.ok) throw new Error(`HTTP ${response.status}`);
+              return await response.arrayBuffer();
+            } catch (error) {
+              if (attempt >= 3) throw error;
+              await new Promise((r) => setTimeout(r, 2000));
+            }
+          }
+        };
+        let next = 0;
+        const inflight = new Map();
+        const queue = () => {
+          while (next < nodes.length && inflight.size < 5) {
+            const key = nodes[next++][0];
+            inflight.set(key, fetchNode(key));
+          }
+        };
+        queue();
+        let points = 0;
+        let matched = 0;
+        let bytes = 0;
+        const started = Date.now();
+        for (let index = 0; index < nodes.length; index += 1) {
+          const key = nodes[index][0];
+          const buffer = await inflight.get(key);
+          inflight.delete(key);
+          queue();
+          bytes += buffer.byteLength;
+          const bytesView = new Uint8Array(buffer);
+          const header = new DataView(buffer);
+          const scale = [header.getFloat64(131, true), header.getFloat64(139, true), header.getFloat64(147, true)];
+          const offset = [header.getFloat64(155, true), header.getFloat64(163, true), header.getFloat64(171, true)];
+          const format = bytesView[104] & 0x7f;
+          const classOffset = format >= 6 ? 16 : 15;
+          const laszip = new lazPerf.LASZip();
+          const dataPtr = lazPerf._malloc(bytesView.length);
+          lazPerf.HEAPU8.set(bytesView, dataPtr);
+          laszip.open(dataPtr, bytesView.length);
+          const count = laszip.getCount();
+          const pointLength = laszip.getPointLength();
+          const pointPtr = lazPerf._malloc(pointLength);
+          for (let i = 0; i < count; i += 1) {
+            laszip.getPoint(pointPtr);
+            const point = new DataView(lazPerf.HEAPU8.buffer, pointPtr, pointLength);
+            const x = point.getInt32(0, true) * scale[0] + offset[0];
+            if (x < A[0] || x >= A[2]) continue;
+            const y = point.getInt32(4, true) * scale[1] + offset[1];
+            if (y < A[1] || y >= A[3]) continue;
+            const z = point.getInt32(8, true) * scale[2] + offset[2];
+            let classification = point.getUint8(classOffset);
+            if (format < 6) classification &= 0x1f;
+            if (classification === 7 || classification === 18) continue; // noise
+            points += 1;
+            if (classification === 2) {
+              const cell = Math.floor((y - A[1]) / GC) * gW + Math.floor((x - A[0]) / GC);
+              if (Number.isNaN(groundMin[cell]) || z < groundMin[cell]) groundMin[cell] = z;
+              continue;
+            }
+            const candidates = grid.get(Math.floor((y - A[1]) / CELL) * gridW + Math.floor((x - A[0]) / CELL));
+            if (!candidates) continue;
+            for (const candidate of candidates) {
+              const building = buildings[candidate];
+              const [minX, minY, maxX, maxY] = building.bbox;
+              if (x < minX || x > maxX || y < minY || y > maxY) continue;
+              if (!inside(x, y, building.merc[0])) continue;
+              let inHole = false;
+              for (let h = 1; h < building.merc.length; h += 1) {
+                if (inside(x, y, building.merc[h])) { inHole = true; break; }
+              }
+              if (inHole) continue;
+              matched += 1;
+              building.n += 1;
+              const cellKey = Math.floor((y - minY) / RC) * 4096 + Math.floor((x - minX) / RC);
+              const current = building.cells.get(cellKey);
+              if (current === undefined || z > current) building.cells.set(cellKey, z);
+              break;
+            }
+          }
+          laszip.delete();
+          lazPerf._free(dataPtr);
+          lazPerf._free(pointPtr);
+          if (index % 20 === 0 || index === nodes.length - 1) {
+            log(`node ${index + 1}/${nodes.length}: ${points} points, ${matched} on footprints, ${(bytes / 1048576).toFixed(0)} MB, ${((Date.now() - started) / 1000).toFixed(0)} s`);
+            await new Promise((r) => setTimeout(r, 0));
+          }
+        }
+        const percentile = (sorted, q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];
+        let measured = 0;
+        for (const building of buildings) {
+          if (!building.cells) continue;
+          const [minX, minY, maxX, maxY] = building.bbox;
+          const grounds = [];
+          for (let gy = Math.max(0, Math.floor((minY - 8 - A[1]) / GC)); gy <= Math.min(gH - 1, Math.floor((maxY + 8 - A[1]) / GC)); gy += 1) {
+            for (let gx = Math.max(0, Math.floor((minX - 8 - A[0]) / GC)); gx <= Math.min(gW - 1, Math.floor((maxX + 8 - A[0]) / GC)); gx += 1) {
+              const value = groundMin[gy * gW + gx];
+              if (!Number.isNaN(value)) grounds.push(value);
+            }
+          }
+          const cells = Array.from(building.cells.values()).sort((a, b) => a - b);
+          delete building.cells;
+          delete building.merc;
+          delete building.bbox;
+          if (grounds.length < 2 || cells.length < 4) { building.lidar = null; continue; }
+          grounds.sort((a, b) => a - b);
+          const ground = percentile(grounds, 0.5);
+          const above = (value) => Math.round((value - ground) * 10) / 10;
+          building.lidar = {
+            g: Math.round(ground * 10) / 10,
+            n: building.n,
+            cells: cells.length,
+            c20: above(percentile(cells, 0.2)),
+            c40: above(percentile(cells, 0.4)),
+            c60: above(percentile(cells, 0.6)),
+            c80: above(percentile(cells, 0.8)),
+            c95: above(percentile(cells, 0.95)),
+            cmax: above(cells[cells.length - 1]),
+          };
+          measured += 1;
+          delete building.n;
+        }
+        log(`Heights measured for ${measured} of ${buildings.length} footprints`);
+      }
+
+      async function run() {
+        const button = document.getElementById('run');
+        button.disabled = true;
+        lines.length = 0;
+        try {
+          const box = readBox();
+          const coreText = document.getElementById('core').value.trim();
+          const core = coreText ? coreText.split(',').map(Number) : null;
+          const buildings = await fetchFootprints(box);
+          const nodes = await selectNodes(box, core);
+          await measure(buildings, nodes, box);
+          const round = (value) => Math.round(value * 1e7) / 1e7;
+          const dataset = {
+            generated: new Date().toISOString(),
+            bbox: box,
+            sources: {
+              footprints: 'OpenStreetMap via Overpass API (ODbL)',
+              heights: 'USGS 3DEP LiDAR, USGS_LPC_MI_Kalamazoo_2015_LAS_2018 (public domain), Entwine Point Tiles on usgs-lidar-public',
+            },
+            lidar:
+              'per footprint: g ground (m MSL, median of nearby class-2 cells), n matched points, cells 2.5 m cells with points, cNN percentile of per-cell maximum above ground, cmax highest cell',
+            buildings: buildings.map((building) => ({
+              id: building.id,
+              tags: building.tags,
+              rings: building.rings.map((ring) => ring.map(([x, y]) => [round(x), round(y)])),
+              lidar: building.lidar ?? null,
+            })),
+          };
+          const json = JSON.stringify(dataset);
+          const compressed = await new Response(
+            new Blob([json]).stream().pipeThrough(new CompressionStream('gzip')),
+          ).blob();
+          const link = document.createElement('a');
+          link.href = URL.createObjectURL(compressed);
+          link.download = 'kalamazoo-buildings.json.gz';
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          log(`Done: ${(compressed.size / 1048576).toFixed(2)} MB downloaded`);
+        } catch (error) {
+          log(`Failed: ${error}`);
+        } finally {
+          button.disabled = false;
+        }
+      }
+      document.getElementById('run').addEventListener('click', run);
+    </script>
+  </body>
+</html>

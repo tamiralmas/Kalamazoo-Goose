@@ -46,3 +46,12 @@ The pause menu's Options tab also has a Render scale control (Auto, Crisp, or Fa
 ## World data
 
 The game combines OpenStreetMap-derived roads, buildings, water, trails, and vegetation (via OpenFreeMap) with Mapterhorn terrain and State of Michigan MiSAIL aerial imagery across Kalamazoo.
+
+### Building heights
+
+Within roughly five kilometres of campus, buildings rise to their real roof height instead of OpenStreetMap's storey count guess. The heights come from the USGS 3D Elevation Program's 2015 Kalamazoo LiDAR flight (public domain), measured against each OpenStreetMap footprint, and are shipped as the game's own zoom-14 vector tiles under `public/buildings`. Outside that area the OpenFreeMap buildings take over, so the join is seamless and the whole map keeps its walls.
+
+To regenerate the tiles:
+
+1. Open `scripts/lidar-heights/index.html` in a browser and run it. It fetches the footprints from Overpass, streams the point cloud from the public `usgs-lidar-public` bucket (about 1.7 GB), measures every footprint, and downloads `kalamazoo-buildings.json.gz`. The committed copy lives in `data/`.
+2. Run `node scripts/build-building-tiles.mjs data/kalamazoo-buildings.json.gz`. It writes the tiles and updates `app/building-tiles-coverage.ts` with the tile range they cover.
