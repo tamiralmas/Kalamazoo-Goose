@@ -2291,9 +2291,6 @@ export function GooseGame() {
       </div>
 
       <footer className="game-footer">
-        <span>SATELLITE GROUND + AERIAL ROOFS + OSM 3D</span>
-        <i />
-        <span>{terrainReady ? 'REAL TERRAIN' : '3D BUILDINGS'} · WMU</span>
         <span className="map-credit">
           ©{' '}
           <a href={AERIAL_INFORMATION_URL} target="_blank" rel="noreferrer">

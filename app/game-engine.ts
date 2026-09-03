@@ -48,9 +48,11 @@ import {
 } from './props';
 import { PROP_PLACEMENTS } from './props-placement';
 import {
+  TREE_DENSITY_SCALE,
   TREE_TILE_BOUNDS,
   createTreeSelection,
   createTreeTileStore,
+  retainTreeAtDensity,
 } from './tree-tiles';
 import { WMU_TREE_POINTS } from './wmu-trees';
 import { createWaterSurfaces } from './water-surface';
@@ -410,15 +412,12 @@ const STREET_TREE_ROAD_CLASSES = new Set(['minor', 'tertiary', 'residential']);
 const WOODLAND_RECYCLE_DISTANCE = 1_600;
 const WOODLAND_SPAWN_MIN_DISTANCE = 180;
 /**
- * Tree instance budget. The LiDAR tiles hold a quarter of a million trees, so
- * this is not a count of the world's trees any more, only of how many of them
- * the two InstancedMeshes carry at once around the goose. Kalamazoo runs to
- * four thousand crowns per square kilometre, so 1,800 filled up within 350 m
- * of the goose and the woods ended in a visible line; 3,600 pushes that edge
- * out to about 500 m in the densest neighbourhoods, into the haze.
+ * Tree instance budget, reduced alongside the 20% location thinning. Reducing
+ * both keeps roughly the same woodland horizon instead of merely drawing
+ * fewer nearest trees and bringing the visible edge closer to the goose.
  */
-const MAX_TREE_COUNT_DESKTOP = 3_600;
-const MAX_TREE_COUNT_PHONE = 1_000;
+const MAX_TREE_COUNT_DESKTOP = Math.floor(3_600 * TREE_DENSITY_SCALE);
+const MAX_TREE_COUNT_PHONE = Math.floor(1_000 * TREE_DENSITY_SCALE);
 /** How far the LiDAR selection reaches, and how far its tiles are fetched. */
 const LIDAR_TREE_RADIUS_DESKTOP = 900;
 const LIDAR_TREE_RADIUS_PHONE = 550;
@@ -490,11 +489,10 @@ const SERVICE_CONE_SHOULDER = 2;
 const SERVICE_CONE_MIN_LENGTH = 60;
 const SERVICE_CONE_RADIUS = 600;
 const SERVICE_CONE_ROW_LIMIT = 40;
-// The jetstream is advertised as "a 10% boost above 50 m", and these are the
-// numbers that make that literally true. The boost arms the moment the goose
-// crosses 50 m and is at full strength half a second later, whatever the
-// climb rate, so the HUD's "+10%" and the airspeed agree. It lets go below
-// 47 m, a little hysteresis so a wobble at 50 m does not flicker it.
+// The jetstream's speed increase comes from JETSTREAM_BOOST_PERCENT so the
+// physics and HUD agree. The boost arms the moment the goose crosses 50 m
+// and is at full strength half a second later, whatever the climb rate.
+// It lets go below 47 m so a wobble at 50 m does not flicker it.
 const ALTITUDE_BOOST_HEIGHT = 50;
 const ALTITUDE_BOOST_RELEASE_HEIGHT = 47;
 /** Seconds for the boost to fade in once armed, and out once released. */
@@ -1607,11 +1605,6 @@ export function createGooseEngine(
 
   const keys = new Set<string>();
   const styleLayers = map.getStyle().layers ?? [];
-  const waterLayers = styleLayers
-    .filter(
-      (layer) => layer.type === 'fill' && layer['source-layer'] === 'water',
-    )
-    .map((layer) => layer.id);
   const waterSourceLayer = styleLayers.find(
     (layer) =>
       layer.type === 'fill' &&
@@ -1915,6 +1908,8 @@ export function createGooseEngine(
   const mappedWaterAreas: WaterArea[] = [];
   let mappedWaterSignature = '';
   let mappedWaterGeneration = 0;
+  let waterRefreshRequested = true;
+  let waterRefreshClock = 0;
   const mappedWaterAnchor = new THREE.Vector2(
     Number.POSITIVE_INFINITY,
     Number.POSITIVE_INFINITY,
@@ -2284,6 +2279,28 @@ export function createGooseEngine(
         nextAreas.push({ minX, maxX, minZ, maxZ, outer, holes });
       });
     });
+    // A reload can return only some ponds, or none. Preserve missing nearby
+    // outlines until the complete source snapshot arrives. A repeated chunk
+    // must not add duplicate sheets or keep increasing the cache generation.
+    if (nextAreas.length === 0 || !map.isSourceLoaded(waterSourceId)) {
+      nextAreas.push(
+        ...mappedWaterAreas.filter(
+          (area) =>
+            area.maxX >= state.position.x - WATER_INGEST_RADIUS &&
+            area.minX <= state.position.x + WATER_INGEST_RADIUS &&
+            area.maxZ >= state.position.z - WATER_INGEST_RADIUS &&
+            area.minZ <= state.position.z + WATER_INGEST_RADIUS &&
+            !nextAreas.some(
+              (next) =>
+                Math.abs(next.minX - area.minX) < 0.1 &&
+                Math.abs(next.minZ - area.minZ) < 0.1 &&
+                Math.abs(next.maxX - area.maxX) < 0.1 &&
+                Math.abs(next.maxZ - area.maxZ) < 0.1,
+            ),
+        ),
+      );
+    }
+    waterRefreshRequested = false;
     const nextSignature = nextAreas
       .map(
         (area) =>
@@ -2304,12 +2321,12 @@ export function createGooseEngine(
     if (
       !waterSourceId ||
       !map.getSource(waterSourceId) ||
-      !map.isSourceLoaded(waterSourceId) ||
-      Math.hypot(
-        state.position.x - mappedWaterAnchor.x,
-        state.position.z - mappedWaterAnchor.y,
-      ) <=
-        TREE_PLACEMENT_ANCHOR_TOLERANCE * 0.7
+      (!waterRefreshRequested &&
+        Math.hypot(
+          state.position.x - mappedWaterAnchor.x,
+          state.position.z - mappedWaterAnchor.y,
+        ) <=
+          TREE_PLACEMENT_ANCHOR_TOLERANCE * 0.7)
     )
       return false;
     return collectMappedWaterAreas();
@@ -4314,7 +4331,7 @@ export function createGooseEngine(
       scale: 0.9 + Math.abs(Math.sin(Number(id % 1000000) * 0.0117)) * 0.22,
       measured: null,
     }),
-  );
+  ).filter(({ local }) => retainTreeAtDensity(local.x, local.z));
   const mappedTreeCount = campusTreePoints.length;
   let treeCount = campusTreePoints.length;
   unresolvedTreeCount = terrainEnabled ? treeCount : 0;
@@ -4908,6 +4925,7 @@ export function createGooseEngine(
           const secondUnit = secondHash - Math.floor(secondHash);
           const east = (cellX + 0.5) * spacing + (unit - 0.5) * 4.8;
           const north = (cellZ + 0.5) * spacing + (secondUnit - 0.5) * 4.8;
+          if (!retainTreeAtDensity(east, north)) return;
           // Inside the tiled rectangle the LiDAR knows what actually grows
           // here; inventing a tree on a grid on top of that doubles the woods.
           if (insideTreeCoverage(east, north)) return;
@@ -5023,6 +5041,7 @@ export function createGooseEngine(
                 const offset = STREET_TREE_OFFSET + (unit - 0.5) * 2.4;
                 const east = centerX + rightX * side * offset;
                 const north = centerZ + rightZ * side * offset;
+                if (!retainTreeAtDensity(east, north)) continue;
                 if (
                   Math.hypot(
                     east - state.position.x,
@@ -5417,25 +5436,11 @@ export function createGooseEngine(
       airborneTime = 0;
       peakAgl = 0;
     }
-    if (roof !== null) {
-      state.onWater = false;
-    } else if (waterLayers.length > 0) {
-      const point = map.project(location);
-      const canvas = map.getCanvas();
-      if (
-        point.x >= 0 &&
-        point.y >= 0 &&
-        point.x <= canvas.clientWidth &&
-        point.y <= canvas.clientHeight
-      ) {
-        state.onWater =
-          map.queryRenderedFeatures(point, { layers: waterLayers }).length > 0;
-      } else {
-        state.onWater = false;
-      }
-    } else {
-      state.onWater = false;
-    }
+    // Physics uses the same geographic outlines as the visible pond sheets,
+    // NPC avoidance, and flock. A screen-space water hit depends on the chase
+    // camera and terrain projection, and can miss the Valley ponds entirely.
+    state.onWater =
+      roof === null && isPointInMappedWater(state.position.x, state.position.z);
   };
 
   const spawnSplash = (
@@ -8018,7 +8023,8 @@ export function createGooseEngine(
     );
     const finalGround = roof === null ? terrainSurfaceY : roof;
     state.ground = finalGround;
-    if (roof !== null) state.onWater = false;
+    state.onWater =
+      roof === null && isPointInMappedWater(state.position.x, state.position.z);
     const contactOffset = state.mode === 'planing' ? 0.02 : 0.04;
     if (state.position.y >= finalGround + contactOffset) return;
 
@@ -8445,6 +8451,14 @@ export function createGooseEngine(
     if (state.velocity.length() > maximumSpeed)
       state.velocity.setLength(maximumSpeed);
     state.position.addScaledVector(state.velocity, dt);
+
+    // Reclassify the actual touchdown position after moving. A fast descent
+    // can cross a bank between the regular surface samples.
+    if (
+      state.position.y - state.ground <
+      Math.max(3, -state.velocity.y * dt + 0.25)
+    )
+      sampleSurface();
 
     if (state.position.y <= state.ground + 0.05) {
       const impact = Math.max(0, -state.velocity.y);
@@ -10001,6 +10015,7 @@ export function createGooseEngine(
       buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
     }
     if (event.sourceDataType !== 'content') return;
+    if (event.sourceId === waterSourceId) waterRefreshRequested = true;
     if (event.sourceId === buildingSourceId) {
       buildingRefreshRequested = true;
       buildingRefreshClock = Math.min(buildingRefreshClock, 0.08);
@@ -10039,6 +10054,13 @@ export function createGooseEngine(
     // A paused game still renders and still lets the camera settle, but no
     // simulated time passes: the world is exactly where it was on unpause.
     const simulating = playing && !paused;
+    // The animated map may never become idle. Ingest newly arrived water
+    // tiles on a bounded cadence, including while the goose stays still.
+    waterRefreshClock -= frameDt;
+    if (waterRefreshClock <= 0) {
+      waterRefreshClock = 0.25;
+      refreshMappedWaterForCurrentArea();
+    }
     if (simulating) elapsedTime += frameDt;
     drainPendingToasts(frameDt);
     if (simulating) {

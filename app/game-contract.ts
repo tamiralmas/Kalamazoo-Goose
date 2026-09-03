@@ -259,7 +259,7 @@ export const CONTROL_CODES = [
  * HUD can print the number the engine actually applies instead of its own
  * copy. The engine's ALTITUDE_BOOST_* speeds are derived from this.
  */
-export const JETSTREAM_BOOST_PERCENT = 10;
+export const JETSTREAM_BOOST_PERCENT = 25;
 
 export const DEFAULT_SETTINGS: Settings = {
   touchControls: 'auto',

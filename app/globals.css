@@ -857,12 +857,6 @@ kbd {
   text-transform: uppercase;
 }
 
-.game-footer i {
-  width: 3px;
-  height: 3px;
-  border-radius: 50%;
-  background: #f1c500;
-}
 .map-credit {
   margin-left: auto;
 }
@@ -2603,11 +2597,8 @@ kbd {
       bottom: calc(170px + env(safe-area-inset-bottom));
     }
 
-    /* This whole touch chrome cluster (mobile-controls through the
-       attribution reposition) is sized to fit down to a 360px-wide phone
-       in portrait -- see the comment above scenarios/p6-hud.mjs in the
-       harness for the exact numbers checked. The d-pad gives up some size
-       so the four action buttons can hold their fixed 48/56/48/64px sizes. */
+    /* Full-size direction targets; narrow phones stack the action buttons
+       below so both control groups fit without shrinking the arrows. */
     & .mobile-controls {
       position: absolute;
       z-index: 7;
@@ -2623,10 +2614,11 @@ kbd {
 
     & .touch-pad {
       display: grid;
-      width: 96px;
-      grid-template-columns: repeat(3, 30px);
-      grid-template-rows: repeat(2, 30px);
-      gap: 3px;
+      flex: 0 0 auto;
+      width: 152px;
+      grid-template-columns: repeat(3, 48px);
+      grid-template-rows: repeat(2, 48px);
+      gap: 4px;
       pointer-events: auto;
     }
 
@@ -2667,12 +2659,11 @@ kbd {
       border-radius: 7px 13px 13px 7px;
     }
     & .touch-pad svg {
-      width: 14px;
+      width: 24px;
+      height: 24px;
     }
 
-    /* Grab/Flare 48px, Honk 56px, Flap 64px (the big primary): fixed sizes
-       that fit the 4-button row at a 360px-wide viewport with the tighter
-       4px gap below. */
+    /* Grab/Flare 48px, Honk 56px, Flap 64px (the big primary). */
     & .touch-actions {
       display: flex;
       align-items: flex-end;
@@ -2999,10 +2990,11 @@ kbd {
 
   & .touch-pad {
     display: grid;
-    width: 96px;
-    grid-template-columns: repeat(3, 30px);
-    grid-template-rows: repeat(2, 30px);
-    gap: 3px;
+    flex: 0 0 auto;
+    width: 152px;
+    grid-template-columns: repeat(3, 48px);
+    grid-template-rows: repeat(2, 48px);
+    gap: 4px;
     pointer-events: auto;
   }
 
@@ -3043,7 +3035,8 @@ kbd {
     border-radius: 7px 13px 13px 7px;
   }
   & .touch-pad svg {
-    width: 14px;
+    width: 24px;
+    height: 24px;
   }
 
   & .touch-actions {
@@ -3486,13 +3479,27 @@ kbd {
   }
 }
 
+/* Two rows preserve the large direction targets and action buttons even
+   on 320px phones. Keep the minimap above the taller action cluster. */
+@media (max-width: 520px) {
+  .game-shell:not([data-input='pointer']) .touch-actions,
+  .game-shell[data-input='touch'] .touch-actions {
+    display: grid;
+    grid-template-columns: repeat(2, max-content);
+    justify-items: center;
+    gap: 6px;
+  }
+
+  .game-shell:not([data-input='pointer']) .minimap-dock,
+  .game-shell[data-input='touch'] .minimap-dock {
+    bottom: calc(148px + env(safe-area-inset-bottom));
+  }
+}
+
 @media (max-width: 380px) {
   .brand-lockup > span:last-child {
     display: none;
   }
-  /* .mobile-controls / .touch-pad / .touch-actions are not overridden here
-     any more -- the base touch sizes (see the coarse-pointer block and the
-     [data-input='touch'] block above) already fit down to 360px. */
   .mobile-status-strip > span {
     padding-inline: 4px;
   }

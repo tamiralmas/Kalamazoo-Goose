@@ -35,6 +35,9 @@ jobs:
         id: pages
         uses: actions/configure-pages@v5
 
+      - name: Check gameplay regressions
+        run: npm run test:game
+
       - name: Build static game
         run: npm run build:pages
 

@@ -25,6 +25,22 @@ import {
 /** Spatial index cell, metres. A little wider than the crown of one tree. */
 const GRID_CELL_METRES = 60;
 
+/** Keep 80% of tree locations and of the renderer's original instance budget. */
+export const TREE_DENSITY_SCALE = 0.8;
+
+/**
+ * Thin by fixed world coordinates, never by frame, query order or tile arrival.
+ * The same trees stay absent on every visit; all sources share this rule.
+ */
+export const retainTreeAtDensity = (east: number, north: number) => {
+  let hash =
+    Math.imul(Math.round(east * 10), 0x45d9f3b) ^
+    Math.imul(Math.round(north * 10), 0x27d4eb2d);
+  hash = Math.imul(hash ^ (hash >>> 16), 0x7feb352d);
+  hash = Math.imul(hash ^ (hash >>> 15), 0x846ca68b);
+  return ((hash ^ (hash >>> 16)) >>> 0) / 4_294_967_296 < TREE_DENSITY_SCALE;
+};
+
 /**
  * Ranking band, metres. Within one band of distance the taller tree wins, so
  * a stand of mature oaks fills the budget ahead of the saplings beneath them
@@ -267,6 +283,7 @@ export const createTreeTileStore = ({
         tile.latitude[index],
         scratchLocal,
       );
+      if (!retainTreeAtDensity(local.x, local.z)) continue;
       const slot = count;
       east[slot] = local.x;
       north[slot] = local.z;
