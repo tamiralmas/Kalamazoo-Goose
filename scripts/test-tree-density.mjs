@@ -21,6 +21,7 @@ const coverageUrl = moduleUrl(
     'utf8',
   ),
 );
+const { TREE_TILE_COVERAGE } = await import(coverageUrl);
 const treeSource = await readFile(
   new URL('../app/tree-tiles.ts', import.meta.url),
   'utf8',
@@ -53,6 +54,22 @@ const treeRoot = new URL('../public/trees/14/', import.meta.url);
 const files = (await readdir(treeRoot, { recursive: true }))
   .filter((file) => file.endsWith('.bin'))
   .sort();
+const preloadFiles = files.toSorted((first, second) => {
+  const [firstX, firstYWithExtension] = first.split(/[\\/]/);
+  const [secondX, secondYWithExtension] = second.split(/[\\/]/);
+  const firstY = firstYWithExtension.replace('.bin', '');
+  const secondY = secondYWithExtension.replace('.bin', '');
+  const centerX = (TREE_TILE_COVERAGE.minX + TREE_TILE_COVERAGE.maxX) / 2;
+  const centerY = (TREE_TILE_COVERAGE.minY + TREE_TILE_COVERAGE.maxY) / 2;
+  return (
+    Math.abs(Number(firstX) - centerX) +
+      Math.abs(Number(firstY) - centerY) -
+      Math.abs(Number(secondX) - centerX) -
+      Math.abs(Number(secondY) - centerY) ||
+    Number(firstX) - Number(secondX) ||
+    Number(firstY) - Number(secondY)
+  );
+});
 const tiles = await Promise.all(
   files.map(async (file) => {
     const bytes = await readFile(new URL(file.replaceAll('\\', '/'), treeRoot));
@@ -108,6 +125,72 @@ test('density decisions depend only on position, not the traversal order', () =>
   assert.ok(
     Math.abs(original.filter(Boolean).length / points.length - 0.8) < 0.02,
   );
+});
+
+test('the store preloads compact tiles once and only ingests requested data', async () => {
+  const requested = [];
+  let activeRequests = 0;
+  let maxActiveRequests = 0;
+  let releaseFirstRequest;
+  const firstRequestGate = new Promise((resolve) => {
+    releaseFirstRequest = resolve;
+  });
+  const emptyTile = new Uint8Array(8);
+  emptyTile.set([0x4b, 0x47, 0x54, 0x31]); // KGT1, followed by a zero count.
+  const store = createTreeTileStore({
+    base: '/Kalamazoo-Goose/',
+    toLocal,
+    fetchTile: async (url) => {
+      requested.push(url);
+      activeRequests += 1;
+      maxActiveRequests = Math.max(maxActiveRequests, activeRequests);
+      try {
+        if (requested.length === 1) await firstRequestGate;
+        return new Response(emptyTile);
+      } finally {
+        activeRequests -= 1;
+      }
+    },
+    scheduleSlice: (run) => run(),
+  });
+  try {
+    const firstWarmup = store.preloadAll();
+    assert.equal(
+      store.preloadAll(),
+      firstWarmup,
+      'Repeated calls share one background warm-up.',
+    );
+    assert.deepEqual(store.stats(), { tiles: 0, pending: 1, trees: 0 });
+
+    // Asking for the first tile while its preload is held must share the
+    // in-flight promise rather than issuing a duplicate request. The other
+    // nineteen buffers remain compact and unindexed after the warm-up.
+    const [firstX, firstYWithExtension] = preloadFiles[0].split(/[\\/]/);
+    const firstY = firstYWithExtension.replace('.bin', '');
+    const span = 2 ** 14;
+    const longitude = ((Number(firstX) + 0.5) / span) * 360 - 180;
+    const mercator = Math.PI - (2 * Math.PI * (Number(firstY) + 0.5)) / span;
+    const latitude = (180 / Math.PI) * Math.atan(Math.sinh(mercator));
+    store.request(longitude, latitude, 0);
+    assert.equal(requested.length, 1);
+
+    releaseFirstRequest();
+    await firstWarmup;
+    assert.equal(maxActiveRequests, 1);
+    assert.deepEqual(
+      requested,
+      preloadFiles.map(
+        (file) => `/Kalamazoo-Goose/trees/14/${file.replaceAll('\\', '/')}`,
+      ),
+    );
+    assert.deepEqual(store.stats(), {
+      tiles: 1,
+      pending: 0,
+      trees: 0,
+    });
+  } finally {
+    store.dispose();
+  }
 });
 
 test('the real tile store thins before indexing and keeps selection stable', async () => {

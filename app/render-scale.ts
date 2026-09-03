@@ -31,6 +31,8 @@ export type RenderScaleSetting = 'auto' | 'crisp' | 'fast';
 // at DPR 2 backs off to the 0.75 floor.
 const AUTO_BUDGET_DESKTOP = 2_200_000;
 const AUTO_BUDGET_TOUCH = 1_300_000;
+/** Auto favors steadier mobile frame times; Crisp remains the 1.5x override. */
+const AUTO_TOUCH_CAP = 1.35;
 const AUTO_FLOOR = 0.75;
 
 const FAST_RATIO = 0.75;
@@ -69,5 +71,6 @@ export function resolveRenderPixelRatio(
   const area = cssWidth > 0 && cssHeight > 0 ? cssWidth * cssHeight : 0;
   const budget = coarsePointer ? AUTO_BUDGET_TOUCH : AUTO_BUDGET_DESKTOP;
   const budgetCap = area > 0 ? Math.sqrt(budget / area) : crispCap;
-  return round2(Math.max(AUTO_FLOOR, Math.min(dpr, crispCap, budgetCap)));
+  const autoQualityCap = coarsePointer ? AUTO_TOUCH_CAP : crispCap;
+  return round2(Math.max(AUTO_FLOOR, Math.min(dpr, autoQualityCap, budgetCap)));
 }

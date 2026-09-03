@@ -16,10 +16,11 @@ import {
  * to make "the trees nearest the goose, tallest first inside a band" cheap
  * enough to answer on the tree refresh tick and never on a frame.
  *
- * Tiles are fetched around the goose, parsed once and kept: a tile is a few
- * hundred kilobytes and the goose crosses back over the same ground all game.
- * Conversion to the engine's local metres happens at ingest, in slices, so a
- * dense tile never lands as one long task in the middle of a flight.
+ * The compact binary tiles can all be warmed into memory in the background.
+ * A tile is parsed and indexed only when the goose gets near it, then kept
+ * because the goose may cross that ground again. Conversion to the engine's
+ * local metres happens at ingest, in slices, so a dense tile never lands as
+ * one long task in the middle of a flight.
  */
 
 /** Spatial index cell, metres. A little wider than the crown of one tree. */
@@ -191,6 +192,14 @@ export type TreeTileStore = {
   readonly generation: number;
   /** True while the point sits inside the tiled rectangle. */
   covers(longitude: number, latitude: number): boolean;
+  /**
+   * Fetch the complete packaged data set into a compact background cache.
+   *
+   * Tiles advance one at a time and are not parsed or indexed until `request`
+   * needs them near the goose. Repeated calls share the same warm-up rather
+   * than downloading the data again.
+   */
+  preloadAll(): Promise<void>;
   /** Start fetching the tiles within `radius` metres. Never blocks. */
   request(longitude: number, latitude: number, radius: number): void;
   /** Fill `out` with the trees within `radius` of a local point, best first. */
@@ -217,9 +226,15 @@ export type TreeTileStoreOptions = {
 const defaultFetchTile = (url: string, signal: AbortSignal) =>
   fetch(url, { signal });
 
-// A macrotask, not a microtask: microtasks all run before the browser gets
-// the thread back, so slicing across them would still land as one long task.
+// Prefer true browser idle time, with a short deadline so a busy animation
+// cannot starve nearby trees forever. The fallback is still a macrotask, not
+// a microtask: microtasks all run before the browser gets the thread back, so
+// slicing across them would still land as one long task.
 const defaultScheduleSlice = (run: () => void) => {
+  if (typeof globalThis.requestIdleCallback === 'function') {
+    globalThis.requestIdleCallback(run, { timeout: 100 });
+    return;
+  }
   setTimeout(run, 0);
 };
 
@@ -242,10 +257,18 @@ export const createTreeTileStore = ({
   // index stays valid for the life of the store and the grid only grows.
   const grid = new Map<number, number[]>();
   const attempts = new Map<number, number>();
+  /** Compact fetched bytes waiting for a proximity request. */
+  const prefetched = new Map<number, ArrayBuffer>();
+  /** Successful 404/204 answers, also consumed only by a proximity request. */
+  const knownEmpty = new Set<number>();
   const loaded = new Set<number>();
-  const inFlight = new Set<number>();
+  // Keeping both promises lets background prefetch and proximity loading
+  // share a download, while repeated proximity passes also share one ingest.
+  const fetchInFlight = new Map<number, Promise<void>>();
+  const ingestInFlight = new Map<number, Promise<void>>();
   const scratchLocal = { x: 0, z: 0 };
   let sortKeys = new Float64Array(0);
+  let preloadPromise: Promise<void> | null = null;
 
   // Cell coordinates are signed and small (the coverage is nine kilometres
   // across), so one shifted product keys the grid without a string.
@@ -311,45 +334,140 @@ export const createTreeTileStore = ({
     generation += 1;
   };
 
-  const ingest = (tile: ParsedTreeTile) => {
-    const step = (from: number) => {
-      if (aborter.signal.aborted) return;
-      const to = Math.min(tile.count, from + INGEST_SLICE);
-      appendRange(tile, from, to);
-      if (to < tile.count) scheduleSlice(() => step(to));
-    };
-    step(0);
-  };
+  const ingest = (tile: ParsedTreeTile) =>
+    new Promise<void>((resolve) => {
+      const step = (from: number) => {
+        if (aborter.signal.aborted) {
+          resolve();
+          return;
+        }
+        const to = Math.min(tile.count, from + INGEST_SLICE);
+        appendRange(tile, from, to);
+        if (to < tile.count) scheduleSlice(() => step(to));
+        else resolve();
+      };
+      step(0);
+    });
 
-  const load = (x: number, y: number) => {
+  const prefetch = (x: number, y: number) => {
     const key = tileKey(x, y);
-    if (loaded.has(key) || inFlight.has(key)) return;
-    if ((attempts.get(key) ?? 0) >= TILE_FETCH_ATTEMPTS) return;
-    inFlight.add(key);
+    if (loaded.has(key) || prefetched.has(key) || knownEmpty.has(key))
+      return Promise.resolve();
+    const pending = fetchInFlight.get(key);
+    if (pending) return pending;
+    if ((attempts.get(key) ?? 0) >= TILE_FETCH_ATTEMPTS)
+      return Promise.resolve();
     attempts.set(key, (attempts.get(key) ?? 0) + 1);
-    void fetchTile(
-      `${base}trees/${TREE_TILE_ZOOM}/${x}/${y}.bin`,
-      aborter.signal,
-    )
+    let response: Promise<Response>;
+    try {
+      response = fetchTile(
+        `${base}trees/${TREE_TILE_ZOOM}/${x}/${y}.bin`,
+        aborter.signal,
+      );
+    } catch {
+      // A test adapter can throw before returning a promise. Treat it like a
+      // rejected fetch so the bounded retry rule stays true for every caller.
+      return Promise.resolve();
+    }
+    const request = response
       .then(async (response) => {
         // A missing tile is an answer, not a failure: no trees stand there.
         if (response.status === 404 || response.status === 204) {
-          loaded.add(key);
+          if (!aborter.signal.aborted) knownEmpty.add(key);
           return;
         }
         if (!response.ok)
           throw new Error(`Tree tile request failed: HTTP ${response.status}`);
         const buffer = await response.arrayBuffer();
-        loaded.add(key);
-        ingest(parseTreeTile(buffer));
+        if (!aborter.signal.aborted) prefetched.set(key, buffer);
       })
       .catch(() => {
-        // Offline, a truncated download, a tile that is not a tile: leave the
-        // tile unloaded so a later pass can try again, and keep flying.
+        // Offline or a failed response: leave the tile absent so the bounded
+        // preload loop or a later proximity pass can try again.
       })
       .finally(() => {
-        inFlight.delete(key);
+        fetchInFlight.delete(key);
       });
+    fetchInFlight.set(key, request);
+    return request;
+  };
+
+  const load = (x: number, y: number) => {
+    const key = tileKey(x, y);
+    if (loaded.has(key)) return Promise.resolve();
+    const pending = ingestInFlight.get(key);
+    if (pending) return pending;
+    const request = (async () => {
+      await prefetch(x, y);
+      if (aborter.signal.aborted) return;
+      if (knownEmpty.delete(key)) {
+        loaded.add(key);
+        return;
+      }
+      const buffer = prefetched.get(key);
+      if (!buffer) return;
+      try {
+        await ingest(parseTreeTile(buffer));
+        prefetched.delete(key);
+        if (!aborter.signal.aborted) loaded.add(key);
+      } catch {
+        // A truncated or invalid tile must not stop the game. Its successful
+        // fetch already counted as one attempt, so later passes remain bounded.
+        prefetched.delete(key);
+      }
+    })().finally(() => {
+      ingestInFlight.delete(key);
+    });
+    ingestInFlight.set(key, request);
+    return request;
+  };
+
+  const preloadAll = () => {
+    if (preloadPromise) return preloadPromise;
+    preloadPromise = (async () => {
+      // One background tile at a time keeps the 3.25 MiB data set from
+      // competing with map/terrain requests or producing a parse burst on a
+      // phone. Centre-first ordering starts with WMU's spawn tile, so the
+      // initial proximity request shares it instead of opening a second tree
+      // download while the map is settling.
+      const centerX = (TREE_TILE_COVERAGE.minX + TREE_TILE_COVERAGE.maxX) / 2;
+      const centerY = (TREE_TILE_COVERAGE.minY + TREE_TILE_COVERAGE.maxY) / 2;
+      const tiles: Array<[number, number]> = [];
+      for (
+        let x = TREE_TILE_COVERAGE.minX;
+        x <= TREE_TILE_COVERAGE.maxX;
+        x += 1
+      )
+        for (
+          let y = TREE_TILE_COVERAGE.minY;
+          y <= TREE_TILE_COVERAGE.maxY;
+          y += 1
+        )
+          tiles.push([x, y]);
+      tiles.sort(
+        ([firstX, firstY], [secondX, secondY]) =>
+          Math.abs(firstX - centerX) +
+            Math.abs(firstY - centerY) -
+            Math.abs(secondX - centerX) -
+            Math.abs(secondY - centerY) ||
+          firstX - secondX ||
+          firstY - secondY,
+      );
+      for (const [x, y] of tiles) {
+        if (aborter.signal.aborted) return;
+        const key = tileKey(x, y);
+        do {
+          await prefetch(x, y);
+        } while (
+          !aborter.signal.aborted &&
+          !loaded.has(key) &&
+          !prefetched.has(key) &&
+          !knownEmpty.has(key) &&
+          (attempts.get(key) ?? 0) < TILE_FETCH_ATTEMPTS
+        );
+      }
+    })();
+    return preloadPromise;
   };
 
   const query = (
@@ -432,6 +550,7 @@ export const createTreeTileStore = ({
     },
     covers: (longitude: number, latitude: number) =>
       inTreeTileCoverage(treeTileX(longitude), treeTileY(latitude)),
+    preloadAll,
     request: (longitude: number, latitude: number, radius: number) => {
       if (aborter.signal.aborted) return;
       const latitudeSpan = radius / METRES_PER_DEGREE_LATITUDE;
@@ -446,14 +565,21 @@ export const createTreeTileStore = ({
       const toY = treeTileY(latitude - latitudeSpan);
       for (let x = fromX; x <= toX; x += 1) {
         for (let y = fromY; y <= toY; y += 1) {
-          if (inTreeTileCoverage(x, y)) load(x, y);
+          if (inTreeTileCoverage(x, y)) void load(x, y);
         }
       }
     },
     query,
-    stats: () => ({ tiles: loaded.size, pending: inFlight.size, trees: count }),
+    stats: () => {
+      let pending = fetchInFlight.size;
+      for (const key of ingestInFlight.keys())
+        if (!fetchInFlight.has(key)) pending += 1;
+      return { tiles: loaded.size, pending, trees: count };
+    },
     dispose: () => {
       aborter.abort();
+      prefetched.clear();
+      knownEmpty.clear();
       grid.clear();
     },
   };

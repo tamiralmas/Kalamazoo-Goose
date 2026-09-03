@@ -9,10 +9,22 @@
     <meta name="theme-color" content="#532e1f" />
     <link rel="preconnect" href="https://imagery.michigan.gov" crossorigin />
     <link rel="dns-prefetch" href="https://imagery.michigan.gov" />
+    <link rel="preconnect" href="https://tiles.openfreemap.org" crossorigin />
+    <link rel="dns-prefetch" href="https://tiles.openfreemap.org" />
+    <link rel="preconnect" href="https://tiles.mapterhorn.com" crossorigin />
+    <link rel="dns-prefetch" href="https://tiles.mapterhorn.com" />
     <link
       rel="preload"
       as="image"
       href="https://imagery.michigan.gov/server/rest/services/Michigan_imagery_public/MapServer/tile/15/12129/8590"
+      crossorigin="anonymous"
+      fetchpriority="high"
+    />
+    <link
+      rel="preload"
+      as="fetch"
+      href="https://tiles.mapterhorn.com/16/17181/24258.webp"
+      type="image/webp"
       crossorigin="anonymous"
       fetchpriority="high"
     />

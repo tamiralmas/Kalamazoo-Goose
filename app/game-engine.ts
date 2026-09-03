@@ -515,8 +515,9 @@ const BUILDING_RESCAN_DISTANCE = 240;
  * the camera having moved on to a different chunking.
  */
 const STALE_CHUNK_SCANS = 3;
-/** Seconds between the steady building scans that feed that count. */
-const BUILDING_RESCAN_INTERVAL = 2;
+/** Seconds between steady building scans; source events and long moves stay immediate. */
+const BUILDING_RESCAN_INTERVAL_DESKTOP = 2;
+const BUILDING_RESCAN_INTERVAL_TOUCH = 4;
 /**
  * How far a secret's visual stays in the scene graph. Frustum culling alone
  * still walks all 165 secret meshes every frame; dropping the whole group past
@@ -1506,6 +1507,9 @@ export function createGooseEngine(
   const texturedRoofLimit = coarsePointer ? 180 : 320;
   const flareHint = coarsePointer ? 'hold Flare' : 'hold Shift to flare';
   const buildingTextureMaxZoom = coarsePointer ? 16 : BUILDING_TEXTURE_MAX_ZOOM;
+  const buildingRescanInterval = coarsePointer
+    ? BUILDING_RESCAN_INTERVAL_TOUCH
+    : BUILDING_RESCAN_INTERVAL_DESKTOP;
   const scene = new THREE.Scene();
   const camera = new THREE.Camera();
   const goose = createGooseRig();
@@ -1773,7 +1777,7 @@ export function createGooseEngine(
   let surfaceClock = 0;
   let telemetryClock = 0;
   let buildingRefreshClock = 0;
-  let buildingRescanClock = BUILDING_RESCAN_INTERVAL;
+  let buildingRescanClock = buildingRescanInterval;
   let secretRangeClock = 0;
   let buildingRefreshRequested = true;
   let trafficRefreshClock = 0;
@@ -10092,7 +10096,7 @@ export function createGooseEngine(
     if (playing) {
       buildingRescanClock -= frameDt;
       if (buildingRescanClock <= 0) {
-        buildingRescanClock = BUILDING_RESCAN_INTERVAL;
+        buildingRescanClock = buildingRescanInterval;
         buildingRefreshRequested = true;
       }
       secretRangeClock -= frameDt;
@@ -10427,6 +10431,10 @@ export function createGooseEngine(
 
   resetState(true, false);
   restoreSavedWorld();
+  // resetState has already asked for the spawn-area tiles. Warm the remaining
+  // compact tree files one at a time without making launch wait for them; the
+  // store only parses/indexes a tile later when the goose approaches it.
+  void treeTiles.preloadAll();
   // The HUD owns the store, so a wipe can arrive from anywhere. Only a
   // generation bump is a wipe; every other update is ordinary bookkeeping.
   // Phase 4: mutators also live here; activeMutators/unlockedMutators are

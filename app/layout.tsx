@@ -2,7 +2,12 @@ import type { Metadata, Viewport } from 'next';
 import { Geist, Geist_Mono } from 'next/font/google';
 import './globals.css';
 
-import { AERIAL_HOST_ORIGIN, AERIAL_SPAWN_PRELOAD_URL } from './world-imagery';
+import {
+  AERIAL_HOST_ORIGIN,
+  AERIAL_SPAWN_PRELOAD_URL,
+  TERRAIN_HOST_ORIGIN,
+  TERRAIN_SPAWN_PRELOAD_URL,
+} from './world-imagery';
 
 const geistSans = Geist({
   variable: '--font-geist-sans',
@@ -67,9 +72,23 @@ export default function RootLayout({
         />
         <link rel="dns-prefetch" href={AERIAL_HOST_ORIGIN} />
         <link
+          rel="preconnect"
+          href={TERRAIN_HOST_ORIGIN}
+          crossOrigin="anonymous"
+        />
+        <link rel="dns-prefetch" href={TERRAIN_HOST_ORIGIN} />
+        <link
           rel="preload"
           as="image"
           href={AERIAL_SPAWN_PRELOAD_URL}
+          crossOrigin="anonymous"
+          fetchPriority="high"
+        />
+        <link
+          rel="preload"
+          as="fetch"
+          href={TERRAIN_SPAWN_PRELOAD_URL}
+          type="image/webp"
           crossOrigin="anonymous"
           fetchPriority="high"
         />

@@ -116,8 +116,12 @@ const MINIMAP_WORLD_SIZE = MINIMAP_TILE_SIZE * 2 ** MINIMAP_ZOOM;
 const MINIMAP_EDGE_INSET_PX = 8;
 const MINIMAP_IN_VIEW_MARGIN_PX = 9;
 const MINIMAP_EDGE_MARKER_LIMIT = 3;
-/** How long the launch waits for the spawn DEM tile before starting flat. */
-const TERRAIN_READY_DEADLINE_MS = 12_000;
+/**
+ * A short chance for the preloaded spawn DEM to decode before the engine starts.
+ * The engine can lift its world safely when terrain arrives later, so this is a
+ * grace period rather than a reason to hold the launch screen for many seconds.
+ */
+const TERRAIN_READY_GRACE_MS = 1_500;
 /** The stitched building source (LiDAR tiles near campus, OpenFreeMap beyond). */
 const BUILDING_SOURCE_ID = 'wmug-buildings';
 /** The hillshade reads the same DEM through its own source (see below). */
@@ -437,6 +441,10 @@ export function GooseGame() {
       .then((maplibre) => {
         if (cancelled) return;
         maplibre.setWorkerUrl(maplibreWorkerUrl);
+        // Download the gameplay bundle while the remote map style and its first
+        // tiles are loading. Previously this second download did not begin until
+        // the map's load event, leaving mobile players with another serial wait.
+        const engineModulePromise = import('@/app/game-engine');
         const map = new maplibre.Map({
           container,
           style: 'https://tiles.openfreemap.org/styles/liberty',
@@ -519,9 +527,6 @@ export function GooseGame() {
           if (cancelled) return;
           loaded = true;
           setMapError(false);
-          // Three.js and the gameplay simulation are intentionally a second
-          // download. Ground imagery wins the first mobile network/render pass.
-          const engineModulePromise = import('@/app/game-engine');
           try {
             aerialImagery.installDetailed();
             const layers = map.getStyle().layers ?? [];
@@ -766,6 +771,15 @@ export function GooseGame() {
 
             let worldInitialized = false;
             let terrainPoll: number | null = null;
+            const disableTerrain = () => {
+              try {
+                map.setTerrain(null);
+                map.removeSource('wmug-terrain-dem');
+              } catch {
+                // The source may already be absent after a partial setup.
+              }
+              terrainConfigured = false;
+            };
             const finishWorld = (hasTerrain: boolean) => {
               if (worldInitialized || cancelled) return;
               worldInitialized = true;
@@ -775,15 +789,6 @@ export function GooseGame() {
               terrainTimer = null;
               if (terrainPoll !== null) window.clearInterval(terrainPoll);
               terrainPoll = null;
-
-              if (!hasTerrain && terrainConfigured) {
-                try {
-                  map.setTerrain(null);
-                  map.removeSource('wmug-terrain-dem');
-                } catch {
-                  // A flat map is a safe fallback; all gameplay heights use zero MSL.
-                }
-              }
 
               void engineModulePromise
                 .then(({ createGooseEngine }) => {
@@ -800,7 +805,10 @@ export function GooseGame() {
                       },
                       progress,
                     );
-                    setTerrainReady(hasTerrain);
+                    // Keep configured terrain enabled even if its first tile is
+                    // still decoding. game-engine.ts preserves the goose's AGL
+                    // and re-fits world objects when that elevation arrives.
+                    setTerrainReady(hasTerrain || terrainConfigured);
                     setMapReady(true);
                     setMapError(false);
                   } catch {
@@ -832,21 +840,22 @@ export function GooseGame() {
             // is unreachable: start flat now rather than at the deadline.
             const onTerrainTileError = (event: MapLibreErrorEvent) => {
               const detail = event as { tile?: unknown; sourceId?: string };
-              if (detail.tile && detail.sourceId === 'wmug-terrain-dem')
+              if (detail.tile && detail.sourceId === 'wmug-terrain-dem') {
+                disableTerrain();
                 finishWorld(false);
+              }
             };
 
             if (terrainConfigured) {
               map.on('idle', tryTerrainReady);
               map.on('error', onTerrainTileError);
-              // The deadline is generous because a flat campus is permanent
-              // for the session: on a slow connection the spawn DEM tile can
-              // take several seconds, and 3.5 s was turning real terrain into
-              // a coin flip. The poll covers a background tab, where 'idle'
-              // waits on a throttled animation frame.
+              // The exact spawn tile is preloaded from index.html. If it still
+              // is not decoded after this short grace period, start on the
+              // engine's safe WMU fallback and let its late-terrain correction
+              // lift the goose and nearby world without a visible jump.
               terrainTimer = window.setTimeout(
                 () => finishWorld(false),
-                TERRAIN_READY_DEADLINE_MS,
+                TERRAIN_READY_GRACE_MS,
               );
               terrainPoll = window.setInterval(tryTerrainReady, 250);
               tryTerrainReady();

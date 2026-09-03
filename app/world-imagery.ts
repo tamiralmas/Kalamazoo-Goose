@@ -19,8 +19,13 @@ export const AERIAL_SPAWN_PRELOAD_URL = getAerialTileUrl(15, 8590, 12129);
 // Mapterhorn publishes global Terrarium-encoded DEM tiles. Its TileJSON omits
 // maxzoom, and the Kalamazoo coverage ends at zoom 16, so the source declares
 // the ceiling itself instead of letting MapLibre probe zooms 17-22.
-export const TERRAIN_TILE_TEMPLATE =
-  'https://tiles.mapterhorn.com/{z}/{x}/{y}.webp';
+export const TERRAIN_HOST_ORIGIN = 'https://tiles.mapterhorn.com';
+export const TERRAIN_TILE_TEMPLATE = `${TERRAIN_HOST_ORIGIN}/{z}/{x}/{y}.webp`;
 export const TERRAIN_MAX_ZOOM = 16;
 export const TERRAIN_ATTRIBUTION =
   'Terrain © <a href="https://mapterhorn.com/attribution/" target="_blank">Mapterhorn</a>';
+export const getTerrainTileUrl = (zoom: number, x: number, y: number) =>
+  `${TERRAIN_HOST_ORIGIN}/${zoom}/${x}/${y}.webp`;
+
+/** Zoom-16 DEM tile containing the WMU spawn, fetched while the app starts. */
+export const TERRAIN_SPAWN_PRELOAD_URL = getTerrainTileUrl(16, 17181, 24258);
