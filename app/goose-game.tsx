@@ -43,7 +43,6 @@ import {
 import type {
   ErrorEvent as MapLibreErrorEvent,
   Map as MapLibreMap,
-  MapSourceDataEvent,
 } from 'maplibre-gl';
 import type {
   ExpressionSpecification,
@@ -53,6 +52,12 @@ import type {
 import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-worker.mjs?worker&url';
 
 import { Button } from '@/components/ui/button';
+import {
+  AERIAL_DETAIL_SOURCE_ID,
+  AERIAL_FALLBACK_SOURCE_ID,
+  aerialTileRetentionOptions,
+  createAerialImagery,
+} from '@/app/aerial-imagery';
 import {
   BUILDING_SOURCE_LAYER,
   BUILDING_TILE_TEMPLATE,
@@ -84,10 +89,7 @@ import { resolveRenderPixelRatio } from '@/app/render-scale';
 import { QUESTS } from '@/app/quests';
 import { WMU_SPAWN } from '@/app/world-config';
 import {
-  AERIAL_ATTRIBUTION,
-  AERIAL_BOUNDS,
   AERIAL_INFORMATION_URL,
-  AERIAL_TILE_TEMPLATE,
   TERRAIN_ATTRIBUTION,
   TERRAIN_MAX_ZOOM,
   TERRAIN_TILE_TEMPLATE,
@@ -451,8 +453,7 @@ export function GooseGame() {
           pixelRatio,
           fadeDuration: coarsePointer ? 0 : 300,
           refreshExpiredTiles: !coarsePointer,
-          maxTileCacheZoomLevels: coarsePointer ? 2 : 5,
-          cancelPendingTileRequestsWhileZooming: true,
+          ...aerialTileRetentionOptions(coarsePointer),
           // MapLibre 6 slices vector tiles into finer chunks for the first
           // few zoom levels past the source's maxzoom (14 here), and with
           // terrain on it lifts every chunk by the DEM under that chunk's
@@ -482,84 +483,34 @@ export function GooseGame() {
         collapseAttribution();
         map.once('load', collapseAttribution);
 
-        const previewSourceId = 'wmug-aerial-preview';
-        const fullSourceId = 'wmug-aerial-imagery';
-        let fullAerialTileSeen = false;
-
         const firstBaseLayerId = () =>
           map
             .getStyle()
             .layers?.find(
               (layer) =>
                 layer.type !== 'background' &&
-                layer.id !== previewSourceId &&
-                layer.id !== fullSourceId &&
+                layer.id !== AERIAL_FALLBACK_SOURCE_ID &&
+                layer.id !== AERIAL_DETAIL_SOURCE_ID &&
                 layer.id !== HILLSHADE_SOURCE_ID,
             )?.id;
 
-        const installAerialLayer = (sourceId: string, tileSize: 256 | 512) => {
-          if (map.getSource(sourceId)) return;
-          map.addSource(sourceId, {
-            type: 'raster',
-            tiles: [AERIAL_TILE_TEMPLATE],
-            tileSize,
-            minzoom: 1,
-            maxzoom: 19,
-            bounds: AERIAL_BOUNDS,
-            attribution: AERIAL_ATTRIBUTION,
-          });
-          map.addLayer(
-            {
-              id: sourceId,
-              type: 'raster',
-              source: sourceId,
-              paint: {
-                'raster-opacity': 1,
-                // A touch more colour and contrast than the flat scan: the
-                // photography was flown in spring haze and reads washed out
-                // under a blue sky otherwise.
-                'raster-saturation': 0.06,
-                'raster-contrast': 0.14,
-                'raster-brightness-min': 0.03,
-                'raster-brightness-max': 0.99,
-                // Sharper imagery streams in as the goose approaches; a
-                // cross-fade keeps that from reading as the ground popping.
-                // Phones skip it: every extra blended tile costs fill rate.
-                'raster-fade-duration': coarsePointer ? 0 : 450,
-                'raster-resampling': 'linear',
-              },
-            },
-            firstBaseLayerId(),
-          );
-        };
+        const aerialImagery = createAerialImagery(
+          map,
+          coarsePointer,
+          firstBaseLayerId,
+        );
 
-        const installAerialPreview = () =>
-          installAerialLayer(previewSourceId, 512);
-        const installAerialImagery = () =>
-          installAerialLayer(fullSourceId, 256);
-        const retireAerialPreview = (event: MapSourceDataEvent) => {
-          if (!coarsePointer || cancelled || event.sourceId !== fullSourceId)
-            return;
-          if (event.coord) fullAerialTileSeen = true;
-          if (!fullAerialTileSeen || !map.isSourceLoaded(fullSourceId)) return;
-          if (map.getLayer(previewSourceId)) map.removeLayer(previewSourceId);
-          if (map.getSource(previewSourceId)) map.removeSource(previewSourceId);
-          map.off('sourcedata', retireAerialPreview);
-        };
-
-        // Phones first request a one-zoom-lower MiSAIL preview, reducing the
-        // visible startup tile count by roughly 75%. The full original imagery
-        // then streams above it and replaces the preview once the viewport is ready.
+        // Phones still start with a light MiSAIL preview. It stays underneath
+        // the detailed photography during travel, zoom changes and tile reloads.
         map.on('style.load', () => {
-          if (coarsePointer) installAerialPreview();
-          else installAerialImagery();
+          if (coarsePointer) aerialImagery.installFallback();
+          else aerialImagery.installDetailed();
         });
-        map.on('sourcedata', retireAerialPreview);
 
         map.on('error', (event) => {
-          // A single failed tile (an aerial or DEM request that timed out)
-          // is retried by MapLibre and must not flip the launch button into
-          // its "reconnecting" state. Only style/source level failures do.
+          // A single failed tile must not flip the launch button into its
+          // reconnecting state. Retained parents and the coarse imagery floor
+          // cover detail failures; only style/source level failures block launch.
           if ((event as { tile?: unknown }).tile) return;
           if (!loaded && !cancelled) setMapError(true);
         });
@@ -572,7 +523,7 @@ export function GooseGame() {
           // download. Ground imagery wins the first mobile network/render pass.
           const engineModulePromise = import('@/app/game-engine');
           try {
-            installAerialImagery();
+            aerialImagery.installDetailed();
             const layers = map.getStyle().layers ?? [];
 
             // Let the aerial photography supply the ground detail while preserving

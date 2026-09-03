@@ -389,6 +389,7 @@ const FLAP_STAMINA_COST = 0.014;
 const SPAWN_ALTITUDE = 42;
 const SPAWN_SPEED = 13.8;
 const DEFAULT_CAMERA_SCALE = 10 / 7;
+const DEFAULT_CAMERA_PITCH = 16 * DEG;
 const MAX_TRAFFIC = 40;
 const TRAFFIC_ROUTE_RADIUS = 1_100;
 const TRAFFIC_REANCHOR_DISTANCE = 650;
@@ -2052,8 +2053,8 @@ export function createGooseEngine(
   let cameraDistanceTarget = DEFAULT_CAMERA_SCALE;
   let cameraOrbitYaw = 0;
   let cameraOrbitYawTarget = 0;
-  let cameraOrbitPitch = 24 * DEG;
-  let cameraOrbitPitchTarget = 24 * DEG;
+  let cameraOrbitPitch = DEFAULT_CAMERA_PITCH;
+  let cameraOrbitPitchTarget = DEFAULT_CAMERA_PITCH;
   const initialCampusElevation = queryGroundElevation(WMU_SPAWN);
   let campusGroundResolved =
     !terrainEnabled ||
@@ -9842,8 +9843,8 @@ export function createGooseEngine(
     cameraDistanceTarget = DEFAULT_CAMERA_SCALE;
     cameraOrbitYaw = 0;
     cameraOrbitYawTarget = 0;
-    cameraOrbitPitch = 24 * DEG;
-    cameraOrbitPitchTarget = 24 * DEG;
+    cameraOrbitPitch = DEFAULT_CAMERA_PITCH;
+    cameraOrbitPitchTarget = DEFAULT_CAMERA_PITCH;
     campusNpcs.forEach((npc, index) => {
       campusNpcs[index] = createCampusNpc(
         index,
@@ -10545,7 +10546,7 @@ export function createGooseEngine(
       cameraDistanceScale = cameraDistanceTarget;
       cameraOrbitYawTarget = 0;
       cameraOrbitYaw = cameraOrbitYawTarget;
-      cameraOrbitPitchTarget = 24 * DEG;
+      cameraOrbitPitchTarget = DEFAULT_CAMERA_PITCH;
       cameraOrbitPitch = cameraOrbitPitchTarget;
       updateCamera(1 / 60, renderState, true);
       map.triggerRepaint();
