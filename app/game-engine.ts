@@ -377,6 +377,14 @@ const TRAFFIC_REANCHOR_DISTANCE = 650;
 const WATER_INGEST_RADIUS = 1_600;
 const WOODLAND_INGEST_RADIUS = 1_400;
 const WOODLAND_REANCHOR_DISTANCE = 650;
+/** Metres between street trees along a residential road, per side. */
+const STREET_TREE_SPACING = 24;
+/** How far a street tree stands from the road centreline: a front yard. */
+const STREET_TREE_OFFSET = 9;
+/** Street-tree candidates added per woodland scan, on top of the woods. */
+const STREET_TREE_CANDIDATE_LIMIT = 420;
+/** OpenMapTiles road classes that get street trees. */
+const STREET_TREE_ROAD_CLASSES = new Set(['minor', 'tertiary', 'residential']);
 const WOODLAND_RECYCLE_DISTANCE = 1_600;
 const WOODLAND_SPAWN_MIN_DISTANCE = 180;
 const MAX_TREE_COUNT = 560;
@@ -4307,6 +4315,114 @@ export function createGooseEngine(
         }
       }
 
+      // Street trees. Off campus the only mapped trees are OSM wood
+      // polygons, which residential Kalamazoo barely has, so the
+      // neighbourhoods came up bare. Real streets have a tree every couple
+      // of lots; plant one every STREET_TREE_SPACING along minor and
+      // tertiary roads, on both sides, a lot-depth off the centreline. They
+      // share the woodland budget and pipeline, so water, roads and
+      // buildings still reject them and the nearest ones land first.
+      if (map.getSource(roadSourceId) && candidates.size < candidateLimit) {
+        const roads = map.querySourceFeatures(roadSourceId, {
+          sourceLayer: 'transportation',
+        }) as Array<{
+          properties?: Record<string, unknown>;
+          geometry: { type: string; coordinates: unknown };
+        }>;
+        const streetLimit = Math.min(
+          candidateLimit,
+          candidates.size + STREET_TREE_CANDIDATE_LIMIT,
+        );
+        const plantAlong = (coordinates: number[][]) => {
+          let carry = STREET_TREE_SPACING * 0.5;
+          for (
+            let index = 1;
+            index < coordinates.length && candidates.size < streetLimit;
+            index += 1
+          ) {
+            const from = geoToLocalInto(
+              coordinates[index - 1][0],
+              coordinates[index - 1][1],
+              scanCornerLow,
+            );
+            const fromX = from.x;
+            const fromZ = from.z;
+            const to = geoToLocalInto(
+              coordinates[index][0],
+              coordinates[index][1],
+              scanCornerHigh,
+            );
+            const segmentX = to.x - fromX;
+            const segmentZ = to.z - fromZ;
+            const length = Math.hypot(segmentX, segmentZ);
+            if (length < 0.5) continue;
+            const rightX = segmentZ / length;
+            const rightZ = -segmentX / length;
+            let along = carry;
+            while (along <= length && candidates.size < streetLimit) {
+              const centerX = fromX + (segmentX * along) / length;
+              const centerZ = fromZ + (segmentZ * along) / length;
+              for (const side of [1, -1]) {
+                const cellX = Math.floor(
+                  (centerX + rightX * side * STREET_TREE_OFFSET) / spacing,
+                );
+                const cellZ = Math.floor(
+                  (centerZ + rightZ * side * STREET_TREE_OFFSET) / spacing,
+                );
+                const key = `${cellX}:${cellZ}`;
+                if (woodlandTreeKeys.has(key) || candidates.has(key)) continue;
+                const hash =
+                  Math.sin(cellX * 12.9898 + cellZ * 78.233) * 43758.5453;
+                const unit = hash - Math.floor(hash);
+                const offset = STREET_TREE_OFFSET + (unit - 0.5) * 2.4;
+                const east = centerX + rightX * side * offset;
+                const north = centerZ + rightZ * side * offset;
+                if (
+                  Math.hypot(
+                    east - state.position.x,
+                    north - state.position.z,
+                  ) > WOODLAND_INGEST_RADIUS ||
+                  mappedTrees.some(
+                    (tree) =>
+                      Math.hypot(tree.local.x - east, tree.local.z - north) < 6,
+                  )
+                )
+                  continue;
+                candidates.set(key, {
+                  id:
+                    9_800_000_000 +
+                    Math.abs(cellX * 73_856_093 + cellZ * 19_349_663),
+                  key,
+                  local: new THREE.Vector3(east, 0, north),
+                  supplemental: true,
+                  scale: 0.7 + unit * 0.22,
+                });
+              }
+              along += STREET_TREE_SPACING;
+            }
+            carry = along - length;
+          }
+        };
+        for (const feature of roads) {
+          if (candidates.size >= streetLimit) break;
+          const roadClass =
+            typeof feature.properties?.class === 'string'
+              ? feature.properties.class
+              : '';
+          if (
+            !STREET_TREE_ROAD_CLASSES.has(roadClass) ||
+            feature.properties?.brunnel === 'tunnel' ||
+            feature.properties?.brunnel === 'bridge'
+          )
+            continue;
+          if (feature.geometry.type === 'LineString')
+            plantAlong(feature.geometry.coordinates as number[][]);
+          else if (feature.geometry.type === 'MultiLineString')
+            for (const line of feature.geometry.coordinates as number[][][])
+              plantAlong(line);
+        }
+      }
+
       woodlandAnchor.set(state.position.x, state.position.z);
       woodlandScanNeedsRetry = !map.isSourceLoaded(landcoverSourceId);
       woodlandScanRetryAt = elapsedTime + 4;
@@ -5257,9 +5373,35 @@ export function createGooseEngine(
         DEDICATED_WALKWAY_CLASSES.has(subclass)
       );
     };
-    features.sort(
-      (a, b) => Number(isDedicatedFeature(b)) - Number(isDedicatedFeature(a)),
-    );
+    // Nearest paths first, dedicated walkways ahead of roadsides. The route
+    // list is capped, and the source hands back whole zoom-14 tiles now (see
+    // zoomLevelsToOverscale in goose-game.tsx), so accepting lines in tile
+    // order filled the cap with trails on the far side of the radius and
+    // left the crowd on the spawn lawn fallbacks: students in a field with
+    // the real sidewalks next to them empty.
+    const candidates: Array<{
+      coordinates: number[][];
+      dedicated: boolean;
+      distanceSquared: number;
+    }> = [];
+    const nearestDistanceSquared = (coordinates: number[][]) => {
+      let best = Number.POSITIVE_INFINITY;
+      const stride = Math.max(1, Math.floor(coordinates.length / 12));
+      for (let index = 0; index < coordinates.length; index += stride) {
+        const coordinate = coordinates[index];
+        if (coordinate.length < 2) continue;
+        const point = geoToLocalInto(
+          coordinate[0],
+          coordinate[1],
+          scanCornerLow,
+        );
+        const dx = point.x - state.position.x;
+        const dz = point.z - state.position.z;
+        const distance = dx * dx + dz * dz;
+        if (distance < best) best = distance;
+      }
+      return best;
+    };
     features.forEach((feature) => {
       const roadClass =
         typeof feature.properties?.class === 'string'
@@ -5276,19 +5418,29 @@ export function createGooseEngine(
         feature.properties?.brunnel === 'bridge'
       )
         return;
-      const isDedicatedWalkway = isDedicatedFeature(feature);
-      if (feature.geometry.type === 'LineString') {
-        acceptLine(
-          feature.geometry.coordinates as number[][],
-          isDedicatedWalkway,
-        );
-      }
-      if (feature.geometry.type === 'MultiLineString') {
-        (feature.geometry.coordinates as number[][][]).forEach((line) =>
-          acceptLine(line, isDedicatedWalkway),
-        );
+      const dedicated = isDedicatedFeature(feature);
+      const lines =
+        feature.geometry.type === 'LineString'
+          ? [feature.geometry.coordinates as number[][]]
+          : feature.geometry.type === 'MultiLineString'
+            ? (feature.geometry.coordinates as number[][][])
+            : [];
+      for (const coordinates of lines) {
+        if (coordinates.length < 2) continue;
+        const distanceSquared = nearestDistanceSquared(coordinates);
+        if (distanceSquared > 1_200 * 1_200) continue;
+        candidates.push({ coordinates, dedicated, distanceSquared });
       }
     });
+    candidates.sort(
+      (a, b) =>
+        Number(b.dedicated) - Number(a.dedicated) ||
+        a.distanceSquared - b.distanceSquared,
+    );
+    for (const candidate of candidates) {
+      if (pedestrianRoutes.length >= 80) break;
+      acceptLine(candidate.coordinates, candidate.dedicated);
+    }
 
     trafficRoutes.forEach((route, index) => {
       if (pedestrianRoutes.length >= 48) return;

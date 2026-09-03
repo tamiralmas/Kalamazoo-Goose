@@ -389,6 +389,54 @@ export const BONUS_CHAOS_SECRETS = [
     color: 0xf1c500,
   },
   {
+    // The turnaround at the dead end of Fraternity Village Drive, ringed by
+    // the frat houses. Five honks in the circle is the rush chant.
+    id: 'frat-village-circle',
+    label: 'Cul-de-Sac Chapter Meeting',
+    east: -805.8,
+    north: -1_077.4,
+    altitude: 0.12,
+    radius: 11,
+    trigger: 'multi-honk',
+    effect: 'mega-honk',
+    requiredHonks: 5,
+    points: 1_000,
+    visual: 'honk-shrine',
+    color: 0x2f8f5b,
+  },
+  {
+    // Campus Court at Knollwood, south courtyard: where St. Patrick's Day
+    // gets loud. Three honks and everyone within earshot starts dancing.
+    id: 'campus-court-st-pattys',
+    label: "St. Patty's Honk Parade",
+    east: -218,
+    north: -1_169.2,
+    altitude: 0.12,
+    radius: 10,
+    trigger: 'multi-honk',
+    effect: 'boost',
+    requiredHonks: 3,
+    points: 900,
+    visual: 'honk-shrine',
+    color: 0x1fa04a,
+  },
+  {
+    // Campus Court's north lawn: the House Crawl. Touch the keg and the
+    // whole block wobbles.
+    id: 'campus-court-house-crawl',
+    label: 'House Crawl Keg Stand',
+    east: -204.8,
+    north: -1_009.1,
+    altitude: 0.1,
+    radius: 4,
+    trigger: 'touch',
+    effect: 'traffic-wobble',
+    requiredHonks: 0,
+    points: 900,
+    visual: 'bonk-cluster',
+    color: 0xd9822b,
+  },
+  {
     id: 'bronson-goose-cannon',
     label: 'Bronson Goose Cannon',
     east: 2_608.3,
