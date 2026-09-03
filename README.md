@@ -55,3 +55,13 @@ To regenerate the tiles:
 
 1. Open `scripts/lidar-heights/index.html` in a browser and run it. It fetches the footprints from Overpass, streams the point cloud from the public `usgs-lidar-public` bucket (about 1.7 GB), measures every footprint, and downloads `kalamazoo-buildings.json.gz`. The committed copy lives in `data/`.
 2. Run `node scripts/build-building-tiles.mjs data/kalamazoo-buildings.json.gz`. It writes the tiles and updates `app/building-tiles-coverage.ts` with the tile range they cover.
+
+### Trees
+
+Across the nine kilometres of Kalamazoo covered by `app/tree-tiles-coverage.ts`, the trees are the ones the same 2015 LiDAR flight actually measured: about 280,000 trunks with a height, a crown radius and a canopy closure each, shipped as the game's own zoom-14 binary tiles under `public/trees` and streamed in around the goose. Inside that rectangle the measured trees replace the OpenStreetMap woodland and street-tree placement, which still plants the rest of the map.
+
+To regenerate them: open `scripts/lidar-trees/index.html` in a browser and run it (it streams about 1 GB of points, builds a canopy height model with the building footprints cut out, picks the crowns, and downloads `kalamazoo-trees.json.gz`; the committed copy lives in `data/`), then run `node scripts/build-tree-tiles.mjs data/kalamazoo-trees.json.gz`.
+
+### Water
+
+Ponds and lakes are drawn as animated surfaces: a lit, moving water sheet over each OpenStreetMap water polygon within reach, with a fresnel sky reflection, a sun glint from the same sun as everything else, a fade at the banks, and ripples where the goose lands.

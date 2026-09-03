@@ -58,6 +58,15 @@
         logEl.textContent = lines.join('\n');
         logEl.scrollTop = logEl.scrollHeight;
       };
+      // Timers in a background tab are throttled to a tick a minute after a
+      // while; a message to yourself is not, so the long loops yield through
+      // one instead of setTimeout.
+      const yieldChannel = new MessageChannel();
+      const yieldToBrowser = () =>
+        new Promise((resolve) => {
+          yieldChannel.port1.onmessage = () => resolve();
+          yieldChannel.port2.postMessage(0);
+        });
       const readBox = () =>
         ['west', 'south', 'east', 'north'].map((id) =>
           Number(document.getElementById(id).value),
@@ -331,7 +340,7 @@
           lazPerf._free(pointPtr);
           if (index % 20 === 0 || index === nodes.length - 1) {
             log(`node ${index + 1}/${nodes.length}: ${points} points, ${matched} on footprints, ${(bytes / 1048576).toFixed(0)} MB, ${((Date.now() - started) / 1000).toFixed(0)} s`);
-            await new Promise((r) => setTimeout(r, 0));
+            await yieldToBrowser();
           }
         }
         const percentile = (sorted, q) => sorted[Math.min(sorted.length - 1, Math.floor(q * sorted.length))];

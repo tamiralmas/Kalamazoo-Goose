@@ -39,6 +39,7 @@ import {
 } from './building-terrain';
 import { BONUS_CHAOS_SECRETS, type BonusChaosSecret } from './chaos-secrets';
 import { isTouchDevice } from './device';
+import { createContactShadow } from './contact-shadow';
 import {
   PROP_CAPACITY,
   createPropSystem,
@@ -46,8 +47,15 @@ import {
   type PropSystem,
 } from './props';
 import { PROP_PLACEMENTS } from './props-placement';
+import {
+  TREE_TILE_BOUNDS,
+  createTreeSelection,
+  createTreeTileStore,
+} from './tree-tiles';
 import { WMU_TREE_POINTS } from './wmu-trees';
+import { createWaterSurfaces } from './water-surface';
 import { WMU_SPAWN } from './world-config';
+import { sunDirection } from './world-light';
 import { TERRAIN_MAX_ZOOM, getAerialTileUrl } from './world-imagery';
 import { JETSTREAM_BOOST_PERCENT, slugifyLabel } from './game-contract';
 import type {
@@ -105,6 +113,8 @@ export type GameTelemetry = {
   nearestStudentVertical: number | null;
   trees: number;
   treesResolved: number;
+  /** Animated water meshes standing in for the map's flat water fill. */
+  waterSurfaces: number;
   flockSize: number;
   flockTotal: number;
   recruitableGooseInRange: boolean;
@@ -167,6 +177,10 @@ type GooseRig = {
   root: THREE.Group;
   leftWing: THREE.Group;
   rightWing: THREE.Group;
+  // Phase 8: the hand section, pivoting at the wrist off the arm above, so a
+  // wingbeat bends through the span instead of hinging at the shoulder.
+  leftWingOuter: THREE.Group;
+  rightWingOuter: THREE.Group;
   legs: THREE.Group;
   leftLeg: THREE.Group;
   rightLeg: THREE.Group;
@@ -181,6 +195,8 @@ type GooseRig = {
     wing: THREE.MeshStandardMaterial;
     beak: THREE.MeshStandardMaterial;
   };
+  /** Phase 8: the rim light's eye position, fed the chase camera each frame. */
+  rimEye: GooseRimEye;
   halo: THREE.Mesh<THREE.TorusGeometry, THREE.MeshBasicMaterial>;
 };
 
@@ -375,6 +391,12 @@ const MAX_TRAFFIC = 40;
 const TRAFFIC_ROUTE_RADIUS = 1_100;
 const TRAFFIC_REANCHOR_DISTANCE = 650;
 const WATER_INGEST_RADIUS = 1_600;
+/**
+ * Seconds between re-samples of the terrain under a water sheet that is still
+ * sitting on the fallback height. Ponds arrive from the vector tiles long
+ * before the DEM under them, exactly like the building colliders do.
+ */
+const WATER_SURFACE_RESOLVE_INTERVAL = 0.45;
 const WOODLAND_INGEST_RADIUS = 1_400;
 const WOODLAND_REANCHOR_DISTANCE = 650;
 /** Metres between street trees along a residential road, per side. */
@@ -387,7 +409,47 @@ const STREET_TREE_CANDIDATE_LIMIT = 420;
 const STREET_TREE_ROAD_CLASSES = new Set(['minor', 'tertiary', 'residential']);
 const WOODLAND_RECYCLE_DISTANCE = 1_600;
 const WOODLAND_SPAWN_MIN_DISTANCE = 180;
-const MAX_TREE_COUNT = 560;
+/**
+ * Tree instance budget. The LiDAR tiles hold a quarter of a million trees, so
+ * this is not a count of the world's trees any more, only of how many of them
+ * the two InstancedMeshes carry at once around the goose. Kalamazoo runs to
+ * four thousand crowns per square kilometre, so 1,800 filled up within 350 m
+ * of the goose and the woods ended in a visible line; 3,600 pushes that edge
+ * out to about 500 m in the densest neighbourhoods, into the haze.
+ */
+const MAX_TREE_COUNT_DESKTOP = 3_600;
+const MAX_TREE_COUNT_PHONE = 1_000;
+/** How far the LiDAR selection reaches, and how far its tiles are fetched. */
+const LIDAR_TREE_RADIUS_DESKTOP = 900;
+const LIDAR_TREE_RADIUS_PHONE = 550;
+/** Metres of travel before the nearest-first selection is taken again. */
+const LIDAR_TREE_REANCHOR_DISTANCE = 120;
+/**
+ * Planting budgets for measured trees, which arrive by the thousand rather
+ * than by the handful the woodland scan produces: without these the nearest
+ * couple of thousand trees would take a minute of flying to show up.
+ */
+const LIDAR_STREAM_BATCH_DESKTOP = 180;
+const LIDAR_STREAM_BATCH_PHONE = 45;
+/** Trunk height as a share of the measured canopy top. */
+const TREE_TRUNK_HEIGHT_SHARE = 0.4;
+/** Crown centre height as a share of the measured canopy top. */
+const TREE_CROWN_CENTRE_SHARE = 0.7;
+/**
+ * A tree is drawn as a conifer when its crown is both this closed (the share
+ * of pulses the crown stopped before the ground) and narrow for its height
+ * (CONIFER_SLENDERNESS, height over crown diameter). The flight caught the
+ * canopy in leaf, so closure alone does not separate species: most crowns
+ * score 0.7 or so, and only the dense, pointed ones are spruce and pine.
+ */
+const CONIFER_FULLNESS = 0.86;
+const CONIFER_SLENDERNESS = 1.5;
+/** Trunk radius as a share of the canopy top, and the range it lives in. */
+const TREE_TRUNK_RADIUS_SHARE = 0.018;
+const TREE_TRUNK_RADIUS_MIN = 0.1;
+const TREE_TRUNK_RADIUS_MAX = 0.45;
+/** Radius the trunk geometry is authored at, which the scale divides out. */
+const TREE_TRUNK_GEOMETRY_RADIUS = 0.26;
 const NEAR_SPAWN_CROWD_COUNT = 12;
 const NPC_RECYCLE_DISTANCE = 220;
 const NPC_STALE_ROUTE_KEEP_DISTANCE = 160;
@@ -564,35 +626,305 @@ const moveToward = (value: number, target: number, maxDelta: number) => {
   return value + Math.sign(target - value) * maxDelta;
 };
 
-function makeWingGeometry(side: -1 | 1) {
-  const s = side;
+// Phase 8: the hero. The goose is the one thing on screen the whole time, so
+// it gets a rim light (silhouette separation against dark grass and asphalt),
+// a feather-scale surface break-up, eyes, and a wing that bends instead of
+// hinging. Everything below is shared with the flock: createGooseRig builds
+// both the player's rig and the pose rig the InstancedMeshes copy from.
+
+/**
+ * The default Canada-goose palette: a warm greyish brown body, darker
+ * brown-grey wings, cream chin and breast, and a black neck and head. Shared
+ * by the rig's materials and by the mutator recolour path, so a skin that is
+ * turned off puts back exactly what the rig was built with.
+ */
+const GOOSE_PALETTE: GooseColors = {
+  body: 0x796a54,
+  breast: 0xefe7d2,
+  neck: 0x141513,
+  wing: 0x51493c,
+  beak: 0x141513,
+};
+
+/** Rim strength on the plumage: an edge, not a glow. */
+const GOOSE_RIM_STRENGTH = 0.35;
+/**
+ * The near-black neck, head and beak need more than the plumage does, or the
+ * silhouette dissolves into shadowed ground.
+ */
+const GOOSE_RIM_STRENGTH_DARK = 0.52;
+/** Warm daylight bounce rather than the sky's blue, so the rim reads as sun. */
+const GOOSE_RIM_COLOR = 0xffe3bd;
+/** Feather fleck contrast, as a fraction of the base colour. */
+const GOOSE_FLECK_CONTRAST = 0.06;
+/** Fleck cells per rig unit (a rig unit is 0.4 m at the default root scale). */
+const GOOSE_FLECK_CELLS = 17;
+/** Secondary feather rows across the wing chord. */
+const GOOSE_WING_STRIPE_CONTRAST = 0.05;
+/** Eye bead radius in rig units: big enough to read at the chase distance. */
+const GOOSE_EYE_RADIUS = 0.058;
+/** Catchlight bead, which pokes just clear of the eye it sits on. */
+const GOOSE_EYE_GLINT_RADIUS = 0.017;
+
+/**
+ * Where the rim light thinks the eye is, in engine-local metres.
+ *
+ * The custom layer renders through a bare THREE.Camera that only ever gets a
+ * projectionMatrix (MapLibre's), so its matrixWorld stays identity: view space
+ * *is* world space, and three's `vViewPosition` points at the world origin
+ * rather than at the camera. A fresnel built on it would rim the side of the
+ * goose facing the map origin. The engine copies the chase camera's position
+ * in here every frame instead, and the shader reconstructs the world position
+ * as `-vViewPosition`.
+ */
+type GooseRimEye = { value: THREE.Vector3 };
+
+type GoosePlumage = {
+  /** Rim strength; 0 leaves the material's lighting alone. */
+  rim: number;
+  /** Fleck contrast; 0 for the beak, feet and eyes. */
+  fleck: number;
+  /** Chordwise feather rows; wings only. */
+  stripe: number;
+};
+
+/**
+ * Injects the rim and the feather pattern into a MeshStandardMaterial.
+ *
+ * Every goose material shares this one closure, so three's default program
+ * cache key (the source text of onBeforeCompile) matches across all of them
+ * and they compile a single program between them; the per-material differences
+ * ride in uniforms. The flock's InstancedMeshes reuse the pose rig's material
+ * objects, so they inherit this for free (they compile their own USE_INSTANCING
+ * variant, which calls onBeforeCompile again and picks up the same uniforms).
+ */
+const applyGoosePlumage = (
+  material: THREE.MeshStandardMaterial,
+  eye: GooseRimEye,
+  plumage: GoosePlumage,
+) => {
+  material.onBeforeCompile = (shader) => {
+    shader.uniforms.gooseEye = eye;
+    shader.uniforms.gooseRim = { value: plumage.rim };
+    shader.uniforms.gooseRimColor = {
+      value: new THREE.Color(GOOSE_RIM_COLOR),
+    };
+    shader.uniforms.gooseFleck = { value: plumage.fleck };
+    shader.uniforms.gooseStripe = { value: plumage.stripe };
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        '#include <common>\nvarying vec3 vGooseLocal;',
+      )
+      .replace(
+        '#include <begin_vertex>',
+        '#include <begin_vertex>\nvGooseLocal = transformed;',
+      );
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+uniform vec3 gooseEye;
+uniform vec3 gooseRimColor;
+uniform float gooseRim;
+uniform float gooseFleck;
+uniform float gooseStripe;
+varying vec3 vGooseLocal;
+float gooseHash(vec3 cell) {
+  return fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+}`,
+      )
+      // Rig-local, not world: a world-space pattern would swim across the bird
+      // as it flies. Two cell sizes so the speckle is not a single grid.
+      .replace(
+        '#include <roughnessmap_fragment>',
+        `#include <roughnessmap_fragment>
+float gooseSpeck =
+  gooseHash(floor(vGooseLocal * ${GOOSE_FLECK_CELLS.toFixed(1)})) * 1.24 +
+  gooseHash(floor(vGooseLocal * ${(GOOSE_FLECK_CELLS * 2.3).toFixed(1)})) * 0.76 -
+  1.0;
+float gooseRow = sin(vGooseLocal.z * 21.0);
+diffuseColor.rgb *= 1.0 + gooseSpeck * gooseFleck + gooseRow * gooseStripe;
+roughnessFactor = clamp(roughnessFactor + gooseSpeck * 0.09, 0.05, 1.0);`,
+      )
+      // abs(): the map projection mirrors an axis, so gl_FrontFacing (and with
+      // it the DoubleSide normal flip) is inverted. The silhouette is where the
+      // normal is perpendicular to the view either way.
+      .replace(
+        '#include <opaque_fragment>',
+        `float gooseFacing =
+  abs(dot(normalize(normal), normalize(gooseEye + vViewPosition)));
+outgoingLight += gooseRimColor * gooseRim * pow(1.0 - gooseFacing, 3.0);
+#include <opaque_fragment>`,
+      );
+  };
+};
+
+/** Half-span of one wing, in rig units. */
+const WING_SPAN = 1.75;
+/** Span fraction where the hand section pivots off the arm. */
+const WING_SPLIT = 0.55;
+/**
+ * The wrist pivots this far inboard of the split and the arm panel runs on to
+ * the split, so the two panels overlap. They are separate meshes on separate
+ * transform chains, and coincident edges crack open along the join under float
+ * error; a couple of centimetres of overlap is cheaper than fighting that.
+ */
+const WING_JOIN_OVERLAP = 0.035;
+/**
+ * ...and the hand sits this far under the arm through the overlap, so the two
+ * surfaces cannot z-fight at the point in a wingbeat where the wrist angle
+ * passes through zero and they would otherwise be coplanar.
+ */
+const WING_JOIN_DROP = 0.004;
+/** Quads across the chord in every wing panel. */
+const WING_CHORD_STEPS = 3;
+/** Quads along the span in the arm and hand panels (60 triangles a wing). */
+const WING_INNER_STEPS = 4;
+const WING_OUTER_STEPS = 6;
+/** Chord arch at the root, and how much of it is gone by the tip. */
+const WING_CAMBER = 0.08;
+const WING_CAMBER_TAPER = 0.05;
+/** Primary feather notches scalloped into the hand's trailing edge. */
+const WING_NOTCHES = 3;
+const WING_NOTCH_DEPTH = 0.28;
+
+/**
+ * Wing planform. The arm is broad and swept back, the hand narrows and sweeps
+ * forward to a near point: that outline, not the surface detail, is what says
+ * "goose" from the chase camera.
+ */
+const wingLeadingEdge = (span: number) => 0.3 - 0.24 * span * span;
+const wingTrailingEdge = (span: number) =>
+  -0.5 -
+  0.24 * Math.sin(Math.PI * Math.min(span * 1.1, 1)) +
+  0.34 * span ** 2.2;
+/** Gentle dihedral, so the wings are not a flat plank through the body. */
+const wingRise = (span: number) => 0.03 + 0.075 * span * span;
+
+/**
+ * One panel of a wing: a cambered, subdivided sheet between two span
+ * fractions, authored in the panel's own local space so the hand can pivot at
+ * the wrist. Built per side because the geometry is mirrored in x rather than
+ * rotated, which is what the flat wing did before.
+ */
+function makeWingGeometry(
+  side: -1 | 1,
+  fromSpan: number,
+  toSpan: number,
+  spanSteps: number,
+  notched: boolean,
+) {
+  const positions: number[] = [];
+  const indices: number[] = [];
+  const originX = fromSpan * WING_SPAN;
+  const originY = wingRise(fromSpan);
+  for (let i = 0; i <= spanSteps; i += 1) {
+    const t = i / spanSteps;
+    const span = lerp(fromSpan, toSpan, t);
+    const leading = wingLeadingEdge(span);
+    const trailing = wingTrailingEdge(span);
+    // Primaries: the trailing edge is cut back between the feather tips,
+    // deepest near the wingtip and fading out toward the wrist.
+    const notch = notched
+      ? WING_NOTCH_DEPTH *
+        (leading - trailing) *
+        t *
+        (0.5 - 0.5 * Math.cos(t * Math.PI * 2 * WING_NOTCHES))
+      : 0;
+    for (let j = 0; j <= WING_CHORD_STEPS; j += 1) {
+      // Cosine spacing clusters rows at both edges, which rounds the leading
+      // edge and keeps the scalloped trailing edge crisp.
+      const chord = 0.5 - 0.5 * Math.cos((j / WING_CHORD_STEPS) * Math.PI);
+      const camber =
+        (WING_CAMBER - WING_CAMBER_TAPER * span) * Math.sin(Math.PI * chord);
+      positions.push(
+        (span * WING_SPAN - originX) * side,
+        wingRise(span) + camber - originY,
+        lerp(leading, trailing + notch, chord),
+      );
+    }
+  }
+  const stride = WING_CHORD_STEPS + 1;
+  for (let i = 0; i < spanSteps; i += 1) {
+    for (let j = 0; j < WING_CHORD_STEPS; j += 1) {
+      const corner = i * stride + j;
+      const next = corner + stride;
+      indices.push(corner, next, corner + 1, corner + 1, next, next + 1);
+    }
+  }
   const geometry = new THREE.BufferGeometry();
   geometry.setAttribute(
     'position',
-    new THREE.Float32BufferAttribute(
-      [
-        0,
-        0.03,
-        0.3,
-        1.75 * s,
-        -0.05,
-        0.05,
-        1.48 * s,
-        -0.08,
-        -0.45,
-        0.76 * s,
-        -0.02,
-        -0.72,
-        0.12 * s,
-        0.03,
-        -0.52,
-      ],
-      3,
-    ),
+    new THREE.Float32BufferAttribute(positions, 3),
   );
-  geometry.setIndex([0, 1, 2, 0, 2, 3, 0, 3, 4]);
+  geometry.setIndex(indices);
   geometry.computeVertexNormals();
   return geometry;
+}
+
+/** Wing elevation at a point in the flap cycle; positive is wings-down. */
+const wingBeatAngle = (cycle: number) =>
+  0.12 - 0.62 * Math.cos(cycle * Math.PI * 2);
+
+/** Fraction of a wingbeat spent on the downstroke, the power stroke. */
+const WING_DOWNSTROKE = 0.4;
+
+/**
+ * Skews the flap phase so the downstroke takes the first WING_DOWNSTROKE of
+ * the cycle and the recovery takes the rest. A pure cosine spends equal time
+ * both ways, which reads as a hinge rather than as a bird.
+ */
+const flapCycle = (phase: number) =>
+  phase < WING_DOWNSTROKE
+    ? (phase / WING_DOWNSTROKE) * 0.5
+    : 0.5 + ((phase - WING_DOWNSTROKE) / (1 - WING_DOWNSTROKE)) * 0.5;
+
+/** How far the hand trails the arm through the stroke, in cycles. */
+const WING_OUTER_LAG = 0.25;
+/** How much of the arm's lead the hand actually bends through. */
+const WING_OUTER_BEND = 0.72;
+/** Peak nose-down twist of the hand on the downstroke, radians. */
+const WING_OUTER_TWIST = 0.28;
+/** Idle wing breathing in a glide: radians per second, and amplitude. */
+const WING_BREATH_RATE = 0.3 * Math.PI * 2;
+const WING_BREATH_ANGLE = 0.035;
+/** Hand droop below the arm in a glide, which is what makes the gull shape. */
+const WING_GLIDE_HAND_DROOP = 0.16;
+/** Bank spreads the wrists the same way, so a turn is not two rigid planks. */
+const WING_GLIDE_BANK_SPREAD = 0.14;
+
+/**
+ * Wings tucked against the body: the waddling, swimming and roosting stance.
+ *
+ * The flat three-triangle wing this replaced could be folded with a span scale
+ * alone, because there was nothing to it edge-on. A cambered panel with real
+ * chord sticks up like a fin if it is only scaled, so the fold also flattens it
+ * (the y scale), droops it onto the flank and sweeps it back along the body,
+ * with the hand swept further back still. Euler order is XYZ, so the droop is
+ * applied before the sweep, which is the order the joints actually work in.
+ */
+const WING_FOLD_SCALE: [number, number, number] = [0.32, 0.5, 0.7];
+const WING_FOLD_DROOP = 0.04;
+const WING_FOLD_SWEEP = 0.85;
+const WING_FOLD_HAND_SWEEP = 0.45;
+const WING_FOLD_HAND_DROOP = 0.1;
+
+function setGooseWingsFolded(rig: GooseRig) {
+  rig.leftWing.scale.set(...WING_FOLD_SCALE);
+  rig.rightWing.scale.set(...WING_FOLD_SCALE);
+  rig.leftWing.rotation.set(0, -WING_FOLD_SWEEP, WING_FOLD_DROOP);
+  rig.rightWing.rotation.set(0, WING_FOLD_SWEEP, -WING_FOLD_DROOP);
+  rig.leftWingOuter.rotation.set(
+    0,
+    -WING_FOLD_HAND_SWEEP,
+    WING_FOLD_HAND_DROOP,
+  );
+  rig.rightWingOuter.rotation.set(
+    0,
+    WING_FOLD_HAND_SWEEP,
+    -WING_FOLD_HAND_DROOP,
+  );
 }
 
 function createGooseRig(frustumCulled = false) {
@@ -603,8 +935,10 @@ function createGooseRig(frustumCulled = false) {
     object.frustumCulled = frustumCulled;
   });
 
+  const rimEye: GooseRimEye = { value: new THREE.Vector3() };
+
   const brown = new THREE.MeshStandardMaterial({
-    color: 0x6c5742,
+    color: GOOSE_PALETTE.body,
     roughness: 0.9,
     side: THREE.DoubleSide,
     transparent: false,
@@ -612,9 +946,11 @@ function createGooseRig(frustumCulled = false) {
     depthTest: true,
     depthWrite: true,
   });
+  // Roughness 0.6 on the black neck and head: a real Canada goose's head has a
+  // faint sheen, and it is the one place a highlight helps the shape read.
   const dark = new THREE.MeshStandardMaterial({
-    color: 0x171b19,
-    roughness: 0.82,
+    color: GOOSE_PALETTE.neck,
+    roughness: 0.6,
     side: THREE.DoubleSide,
     transparent: false,
     opacity: 1,
@@ -622,7 +958,7 @@ function createGooseRig(frustumCulled = false) {
     depthWrite: true,
   });
   const cream = new THREE.MeshStandardMaterial({
-    color: 0xf0ead8,
+    color: GOOSE_PALETTE.breast,
     roughness: 0.88,
     side: THREE.DoubleSide,
     transparent: false,
@@ -631,7 +967,7 @@ function createGooseRig(frustumCulled = false) {
     depthWrite: true,
   });
   const wingMat = new THREE.MeshStandardMaterial({
-    color: 0x4d4338,
+    color: GOOSE_PALETTE.wing,
     roughness: 0.92,
     side: THREE.DoubleSide,
     transparent: false,
@@ -651,13 +987,65 @@ function createGooseRig(frustumCulled = false) {
   // Phase 4: mutators. The beak used to share `dark` with the neck/head, but
   // GooseColors recolors them independently, so it gets its own material.
   const beakMat = new THREE.MeshStandardMaterial({
-    color: 0x171b19,
-    roughness: 0.82,
+    color: GOOSE_PALETTE.beak,
+    roughness: 0.62,
     side: THREE.DoubleSide,
     transparent: false,
     opacity: 1,
     depthTest: true,
     depthWrite: true,
+  });
+  // Phase 8: the eye bead is glossy and never recoloured by a skin, so a white
+  // goose still has an eye. The catchlight is unlit on purpose: a specular
+  // highlight this small dies at the chase distance, a flat white dot does not.
+  const eyeMat = new THREE.MeshStandardMaterial({
+    color: 0x0a0b0a,
+    roughness: 0.22,
+    metalness: 0.05,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
+  });
+  const glintMat = new THREE.MeshBasicMaterial({
+    color: 0xf4f7ff,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+    depthTest: true,
+    depthWrite: true,
+  });
+
+  applyGoosePlumage(brown, rimEye, {
+    rim: GOOSE_RIM_STRENGTH,
+    fleck: GOOSE_FLECK_CONTRAST,
+    stripe: 0,
+  });
+  applyGoosePlumage(cream, rimEye, {
+    rim: GOOSE_RIM_STRENGTH * 0.85,
+    fleck: GOOSE_FLECK_CONTRAST * 0.6,
+    stripe: 0,
+  });
+  applyGoosePlumage(dark, rimEye, {
+    rim: GOOSE_RIM_STRENGTH_DARK,
+    fleck: GOOSE_FLECK_CONTRAST * 0.5,
+    stripe: 0,
+  });
+  applyGoosePlumage(wingMat, rimEye, {
+    rim: GOOSE_RIM_STRENGTH,
+    fleck: GOOSE_FLECK_CONTRAST,
+    stripe: GOOSE_WING_STRIPE_CONTRAST,
+  });
+  applyGoosePlumage(beakMat, rimEye, {
+    rim: GOOSE_RIM_STRENGTH_DARK,
+    fleck: 0,
+    stripe: 0,
+  });
+  applyGoosePlumage(orange, rimEye, {
+    rim: GOOSE_RIM_STRENGTH * 0.7,
+    fleck: 0,
+    stripe: 0,
   });
 
   const body = new THREE.Mesh(new THREE.SphereGeometry(0.54, 14, 10), brown);
@@ -702,6 +1090,21 @@ function createGooseRig(frustumCulled = false) {
     addToHead(cheek);
   }
 
+  // Phase 8: eyes, high and wide on the head so they sit on the head's
+  // silhouette from the chase camera rather than hiding behind the cheek. They
+  // go through addToHead like everything else above the neck, so a tipped head
+  // still carries them.
+  const eyeGeometry = new THREE.SphereGeometry(GOOSE_EYE_RADIUS, 8, 6);
+  const glintGeometry = new THREE.SphereGeometry(GOOSE_EYE_GLINT_RADIUS, 6, 4);
+  for (const side of [-1, 1]) {
+    const eye = new THREE.Mesh(eyeGeometry, eyeMat);
+    eye.position.set(side * 0.172, 1.752, 0.756);
+    addToHead(eye);
+    const glint = new THREE.Mesh(glintGeometry, glintMat);
+    glint.position.set(side * 0.188, 1.788, 0.78);
+    addToHead(glint);
+  }
+
   const beak = new THREE.Mesh(new THREE.ConeGeometry(0.1, 0.27, 8), beakMat);
   beak.rotation.x = Math.PI / 2;
   beak.position.set(0, 1.66, 0.95);
@@ -712,15 +1115,42 @@ function createGooseRig(frustumCulled = false) {
   tail.position.set(0, 0.8, -0.72);
   root.add(tail);
 
-  const leftWing = new THREE.Group();
-  leftWing.position.set(-0.36, 0.9, 0.08);
-  leftWing.add(new THREE.Mesh(makeWingGeometry(-1), wingMat));
-  root.add(leftWing);
-
-  const rightWing = new THREE.Group();
-  rightWing.position.set(0.36, 0.9, 0.08);
-  rightWing.add(new THREE.Mesh(makeWingGeometry(1), wingMat));
-  root.add(rightWing);
+  // Phase 8: each wing is an arm panel with a hand panel pivoting off it at
+  // the wrist, so updateGoosePose can let the hand trail the arm through a
+  // beat. Folding for the waddle still scales the outer group, which carries
+  // the hand's position as well as its geometry, so both segments tuck.
+  const wristSpan = WING_SPLIT - WING_JOIN_OVERLAP;
+  const buildWing = (side: -1 | 1) => {
+    const shoulder = new THREE.Group();
+    shoulder.position.set(side * 0.36, 0.9, 0.08);
+    shoulder.add(
+      new THREE.Mesh(
+        makeWingGeometry(side, 0, WING_SPLIT, WING_INNER_STEPS, false),
+        wingMat,
+      ),
+    );
+    const wrist = new THREE.Group();
+    wrist.position.set(
+      side * wristSpan * WING_SPAN,
+      wingRise(wristSpan) - wingRise(0) - WING_JOIN_DROP,
+      0,
+    );
+    wrist.add(
+      new THREE.Mesh(
+        makeWingGeometry(side, wristSpan, 1, WING_OUTER_STEPS, true),
+        wingMat,
+      ),
+    );
+    shoulder.add(wrist);
+    root.add(shoulder);
+    return { shoulder, wrist };
+  };
+  const left = buildWing(-1);
+  const right = buildWing(1);
+  const leftWing = left.shoulder;
+  const leftWingOuter = left.wrist;
+  const rightWing = right.shoulder;
+  const rightWingOuter = right.wrist;
 
   const legs = new THREE.Group();
   let leftLeg = new THREE.Group();
@@ -776,6 +1206,8 @@ function createGooseRig(frustumCulled = false) {
     root,
     leftWing,
     rightWing,
+    leftWingOuter,
+    rightWingOuter,
     legs,
     leftLeg,
     rightLeg,
@@ -787,6 +1219,7 @@ function createGooseRig(frustumCulled = false) {
       wing: wingMat,
       beak: beakMat,
     },
+    rimEye,
     halo,
   } satisfies GooseRig;
 }
@@ -1080,6 +1513,8 @@ export function createGooseEngine(
   const trafficFleet = createTrafficFleet(MAX_TRAFFIC);
   const crowdFleet = createCrowdFleet(MAX_CAMPUS_NPCS);
   scene.add(goose.root);
+  const gooseShadow = createContactShadow(0.95);
+  scene.add(gooseShadow.mesh);
   scene.add(trafficFleet.bodies, trafficFleet.cabins, trafficFleet.wheels);
   scene.add(
     crowdFleet.heads,
@@ -1100,9 +1535,14 @@ export function createGooseEngine(
   crowdFleet.rightArms.visible = false;
   crowdFleet.leftLegs.visible = false;
   crowdFleet.rightLegs.visible = false;
-  scene.add(new THREE.HemisphereLight(0xdaf0f2, 0x6d6a4f, 2.35));
-  const sun = new THREE.DirectionalLight(0xfff1c2, 3.2);
-  sun.position.set(-90, 150, 60);
+  // Sky light slightly cool, ground bounce warm, and the key light from the
+  // same south-east sun the aerial photo's shadows were cast by (see
+  // world-light.ts), so the goose, trees and props sit in the same light as
+  // the walls MapLibre shades and the shadows baked into the ground.
+  scene.add(new THREE.HemisphereLight(0xd3e6f0, 0x7a7052, 2.15));
+  const sun = new THREE.DirectionalLight(0xfff0cf, 3.4);
+  const sunFrom = sunDirection();
+  sun.position.set(sunFrom.x * 150, sunFrom.y * 150, sunFrom.z * 150);
   scene.add(sun);
 
   const origin = maplibre.MercatorCoordinate.fromLngLat(WMU_SPAWN, 0);
@@ -1873,6 +2313,30 @@ export function createGooseEngine(
     )
       return false;
     return collectMappedWaterAreas();
+  };
+
+  // Animated water sheets over the same polygons the goose lands on. The
+  // style's fill stays exactly as it was underneath: it is what the far
+  // distance and the rivers still show, and these meshes only cover the
+  // ponds close enough to be worth a draw call.
+  const waterSurfaces = createWaterSurfaces(sunDirection());
+  scene.add(waterSurfaces.group);
+  let waterSurfaceGeneration = -1;
+  let waterSurfaceClock = 0;
+  const waterSurfaceElevationAt = (east: number, north: number) => {
+    if (!terrainEnabled) return campusGroundFallback;
+    const elevation = sampleGroundElevationAtLocal(east, north);
+    return isUsableTerrainElevation(elevation) ? elevation : null;
+  };
+  const refreshWaterSurfaces = () => {
+    if (waterSurfaceGeneration === mappedWaterGeneration) return false;
+    waterSurfaceGeneration = mappedWaterGeneration;
+    waterSurfaces.rebuild(
+      mappedWaterAreas,
+      waterSurfaceElevationAt,
+      campusGroundFallback,
+    );
+    return true;
   };
 
   const isPointInMappedWater = (east: number, north: number) =>
@@ -3689,10 +4153,7 @@ export function createGooseEngine(
           0,
         );
         flockPoseRig.legs.visible = true;
-        flockPoseRig.leftWing.scale.set(0.42, 1, 0.84);
-        flockPoseRig.rightWing.scale.set(0.42, 1, 0.84);
-        flockPoseRig.leftWing.rotation.z = -0.66;
-        flockPoseRig.rightWing.rotation.z = 0.66;
+        setGooseWingsFolded(flockPoseRig);
         setGooseLegStride(flockPoseRig, 0);
         publishFlockPose(memberIndex, playing && member.terrainResolved);
         member.beacon.position.set(
@@ -3749,9 +4210,18 @@ export function createGooseEngine(
         flockPoseRig.legs.visible = false;
         flockPoseRig.leftWing.scale.set(1, 1, 1);
         flockPoseRig.rightWing.scale.set(1, 1, 1);
-        const flap = 0.12 - 0.46 * Math.cos(elapsedTime * 8.2 + member.phase);
-        flockPoseRig.leftWing.rotation.z = flap;
-        flockPoseRig.rightWing.rotation.z = -flap;
+        // A free-running beat rather than the player's flap timer, but the
+        // same quarter-cycle wrist lag, so the formation reads as birds.
+        const beat = elapsedTime * 8.2 + member.phase;
+        const flap = 0.12 - 0.46 * Math.cos(beat);
+        const bend =
+          (0.12 - 0.46 * Math.cos(beat - Math.PI * 0.5) - flap) *
+          WING_OUTER_BEND;
+        const twist = Math.sin(beat) * WING_OUTER_TWIST;
+        flockPoseRig.leftWing.rotation.set(0, 0, flap);
+        flockPoseRig.rightWing.rotation.set(0, 0, -flap);
+        flockPoseRig.leftWingOuter.rotation.set(twist, 0, bend);
+        flockPoseRig.rightWingOuter.rotation.set(twist, 0, -bend);
         setGooseLegStride(flockPoseRig, 0);
         member.waterContactReleaseTime += dt;
         if (member.waterContactReleaseTime >= 0.18)
@@ -3779,10 +4249,7 @@ export function createGooseEngine(
         flockPoseRig.root.rotation.set(0, pose.heading, -waddle * 0.035);
         flockPoseRig.legs.visible = !followerOnWater;
         setGooseLegStride(flockPoseRig, waddle);
-        flockPoseRig.leftWing.scale.set(0.42, 1, 0.84);
-        flockPoseRig.rightWing.scale.set(0.42, 1, 0.84);
-        flockPoseRig.leftWing.rotation.z = -0.66;
-        flockPoseRig.rightWing.rotation.z = 0.66;
+        setGooseWingsFolded(flockPoseRig);
 
         if (followerOnWater) {
           member.waterContactReleaseTime = 0;
@@ -3808,13 +4275,35 @@ export function createGooseEngine(
     commitFlockInstances();
   };
 
+  /** What the LiDAR flight measured of one crown. */
+  type MeasuredCrown = {
+    /** Canopy top above ground, metres. */
+    height: number;
+    radius: number;
+    /** Share of crown cells that returned points, 0..1. */
+    fullness: number;
+  };
+
   type CampusTreePoint = {
     id: number;
     key: string | null;
     local: THREE.Vector3;
     supplemental: boolean;
     scale: number;
+    /**
+     * Set for the LiDAR trees. The authored campus list and the trees the
+     * OpenStreetMap scan invents were never measured, so they keep the old
+     * pseudo-random size instead.
+     */
+    measured: MeasuredCrown | null;
   };
+
+  const MAX_TREE_COUNT = coarsePointer
+    ? MAX_TREE_COUNT_PHONE
+    : MAX_TREE_COUNT_DESKTOP;
+  const lidarTreeRadius = coarsePointer
+    ? LIDAR_TREE_RADIUS_PHONE
+    : LIDAR_TREE_RADIUS_DESKTOP;
 
   const campusTreePoints: CampusTreePoint[] = WMU_TREE_POINTS.map(
     ([id, longitude, latitude]) => ({
@@ -3823,6 +4312,7 @@ export function createGooseEngine(
       local: geoToLocal(longitude, latitude),
       supplemental: false,
       scale: 0.9 + Math.abs(Math.sin(Number(id % 1000000) * 0.0117)) * 0.22,
+      measured: null,
     }),
   );
   const mappedTreeCount = campusTreePoints.length;
@@ -3846,7 +4336,9 @@ export function createGooseEngine(
   const treeCrowns = new THREE.InstancedMesh(
     new THREE.IcosahedronGeometry(1, 1),
     new THREE.MeshStandardMaterial({
-      color: 0x3f7f3d,
+      // White, because every crown carries its own instance colour: an olive
+      // bare deciduous crown and a deep conifer are the same mesh.
+      color: 0xffffff,
       roughness: 0.96,
       vertexColors: false,
       side: THREE.DoubleSide,
@@ -3888,8 +4380,66 @@ export function createGooseEngine(
   }> = [];
   let woodlandScanNeedsRetry = false;
   let woodlandScanRetryAt = 0;
+  /**
+   * The last OSM scan's candidates, kept so a LiDAR re-selection can merge
+   * them back in without paying for the polygon walk again.
+   */
+  let woodlandCandidates: Array<{ key: string; tree: CampusTreePoint }> = [];
   const woodlandStreamBatch = coarsePointer ? 18 : 28;
   const woodlandTerrainQueryBudget = coarsePointer ? 30 : 48;
+  const lidarStreamBatch = coarsePointer
+    ? LIDAR_STREAM_BATCH_PHONE
+    : LIDAR_STREAM_BATCH_DESKTOP;
+
+  // The LiDAR trees. Inside the tiled rectangle these are the trees: the
+  // woodland scan and the street-tree planting below stand down there so the
+  // measured trunks are not doubled by invented ones. The rectangle is
+  // Mercator-aligned, so two corners are enough to test a local point.
+  const treeCoverageNorthWest = geoToLocal(
+    TREE_TILE_BOUNDS.west,
+    TREE_TILE_BOUNDS.north,
+  );
+  const treeCoverageSouthEast = geoToLocal(
+    TREE_TILE_BOUNDS.east,
+    TREE_TILE_BOUNDS.south,
+  );
+  const treeCoverageMinX = Math.min(
+    treeCoverageNorthWest.x,
+    treeCoverageSouthEast.x,
+  );
+  const treeCoverageMaxX = Math.max(
+    treeCoverageNorthWest.x,
+    treeCoverageSouthEast.x,
+  );
+  const treeCoverageMinZ = Math.min(
+    treeCoverageNorthWest.z,
+    treeCoverageSouthEast.z,
+  );
+  const treeCoverageMaxZ = Math.max(
+    treeCoverageNorthWest.z,
+    treeCoverageSouthEast.z,
+  );
+  const insideTreeCoverage = (east: number, north: number, margin = 0) =>
+    east >= treeCoverageMinX - margin &&
+    east <= treeCoverageMaxX + margin &&
+    north >= treeCoverageMinZ - margin &&
+    north <= treeCoverageMaxZ + margin;
+  // Served from "/" in development and "/Kalamazoo-Goose/" on Pages; the tile
+  // pyramid sits next to index.html either way.
+  const treeTiles = createTreeTileStore({
+    base: new URL('.', window.location.href).pathname,
+    toLocal: geoToLocalInto,
+  });
+  const lidarSelection = createTreeSelection(MAX_TREE_COUNT);
+  /** Keys of the trees the last selection asked for, planted or not. */
+  const lidarSelectedKeys = new Set<string>();
+  const lidarAnchor = new THREE.Vector2(
+    Number.POSITIVE_INFINITY,
+    Number.POSITIVE_INFINITY,
+  );
+  let lidarGeneration = -1;
+  const lidarTreeKey = (id: number) => `L${id}`;
+  const treeRecycleDistances = new Float64Array(MAX_TREE_COUNT);
 
   const distanceSquaredToRoute = (
     points: THREE.Vector3[],
@@ -4021,6 +4571,15 @@ export function createGooseEngine(
     treeSourceSnapshotReady(buildingSourceId) &&
     treeSourceSnapshotReady(waterSourceId);
 
+  // Crown palette. Closure reads as density of foliage: an open crown gets
+  // a lighter, yellower green, a closed one a deep green, and the few crowns
+  // dense and pointed enough to be conifers a dark, slightly blue green.
+  const TREE_CROWN_BARE = new THREE.Color(0x7fa548);
+  const TREE_CROWN_DENSE = new THREE.Color(0x3a7a35);
+  const TREE_CROWN_CONIFER = new THREE.Color(0x2b5742);
+  const TREE_CROWN_UNMEASURED = new THREE.Color(0x3f7f3d);
+  const treeCrownColor = new THREE.Color();
+
   const writeTreeInstances = (
     index: number,
     placementDataReady = treePlacementDataReady(),
@@ -4028,9 +4587,14 @@ export function createGooseEngine(
     const tree = campusTreePoints[index];
     const point = tree.local;
     const ground = treeGrounds[index];
+    const measured = tree.measured;
     const random = Math.abs(Math.sin(Number(tree.id % 1000000) * 0.0173));
-    const height = (6.4 + random * 4.8) * tree.scale;
-    const crownRadius = (2.1 + random * 1.3) * tree.scale;
+    const height = measured
+      ? measured.height
+      : (6.4 + random * 4.8) * tree.scale;
+    const crownRadius = measured
+      ? measured.radius
+      : (2.1 + random * 1.3) * tree.scale;
 
     const placementBlocked =
       !treeVisibilityLocked[index] &&
@@ -4047,34 +4611,88 @@ export function createGooseEngine(
     }
     if (placementDataReady) treeVisibilityLocked[index] = true;
 
-    treeDummy.position.set(point.x, ground + height * 0.42 + 0.08, point.z);
-    treeDummy.scale.set(
-      0.72 + random * 0.26,
-      height * 0.84,
-      0.72 + random * 0.26,
-    );
+    const conifer =
+      measured !== null &&
+      measured.fullness >= CONIFER_FULLNESS &&
+      height >= crownRadius * 2 * CONIFER_SLENDERNESS;
+    // Where the crown sits on the trunk. A measured tree gets its own canopy
+    // top; the trunk is drawn up to the crown rather than only to its stated
+    // 40%, because a narrow crown high on a bare pole reads as a floating ball.
+    const crownCenter = measured ? height * TREE_CROWN_CENTRE_SHARE : height;
+    const trunkTop = measured
+      ? Math.max(
+          height * TREE_TRUNK_HEIGHT_SHARE,
+          crownCenter - crownRadius * (conifer ? 0.9 : 0.6),
+        )
+      : height * 0.84;
+    const trunkRadius = measured
+      ? clamp(
+          height * TREE_TRUNK_RADIUS_SHARE,
+          TREE_TRUNK_RADIUS_MIN,
+          TREE_TRUNK_RADIUS_MAX,
+        )
+      : (0.72 + random * 0.26) * TREE_TRUNK_GEOMETRY_RADIUS;
+    const trunkScale = trunkRadius / TREE_TRUNK_GEOMETRY_RADIUS;
+
+    treeDummy.position.set(point.x, ground + trunkTop * 0.5 + 0.08, point.z);
+    treeDummy.scale.set(trunkScale, trunkTop, trunkScale);
     treeDummy.rotation.y = random * Math.PI;
     treeDummy.updateMatrix();
     treeTrunks.setMatrixAt(index, treeDummy.matrix);
+
+    if (conifer) {
+      treeCrownColor.copy(TREE_CROWN_CONIFER);
+    } else if (measured) {
+      treeCrownColor
+        .copy(TREE_CROWN_BARE)
+        .lerp(TREE_CROWN_DENSE, clamp((measured.fullness - 0.45) / 0.45, 0, 1));
+    } else {
+      treeCrownColor.copy(TREE_CROWN_UNMEASURED);
+    }
+    // A stand of one species is still a stand of individuals: shade each tree
+    // a little lighter or darker than its neighbour.
+    treeCrownColor.multiplyScalar(0.86 + random * 0.28);
+
     for (let lobe = 0; lobe < 3; lobe += 1) {
       const crownIndex = index * 3 + lobe;
-      const angle = random * Math.PI * 2 + lobe * ((Math.PI * 2) / 3);
-      const offset = lobe === 0 ? 0 : crownRadius * 0.5;
-      const lobeScale = lobe === 0 ? 1 : 0.76;
-      treeDummy.position.set(
-        point.x + Math.cos(angle) * offset,
-        ground + height - (lobe === 0 ? 0 : crownRadius * 0.18),
-        point.z + Math.sin(angle) * offset,
-      );
-      treeDummy.scale.set(
-        crownRadius * lobeScale,
-        crownRadius * (lobe === 0 ? 1.18 : 0.82),
-        crownRadius * lobeScale,
-      );
-      treeDummy.rotation.y = angle;
+      if (conifer) {
+        // Three spheres up the spine instead of three lobes around it, each
+        // narrower than the one below: a spruce, not a shade tree.
+        const taper = 1 - lobe * 0.3;
+        const lobeRadius = crownRadius * 0.66 * taper;
+        treeDummy.position.set(
+          point.x,
+          ground + crownCenter + (lobe - 0.55) * height * 0.15,
+          point.z,
+        );
+        treeDummy.scale.set(lobeRadius, lobeRadius * 1.3, lobeRadius);
+        treeDummy.rotation.y = random * Math.PI + lobe;
+      } else {
+        const angle = random * Math.PI * 2 + lobe * ((Math.PI * 2) / 3);
+        const offset = lobe === 0 ? 0 : crownRadius * 0.5;
+        const lobeScale = lobe === 0 ? 1 : 0.76;
+        treeDummy.position.set(
+          point.x + Math.cos(angle) * offset,
+          ground + crownCenter - (lobe === 0 ? 0 : crownRadius * 0.18),
+          point.z + Math.sin(angle) * offset,
+        );
+        treeDummy.scale.set(
+          crownRadius * lobeScale,
+          crownRadius * (lobe === 0 ? 1.18 : 0.82),
+          crownRadius * lobeScale,
+        );
+        treeDummy.rotation.y = angle;
+      }
       treeDummy.updateMatrix();
       treeCrowns.setMatrixAt(crownIndex, treeDummy.matrix);
+      treeCrowns.setColorAt(crownIndex, treeCrownColor);
     }
+  };
+
+  const markTreeInstancesDirty = () => {
+    treeTrunks.instanceMatrix.needsUpdate = true;
+    treeCrowns.instanceMatrix.needsUpdate = true;
+    if (treeCrowns.instanceColor) treeCrowns.instanceColor.needsUpdate = true;
   };
 
   const updateTrees = (nearPlayerOnly = false) => {
@@ -4147,30 +4765,54 @@ export function createGooseEngine(
       if (treeGrounds[index] === null || !treeVisibilityLocked[index])
         unresolvedTreeCount += 1;
     });
-    if (changed) {
-      treeTrunks.instanceMatrix.needsUpdate = true;
-      treeCrowns.instanceMatrix.needsUpdate = true;
-    }
+    if (changed) markTreeInstancesDirty();
     return changed;
   };
 
   const collectMappedWoodlandTrees = () => {
-    if (
-      !landcoverSourceId ||
-      !map.getSource(landcoverSourceId) ||
-      !treePlacementDataReady()
-    )
-      return false;
+    if (!treePlacementDataReady()) return false;
+    // Tiles first: a request never blocks, and inside the rectangle the
+    // measured trees are the only trees the rest of this pass will find.
+    const lidarActive = insideTreeCoverage(
+      state.position.x,
+      state.position.z,
+      lidarTreeRadius,
+    );
+    if (lidarActive) {
+      const here = localToLngLat(state.position.x, state.position.z);
+      treeTiles.request(here.lng, here.lat, lidarTreeRadius);
+    } else if (lidarSelectedKeys.size > 0) {
+      // Flown out of the tiled rectangle: let go of the measured trees so the
+      // woodland scan can recycle their slots for trees that are out here.
+      lidarSelectedKeys.clear();
+      lidarSelection.count = 0;
+      lidarGeneration = -1;
+      lidarAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+    }
+    const woodlandSourceReady = Boolean(
+      landcoverSourceId && map.getSource(landcoverSourceId),
+    );
+    if (!lidarActive && !woodlandSourceReady) return false;
     const movedFromWoodlandAnchor =
       Math.hypot(
         state.position.x - woodlandAnchor.x,
         state.position.z - woodlandAnchor.y,
       ) > WOODLAND_REANCHOR_DISTANCE;
-    const needsReanchor =
-      movedFromWoodlandAnchor ||
-      (woodlandScanNeedsRetry && elapsedTime >= woodlandScanRetryAt);
-    if (needsReanchor) {
-      pendingWoodlandTrees = [];
+    const woodlandRescan =
+      woodlandSourceReady &&
+      (movedFromWoodlandAnchor ||
+        (woodlandScanNeedsRetry && elapsedTime >= woodlandScanRetryAt));
+    // The measured trees are re-picked far more often than the woodland is
+    // rescanned: the selection is only 900 m wide, so a short flight already
+    // leaves its far half behind and wants the trees ahead instead.
+    const lidarReselect =
+      lidarActive &&
+      (treeTiles.generation !== lidarGeneration ||
+        Math.hypot(
+          state.position.x - lidarAnchor.x,
+          state.position.z - lidarAnchor.y,
+        ) > LIDAR_TREE_REANCHOR_DISTANCE);
+    if (woodlandRescan && landcoverSourceId) {
       const features = map.querySourceFeatures(landcoverSourceId, {
         sourceLayer: 'landcover',
       }) as Array<{
@@ -4266,6 +4908,9 @@ export function createGooseEngine(
           const secondUnit = secondHash - Math.floor(secondHash);
           const east = (cellX + 0.5) * spacing + (unit - 0.5) * 4.8;
           const north = (cellZ + 0.5) * spacing + (secondUnit - 0.5) * 4.8;
+          // Inside the tiled rectangle the LiDAR knows what actually grows
+          // here; inventing a tree on a grid on top of that doubles the woods.
+          if (insideTreeCoverage(east, north)) return;
           let wooded = false;
           for (const wood of woods) {
             if (
@@ -4295,6 +4940,7 @@ export function createGooseEngine(
             local: new THREE.Vector3(east, 0, north),
             supplemental: true,
             scale: 0.76 + unit * 0.25,
+            measured: null,
           });
         };
         const budgetLeft = () =>
@@ -4382,6 +5028,8 @@ export function createGooseEngine(
                     east - state.position.x,
                     north - state.position.z,
                   ) > WOODLAND_INGEST_RADIUS ||
+                  // The LiDAR already found whatever really lines this street.
+                  insideTreeCoverage(east, north) ||
                   mappedTrees.some(
                     (tree) =>
                       Math.hypot(tree.local.x - east, tree.local.z - north) < 6,
@@ -4396,6 +5044,7 @@ export function createGooseEngine(
                   local: new THREE.Vector3(east, 0, north),
                   supplemental: true,
                   scale: 0.7 + unit * 0.22,
+                  measured: null,
                 });
               }
               along += STREET_TREE_SPACING;
@@ -4424,62 +5073,143 @@ export function createGooseEngine(
       }
 
       woodlandAnchor.set(state.position.x, state.position.z);
-      woodlandScanNeedsRetry = !map.isSourceLoaded(landcoverSourceId);
+      woodlandScanNeedsRetry =
+        candidates.size === 0 && !map.isSourceLoaded(landcoverSourceId);
       woodlandScanRetryAt = elapsedTime + 4;
-      if (candidates.size === 0) return false;
-      woodlandScanNeedsRetry = false;
-      pendingWoodlandTrees = [...candidates.entries()]
-        .sort(
-          ([, first], [, second]) =>
-            (first.local.x - state.position.x) ** 2 +
-            (first.local.z - state.position.z) ** 2 -
-            ((second.local.x - state.position.x) ** 2 +
-              (second.local.z - state.position.z) ** 2),
-        )
-        .map(([key, tree]) => ({ key, tree }));
+      woodlandCandidates = [...candidates.entries()].map(([key, tree]) => ({
+        key,
+        tree,
+      }));
+    }
+
+    if (lidarReselect) {
+      treeTiles.query(
+        state.position.x,
+        state.position.z,
+        lidarTreeRadius,
+        lidarSelection,
+      );
+      lidarSelectedKeys.clear();
+      for (let slot = 0; slot < lidarSelection.count; slot += 1) {
+        lidarSelectedKeys.add(lidarTreeKey(lidarSelection.ids[slot]));
+      }
+      lidarAnchor.set(state.position.x, state.position.z);
+      lidarGeneration = treeTiles.generation;
+    }
+
+    if (woodlandRescan || lidarReselect) {
+      // Both sources feed one queue, so the streaming budget, the terrain
+      // sampling and the recycling below stay exactly as they were. Trees
+      // already standing are skipped here rather than replanted.
+      const queued: typeof pendingWoodlandTrees = [];
+      for (const candidate of woodlandCandidates) {
+        if (!woodlandTreeKeys.has(candidate.key)) queued.push(candidate);
+      }
+      for (let slot = 0; slot < lidarSelection.count; slot += 1) {
+        const key = lidarTreeKey(lidarSelection.ids[slot]);
+        if (woodlandTreeKeys.has(key)) continue;
+        queued.push({
+          key,
+          tree: {
+            id: lidarSelection.ids[slot],
+            key,
+            local: new THREE.Vector3(
+              lidarSelection.east[slot],
+              0,
+              lidarSelection.north[slot],
+            ),
+            supplemental: true,
+            scale: 1,
+            measured: {
+              height: lidarSelection.height[slot],
+              radius: lidarSelection.crownRadius[slot],
+              fullness: lidarSelection.fullness[slot],
+            },
+          },
+        });
+      }
+      queued.sort(
+        ({ tree: first }, { tree: second }) =>
+          (first.local.x - state.position.x) ** 2 +
+          (first.local.z - state.position.z) ** 2 -
+          ((second.local.x - state.position.x) ** 2 +
+            (second.local.z - state.position.z) ** 2),
+      );
+      pendingWoodlandTrees = queued;
     }
     if (pendingWoodlandTrees.length === 0) return false;
 
-    const replacementIndices = campusTreePoints
-      .map((tree, index) => ({
-        index,
-        distance: Math.hypot(
+    // Only worth computing once the budget is full: until then every planting
+    // appends into a free slot, and this scan is the expensive part of a pass.
+    const replacementIndices: number[] = [];
+    if (treeCount >= MAX_TREE_COUNT) {
+      for (let index = 0; index < treeCount; index += 1) {
+        const tree = campusTreePoints[index];
+        if (!tree.supplemental) continue;
+        const distance = Math.hypot(
           tree.local.x - state.position.x,
           tree.local.z - state.position.z,
-        ),
-      }))
-      .filter(
-        ({ index, distance }) =>
-          campusTreePoints[index].supplemental &&
-          distance > WOODLAND_RECYCLE_DISTANCE &&
-          !isPointInsideCameraView(
-            campusTreePoints[index].local.x,
+        );
+        // A measured tree is recyclable the moment the selection stops asking
+        // for it. Waiting for the woodland recycle ring would never happen:
+        // the whole selection is closer to the goose than that ring is.
+        const stale = tree.measured
+          ? tree.key === null || !lidarSelectedKeys.has(tree.key)
+          : distance > WOODLAND_RECYCLE_DISTANCE;
+        if (
+          !stale ||
+          isPointInsideCameraView(
+            tree.local.x,
             (treeGrounds[index] ?? state.ground) + 6,
-            campusTreePoints[index].local.z,
-          ),
-      )
-      .sort((first, second) => second.distance - first.distance)
-      .map(({ index }) => index);
+            tree.local.z,
+          )
+        )
+          continue;
+        treeRecycleDistances[index] = distance;
+        replacementIndices.push(index);
+      }
+      replacementIndices.sort(
+        (first, second) =>
+          treeRecycleDistances[second] - treeRecycleDistances[first],
+      );
+    }
     const retryLater: typeof pendingWoodlandTrees = [];
-    const inspectionBudget = woodlandTerrainQueryBudget * 3;
+    const streamBatch =
+      lidarActive && lidarSelection.count > 0
+        ? lidarStreamBatch
+        : woodlandStreamBatch;
+    const terrainQueryBudget =
+      lidarActive && lidarSelection.count > 0
+        ? lidarStreamBatch
+        : woodlandTerrainQueryBudget;
+    const inspectionBudget = terrainQueryBudget * 3;
     let inspections = 0;
     let terrainQueries = 0;
     let changes = 0;
     while (
       pendingWoodlandTrees.length > 0 &&
       inspections < inspectionBudget &&
-      terrainQueries < woodlandTerrainQueryBudget &&
-      changes < woodlandStreamBatch
+      terrainQueries < terrainQueryBudget &&
+      changes < streamBatch
     ) {
       const candidate = pendingWoodlandTrees.shift();
       if (!candidate) break;
       inspections += 1;
       if (woodlandTreeKeys.has(candidate.key)) continue;
+      // The two deferrals below hide the pop of a tree appearing where the
+      // player is looking. They only apply once the budget is full: during the
+      // first fill every slot is empty, and an empty wood in front of the
+      // goose looks far worse than a wood that finishes drawing itself.
+      const deferForPresentation =
+        candidate.tree.measured === null || treeCount >= MAX_TREE_COUNT;
       const distanceFromPlayer = Math.hypot(
         candidate.tree.local.x - state.position.x,
         candidate.tree.local.z - state.position.z,
       );
-      if (distanceFromPlayer < WOODLAND_SPAWN_MIN_DISTANCE) {
+      if (
+        deferForPresentation &&
+        distanceFromPlayer < WOODLAND_SPAWN_MIN_DISTANCE
+      ) {
         retryLater.push(candidate);
         continue;
       }
@@ -4503,6 +5233,7 @@ export function createGooseEngine(
         continue;
       }
       if (
+        deferForPresentation &&
         isPointInsideCameraView(
           candidate.tree.local.x,
           elevation + 6,
@@ -4545,8 +5276,7 @@ export function createGooseEngine(
     woodlandGeneration += 1;
     treeTrunks.count = treeCount;
     treeCrowns.count = treeCount * 3;
-    treeTrunks.instanceMatrix.needsUpdate = true;
-    treeCrowns.instanceMatrix.needsUpdate = true;
+    markTreeInstancesDirty();
     return true;
   };
 
@@ -4559,8 +5289,7 @@ export function createGooseEngine(
     campusTreePoints.forEach((_, index) =>
       writeTreeInstances(index, placementDataReady),
     );
-    treeTrunks.instanceMatrix.needsUpdate = true;
-    treeCrowns.instanceMatrix.needsUpdate = true;
+    markTreeInstancesDirty();
     return true;
   };
 
@@ -4568,6 +5297,7 @@ export function createGooseEngine(
 
   const setGameplayVisibility = (visible: boolean) => {
     goose.root.visible = visible;
+    gooseShadow.setVisible(visible);
     trafficFleet.bodies.visible = visible;
     trafficFleet.cabins.visible = visible;
     trafficFleet.wheels.visible = visible;
@@ -4579,6 +5309,7 @@ export function createGooseEngine(
     crowdFleet.rightLegs.visible = visible;
     treeTrunks.visible = visible;
     treeCrowns.visible = visible;
+    waterSurfaces.setVisible(visible);
     propSystem.setVisible(visible);
     setPhase3Visibility(visible);
     cloudPuffs.visible = visible && cloudBaseResolved;
@@ -4758,6 +5489,9 @@ export function createGooseEngine(
     });
     scene.add(group);
     splashes.push({ group, age: 0, life: 1.35, rings, drops });
+    // The sheet itself answers the landing, not just the ring props above it.
+    // A splash on dry ground finds no surface here and is silently dropped.
+    waterSurfaces.ripple(position.x, position.z, strength);
     // Only the player's own entry is audible. Flock followers splash in with
     // the same helper, and eight geese landing on a pond would be a wall of
     // noise rather than a landing the player can read.
@@ -8538,6 +9272,10 @@ export function createGooseEngine(
 
   const updateGoosePose = (pose: SimState, dt = 0) => {
     goose.root.position.copy(pose.position);
+    // The rim shader cannot find the eye on its own (see GooseRimEye), so hand
+    // both rigs the chase camera. A frame of lag on an edge highlight is free.
+    goose.rimEye.value.copy(cameraPosition);
+    flockPoseRig.rimEye.value.copy(cameraPosition);
     const horizontalSpeed = Math.hypot(pose.velocity.x, pose.velocity.z);
     const waddleAmount =
       pose.mode === 'waddling' ? smoothstep(0.08, 1.25, horizontalSpeed) : 0;
@@ -8589,22 +9327,47 @@ export function createGooseEngine(
       goose.leftWing.scale.set(1, 1, 1);
       goose.rightWing.scale.set(1, 1, 1);
       if (pose.flapRemaining > 0) {
-        const phase = (FLAP_PERIOD - pose.flapRemaining) / FLAP_PERIOD;
-        const flapAngle = 0.12 - 0.62 * Math.cos(phase * Math.PI * 2);
-        goose.leftWing.rotation.z = flapAngle;
-        goose.rightWing.rotation.z = -flapAngle;
+        const cycle = flapCycle(
+          (FLAP_PERIOD - pose.flapRemaining) / FLAP_PERIOD,
+        );
+        const arm = wingBeatAngle(cycle);
+        // The hand trails the arm by a quarter beat and feathers nose-down
+        // where the tip is moving fastest: the bow and the twist together are
+        // what separate a wingbeat from a hinge swinging open and shut.
+        const bend =
+          (wingBeatAngle(cycle - WING_OUTER_LAG) - arm) * WING_OUTER_BEND;
+        const twist = Math.sin(cycle * Math.PI * 2) * WING_OUTER_TWIST;
+        // set() rather than rotation.z, because the folded stance sweeps the
+        // shoulders about y and a takeoff has to clear that.
+        goose.leftWing.rotation.set(0, 0, arm);
+        goose.rightWing.rotation.set(0, 0, -arm);
+        goose.leftWingOuter.rotation.set(twist, 0, bend);
+        goose.rightWingOuter.rotation.set(twist, 0, -bend);
       } else {
-        goose.leftWing.rotation.z = -0.1 - pose.bank * 0.1;
-        goose.rightWing.rotation.z = 0.1 - pose.bank * 0.1;
+        // Nothing on a bird is ever still: a slow breath through the wrists
+        // plus a bank-dependent spread keeps the glide from reading as a
+        // paper plane.
+        const breath =
+          Math.sin(elapsedTime * WING_BREATH_RATE) * WING_BREATH_ANGLE;
+        const spread = pose.bank * WING_GLIDE_BANK_SPREAD;
+        goose.leftWing.rotation.set(0, 0, -0.1 - pose.bank * 0.1 + breath);
+        goose.rightWing.rotation.set(0, 0, 0.1 - pose.bank * 0.1 - breath);
+        goose.leftWingOuter.rotation.set(
+          breath * 0.5,
+          0,
+          WING_GLIDE_HAND_DROOP + breath * 0.8 + spread,
+        );
+        goose.rightWingOuter.rotation.set(
+          breath * 0.5,
+          0,
+          -WING_GLIDE_HAND_DROOP - breath * 0.8 + spread,
+        );
       }
     } else {
       goose.root.rotation.set(0, pose.heading, -waddle * 0.035);
       goose.legs.visible = pose.mode === 'waddling';
       setGooseLegStride(goose, waddle);
-      goose.leftWing.scale.set(0.42, 1, 0.84);
-      goose.rightWing.scale.set(0.42, 1, 0.84);
-      goose.leftWing.rotation.z = -0.66;
-      goose.rightWing.rotation.z = 0.66;
+      setGooseWingsFolded(goose);
     }
 
     if (tumbleRemaining > 0) {
@@ -8618,6 +9381,13 @@ export function createGooseEngine(
       );
       goose.root.quaternion.multiply(tumble).normalize();
     }
+    gooseShadow.update(
+      pose.position.x,
+      pose.ground,
+      pose.position.z,
+      pose.position.y - pose.ground,
+      modifiers.gooseScale,
+    );
     animateHalo(dt);
   };
 
@@ -8882,6 +9652,7 @@ export function createGooseEngine(
         : null,
       trees: treeCount,
       treesResolved: treeCount - unresolvedTreeCount,
+      waterSurfaces: waterSurfaces.count,
       flockSize: recruitedFlockCount,
       flockTotal: flockGeese.length,
       recruitableGooseInRange,
@@ -9017,6 +9788,7 @@ export function createGooseEngine(
     );
     mappedWaterAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
     woodlandAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
+    lidarAnchor.set(Number.POSITIVE_INFINITY, Number.POSITIVE_INFINITY);
     buildingRefreshRequested = true;
     woodlandScanNeedsRetry = false;
     woodlandScanRetryAt = 0;
@@ -9238,6 +10010,7 @@ export function createGooseEngine(
       // rather than on its next quarter-second tick.
       unresolvedColliderClock = Math.min(unresolvedColliderClock, 0.05);
       treeRefreshClock = Math.min(treeRefreshClock, 0.12);
+      waterSurfaceClock = Math.min(waterSurfaceClock, 0.1);
       campusSecrets.forEach((secret, index) => {
         secret.terrainRefreshRemaining = Math.min(
           secret.terrainRefreshRemaining,
@@ -9388,6 +10161,21 @@ export function createGooseEngine(
         updateTrees(false);
       }
     }
+    // The water polygons are re-collected by the scans above; this is only the
+    // integer generation compare that notices when they changed.
+    if (refreshWaterSurfaces()) map.triggerRepaint();
+    waterSurfaceClock -= frameDt;
+    if (waterSurfaceClock <= 0) {
+      waterSurfaceClock = WATER_SURFACE_RESOLVE_INTERVAL;
+      if (
+        waterSurfaces.resolveElevations(
+          waterSurfaceElevationAt,
+          campusGroundFallback,
+        )
+      )
+        map.triggerRepaint();
+    }
+    waterSurfaces.update(elapsedTime, cameraPosition);
     updateSplashes(simulating ? frameDt : 0);
     updateHonkWaves(simulating ? frameDt : 0);
     propSystem.updateVisuals(
@@ -9440,14 +10228,11 @@ export function createGooseEngine(
   // frame(), which does not run until the next animation frame), so the
   // declaration order is safe.
 
-  /** The default Canada-goose palette, restored whenever no skin is active. */
-  const DEFAULT_GOOSE_COLORS: GooseColors = {
-    body: 0x6c5742,
-    breast: 0xf0ead8,
-    neck: 0x171b19,
-    wing: 0x4d4338,
-    beak: 0x171b19,
-  };
+  /**
+   * Restored whenever no skin is active. Shares GOOSE_PALETTE with the rig, so
+   * dropping a skin puts back the exact colours createGooseRig built with.
+   */
+  const DEFAULT_GOOSE_COLORS: GooseColors = GOOSE_PALETTE;
 
   let modifiers: Modifiers = computeModifiers(progress.get().activeMutators);
   let lastActiveMutatorsKey = progress.get().activeMutators.join(',');
@@ -9822,6 +10607,10 @@ export function createGooseEngine(
       // Before the scene sweep below, so the prop meshes are already out of the
       // graph and their shared material is only disposed once.
       propSystem.dispose();
+      treeTiles.dispose();
+      // Same reason as the props: the shore-mask textures are the one thing
+      // the scene sweep below cannot reach on its own.
+      waterSurfaces.dispose();
       audio.dispose();
       scene.traverse((object) => {
         if (

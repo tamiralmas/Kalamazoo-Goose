@@ -908,6 +908,20 @@ kbd {
 .real-map-canvas:active {
   cursor: grabbing;
 }
+/* A quiet vignette over the world: the eye settles on the goose and the
+   corners stop competing with it. Pure compositing, no fill-rate cost on
+   the map itself; phones skip it via the touch block below. */
+.real-map-canvas::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(
+    ellipse 78% 68% at 50% 46%,
+    rgba(28, 18, 10, 0) 58%,
+    rgba(28, 18, 10, 0.3) 100%
+  );
+}
 .real-map-canvas .maplibregl-canvas {
   outline: none;
 }
@@ -2428,6 +2442,9 @@ kbd {
    `(any-pointer: coarse)` also matches touchscreen laptops, so it is avoided here
    and in app/device.ts on purpose. */
 @media (max-width: 900px), (pointer: coarse) {
+  .game-shell:not([data-input='pointer']) .real-map-canvas::after {
+    display: none;
+  }
   .game-shell:not([data-input='pointer']) {
     & .control-deck,
     & .telemetry-panel,

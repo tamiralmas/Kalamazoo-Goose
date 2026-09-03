@@ -46,6 +46,7 @@ import type {
   MapSourceDataEvent,
 } from 'maplibre-gl';
 import type {
+  ExpressionSpecification,
   FillExtrusionLayerSpecification,
   FilterSpecification,
 } from '@maplibre/maplibre-gl-style-spec';
@@ -92,6 +93,10 @@ import {
   TERRAIN_TILE_TEMPLATE,
   getAerialTileUrl,
 } from '@/app/world-imagery';
+import {
+  HILLSHADE_ILLUMINATION_DIRECTION,
+  MAPLIBRE_SUN_LIGHT,
+} from '@/app/world-light';
 
 // Zoom 15 (~4.8 m/px at Kalamazoo's latitude) rather than 16 (~2.4 m/px): at
 // 16 the minimap's edge-clamp radius only covered ~150m, so nearly every
@@ -113,6 +118,32 @@ const MINIMAP_EDGE_MARKER_LIMIT = 3;
 const TERRAIN_READY_DEADLINE_MS = 12_000;
 /** The stitched building source (LiDAR tiles near campus, OpenFreeMap beyond). */
 const BUILDING_SOURCE_ID = 'wmug-buildings';
+/** The hillshade reads the same DEM through its own source (see below). */
+const HILLSHADE_SOURCE_ID = 'wmug-hillshade-dem';
+/**
+ * Wall colours, picked per building by its OSM id so neighbours differ and
+ * the pick never changes between visits: brick, tan brick, limestone,
+ * darker brick, warm concrete, sandstone. Campus is mostly brick and pale
+ * stone, so the palette leans that way instead of the old uniform grey.
+ */
+const BUILDING_WALL_PALETTE = [
+  '#c9b3a1',
+  '#c0aa94',
+  '#d6ccbd',
+  '#b89b8b',
+  '#d0c7ba',
+  '#cbb8a0',
+];
+const buildingWallColorExpression = (): ExpressionSpecification => {
+  const cases: (number | string)[] = [];
+  BUILDING_WALL_PALETTE.forEach((color, index) => cases.push(index, color));
+  return [
+    'match',
+    ['%', ['to-number', ['coalesce', ['id'], 0]], BUILDING_WALL_PALETTE.length],
+    ...cases,
+    BUILDING_WALL_PALETTE[0],
+  ] as unknown as ExpressionSpecification;
+};
 const BUILDING_HEIGHT_ATTRIBUTION =
   'Building heights © <a href="https://www.usgs.gov/3d-elevation-program" target="_blank">USGS 3DEP</a>';
 const EARTH_CIRCUMFERENCE_METERS = 40_075_016.686;
@@ -158,6 +189,7 @@ const INITIAL_TELEMETRY: GameTelemetry = {
   nearestStudentVertical: null,
   trees: 148,
   treesResolved: 0,
+  waterSurfaces: 0,
   flockSize: 0,
   flockTotal: 8,
   recruitableGooseInRange: false,
@@ -461,7 +493,8 @@ export function GooseGame() {
               (layer) =>
                 layer.type !== 'background' &&
                 layer.id !== previewSourceId &&
-                layer.id !== fullSourceId,
+                layer.id !== fullSourceId &&
+                layer.id !== HILLSHADE_SOURCE_ID,
             )?.id;
 
         const installAerialLayer = (sourceId: string, tileSize: 256 | 512) => {
@@ -482,10 +515,13 @@ export function GooseGame() {
               source: sourceId,
               paint: {
                 'raster-opacity': 1,
-                'raster-saturation': -0.06,
-                'raster-contrast': 0.08,
-                'raster-brightness-min': 0.04,
-                'raster-brightness-max': 0.98,
+                // A touch more colour and contrast than the flat scan: the
+                // photography was flown in spring haze and reads washed out
+                // under a blue sky otherwise.
+                'raster-saturation': 0.06,
+                'raster-contrast': 0.14,
+                'raster-brightness-min': 0.03,
+                'raster-brightness-max': 0.99,
                 // Sharper imagery streams in as the goose approaches; a
                 // cross-fade keeps that from reading as the ground popping.
                 // Phones skip it: every extra blended tile costs fill rate.
@@ -556,6 +592,10 @@ export function GooseGame() {
                 map.setLayoutProperty(layer.id, 'visibility', 'none');
               }
               if (layer.type === 'fill' && sourceLayer === 'water') {
+                // Left as it was now that water-surface.ts draws animated
+                // sheets over the nearby ponds: this fill is still what the
+                // far distance and the rivers show, and under a sheet at 0.78
+                // alpha it contributes about two percent of the final colour.
                 map.setPaintProperty(layer.id, 'fill-color', '#4b9eb0');
                 map.setPaintProperty(layer.id, 'fill-opacity', 0.24);
               }
@@ -646,17 +686,7 @@ export function GooseGame() {
               minzoom: BUILDING_TILE_ZOOM,
               filter: hideBuildingOutlines,
               paint: {
-                'fill-extrusion-color': [
-                  'interpolate',
-                  ['linear'],
-                  ['coalesce', ['get', 'render_height'], 5],
-                  0,
-                  '#aaa79f',
-                  18,
-                  '#cbc7bd',
-                  52,
-                  '#e7e2d7',
-                ],
+                'fill-extrusion-color': buildingWallColorExpression(),
                 'fill-extrusion-height': [
                   'coalesce',
                   ['get', 'render_height'],
@@ -689,13 +719,63 @@ export function GooseGame() {
               if (!keep) map.setLayoutProperty(layer.id, 'visibility', 'none');
             }
 
+            // The sun the walls are shaded by. Pinned to the compass (see
+            // world-light.ts) so the lit side of a building holds still
+            // while the chase camera orbits the goose.
+            try {
+              map.setLight({ ...MAPLIBRE_SUN_LIGHT });
+            } catch {
+              // Lighting is decorative and must not block the game.
+            }
+
+            // Hillshade from the same DEM the terrain uses, lit by the same
+            // sun: the campus hill and the valley finally read as relief in
+            // the photo instead of a flat print draped over a mesh. It gets
+            // its own source because MapLibre feeds terrain and layers from
+            // separate tile caches. Phones skip it: another DEM decode per
+            // tile is real work there and the effect is subtle at their size.
+            if (!coarsePointer) {
+              try {
+                map.addSource(HILLSHADE_SOURCE_ID, {
+                  type: 'raster-dem',
+                  tiles: [TERRAIN_TILE_TEMPLATE],
+                  encoding: 'terrarium',
+                  tileSize: 512,
+                  minzoom: 0,
+                  maxzoom: TERRAIN_MAX_ZOOM,
+                });
+                map.addLayer(
+                  {
+                    id: HILLSHADE_SOURCE_ID,
+                    type: 'hillshade',
+                    source: HILLSHADE_SOURCE_ID,
+                    paint: {
+                      'hillshade-illumination-anchor': 'map',
+                      'hillshade-illumination-direction':
+                        HILLSHADE_ILLUMINATION_DIRECTION,
+                      'hillshade-exaggeration': 0.34,
+                      'hillshade-shadow-color': 'rgba(38, 30, 22, 0.44)',
+                      'hillshade-highlight-color': 'rgba(255, 249, 232, 0.2)',
+                      'hillshade-accent-color': 'rgba(0, 0, 0, 0)',
+                    },
+                  },
+                  firstBaseLayerId(),
+                );
+              } catch {
+                // Relief shading is decorative and must not block the game.
+              }
+            }
+
             try {
               map.setSky({
-                'sky-color': '#8cc8d9',
-                'horizon-color': '#eee4c5',
-                'fog-color': '#d7dfd5',
-                'sky-horizon-blend': 0.7,
-                'horizon-fog-blend': 0.34,
+                // Deeper blue overhead, warm haze at the horizon, and a
+                // distance fog with a little of both, so far buildings sink
+                // into the air instead of standing cut out against it.
+                'sky-color': '#78b3d8',
+                'horizon-color': '#f2e6c8',
+                'fog-color': '#d6dcd9',
+                'sky-horizon-blend': 0.64,
+                'horizon-fog-blend': 0.3,
                 'fog-ground-blend': 0.5,
                 'atmosphere-blend': [
                   'interpolate',
@@ -1394,6 +1474,7 @@ export function GooseGame() {
       data-ragdolling={telemetry.ragdolling}
       data-time-scale={telemetry.timeScale.toFixed(2)}
       data-tree-terrain-resolved={telemetry.treesResolved}
+      data-water-surfaces={telemetry.waterSurfaces}
       data-flock-size={telemetry.flockSize}
       data-altitude-boost={telemetry.altitudeBoost.toFixed(3)}
       data-speed={telemetry.speed.toFixed(2)}

@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Kalamazoo Goose: LiDAR trees</title>
+    <style>
+      body { font: 14px/1.5 system-ui, sans-serif; margin: 2rem auto; max-width: 52rem; padding: 0 1rem; color: #222; }
+      pre { background: #f3f1ea; padding: 0.75rem; overflow: auto; max-height: 18rem; }
+      button { font: inherit; padding: 0.4rem 0.9rem; }
+      label { display: block; margin: 0.3rem 0; }
+      input { width: 6rem; }
+    </style>
+  </head>
+  <body>
+    <h1>LiDAR trees</h1>
+    <p>
+      Finds every tree in the USGS 3DEP point cloud (Kalamazoo 2015 flight,
+      public domain, served as Entwine Point Tiles from
+      <code>usgs-lidar-public</code>) over the zoom-14 tile range below. The
+      points that are neither ground nor on an OpenStreetMap building
+      footprint form a canopy height model on a 2 m grid; each local maximum
+      of that model that looks like a crown rather than a pole or a wire
+      becomes a tree with a height, a crown radius and a fullness (the share
+      of crown cells that returned points, which in a leaf-off flight
+      separates dense conifers from bare deciduous crowns: it is the share of
+      pulses over the crown that the crown stopped before the ground).
+    </p>
+    <p>
+      Everything runs in this page (Overpass and the S3 bucket both send CORS
+      headers, <code>laz-perf</code> decodes LAZ in WebAssembly). It streams
+      roughly 1.5 GB and then downloads <code>kalamazoo-trees.json.gz</code>,
+      which <code>scripts/build-tree-tiles.mjs</code> turns into the tiles
+      under <code>public/trees</code>.
+    </p>
+    <fieldset>
+      <legend>Zoom-14 tile range</legend>
+      <label>min x <input id="minx" value="4293" /></label>
+      <label>max x <input id="maxx" value="4297" /></label>
+      <label>min y <input id="miny" value="6063" /></label>
+      <label>max y <input id="maxy" value="6066" /></label>
+      <label>Extra EPT depth around campus (denser points) <input id="core" value="-85.64,42.27,-85.59,42.30" style="width: 16rem" /></label>
+    </fieldset>
+    <p><button id="run">Find the trees</button></p>
+    <pre id="log">idle</pre>
+
+    <script src="https://cdn.jsdelivr.net/npm/laz-perf@0.0.6/lib/laz-perf.js"></script>
+    <script>
+      const EPT_BASE =
+        'https://s3-us-west-2.amazonaws.com/usgs-lidar-public/USGS_LPC_MI_Kalamazoo_2015_LAS_2018/';
+      const OVERPASS = 'https://overpass-api.de/api/interpreter';
+      const R = 6378137;
+      const ZOOM = 14;
+      const toMerc = (lng, lat) => [
+        (lng * Math.PI) / 180 * R,
+        Math.log(Math.tan(Math.PI / 4 + (lat * Math.PI) / 360)) * R,
+      ];
+      const toLngLat = (x, y) => [
+        (x / R) * (180 / Math.PI),
+        (2 * Math.atan(Math.exp(y / R)) - Math.PI / 2) * (180 / Math.PI),
+      ];
+      const tileLng = (x) => (x / 2 ** ZOOM) * 360 - 180;
+      const tileLat = (y) => {
+        const n = Math.PI - (2 * Math.PI * y) / 2 ** ZOOM;
+        return (180 / Math.PI) * Math.atan(0.5 * (Math.exp(n) - Math.exp(-n)));
+      };
+      const logEl = document.getElementById('log');
+      const lines = [];
+      const log = (message) => {
+        lines.push(message);
+        if (lines.length > 200) lines.shift();
+        logEl.textContent = lines.join('\n');
+        logEl.scrollTop = logEl.scrollHeight;
+      };
+      const readInt = (id) => Number.parseInt(document.getElementById(id).value, 10);
+      // Timers in a background tab are throttled to a tick a minute after a
+      // while; a message to yourself is not, so the long loops yield through
+      // one instead of setTimeout.
+      const yieldChannel = new MessageChannel();
+      const yieldToBrowser = () =>
+        new Promise((resolve) => {
+          yieldChannel.port1.onmessage = () => resolve();
+          yieldChannel.port2.postMessage(0);
+        });
+
+      async function fetchFootprints(box) {
+        const bbox = `${box[1]},${box[0]},${box[3]},${box[2]}`;
+        const query = `[out:json][timeout:180];(way["building"](${bbox});relation["building"](${bbox}););out geom;`;
+        log('Overpass: requesting building footprints (they are excluded from the canopy)…');
+        const response = await fetch(OVERPASS, { method: 'POST', body: 'data=' + encodeURIComponent(query) });
+        if (!response.ok) throw new Error(`Overpass HTTP ${response.status}`);
+        const osm = await response.json();
+        const rings = [];
+        for (const element of osm.elements) {
+          if (element.type === 'way' && element.geometry && element.geometry.length >= 4) {
+            rings.push(element.geometry.map((p) => toMerc(p.lon, p.lat)));
+          } else if (element.type === 'relation' && element.members) {
+            for (const member of element.members) {
+              if (member.type === 'way' && member.role !== 'inner' && member.geometry && member.geometry.length >= 4) {
+                rings.push(member.geometry.map((p) => toMerc(p.lon, p.lat)));
+              }
+            }
+          }
+        }
+        log(`Overpass: ${rings.length} footprint rings`);
+        return rings;
+      }
+
+      async function selectNodes(merc, coreBox) {
+        const ept = await (await fetch(EPT_BASE + 'ept.json')).json();
+        const bounds = ept.bounds;
+        const span = bounds[3] - bounds[0];
+        const core = coreBox ? [...toMerc(coreBox[0], coreBox[1]), ...toMerc(coreBox[2], coreBox[3])] : null;
+        const intersects = (key, target) => {
+          const [depth, x, y] = key.split('-').map(Number);
+          const size = span / 2 ** depth;
+          const x0 = bounds[0] + x * size;
+          const y0 = bounds[1] + y * size;
+          return !(x0 + size < target[0] || x0 > target[2] || y0 + size < target[1] || y0 > target[3]);
+        };
+        const selected = new Map();
+        const walk = async (hierarchyKey) => {
+          const hierarchy = await (await fetch(`${EPT_BASE}ept-hierarchy/${hierarchyKey}.json`)).json();
+          const subtrees = [];
+          for (const [key, count] of Object.entries(hierarchy)) {
+            const depth = Number(key.split('-')[0]);
+            const wanted = (depth <= 7 && intersects(key, merc)) || (depth === 8 && core && intersects(key, core));
+            if (!wanted) continue;
+            if (count === -1) subtrees.push(key);
+            else if (count > 0) selected.set(key, count);
+          }
+          await Promise.all(subtrees.map(walk));
+        };
+        await walk('0-0-0-0');
+        const nodes = Array.from(selected.entries());
+        log(`EPT: ${nodes.length} nodes, ${nodes.reduce((sum, node) => sum + node[1], 0)} points`);
+        return nodes;
+      }
+
+      async function run() {
+        const button = document.getElementById('run');
+        button.disabled = true;
+        lines.length = 0;
+        try {
+          const minX = readInt('minx'), maxX = readInt('maxx'), minY = readInt('miny'), maxY = readInt('maxy');
+          const box = [tileLng(minX), tileLat(maxY + 1), tileLng(maxX + 1), tileLat(minY)];
+          const A = [...toMerc(box[0], box[1]), ...toMerc(box[2], box[3])];
+          log(`Box: ${box.map((v) => v.toFixed(4)).join(', ')}`);
+          const coreText = document.getElementById('core').value.trim();
+          const core = coreText ? coreText.split(',').map(Number) : null;
+          const footprints = await fetchFootprints(box);
+          const nodes = await selectNodes(A, core);
+
+          // Building footprints on a coarse grid so a point can be tested
+          // against the handful of rings near it.
+          const FCELL = 20;
+          const fW = Math.ceil((A[2] - A[0]) / FCELL);
+          const fH = Math.ceil((A[3] - A[1]) / FCELL);
+          const fGrid = new Map();
+          const boxes = footprints.map((ring) => {
+            let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+            for (const [x, y] of ring) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; }
+            return [x0, y0, x1, y1];
+          });
+          boxes.forEach((b, index) => {
+            const cx0 = Math.max(0, Math.floor((b[0] - A[0]) / FCELL)), cx1 = Math.min(fW - 1, Math.floor((b[2] - A[0]) / FCELL));
+            const cy0 = Math.max(0, Math.floor((b[1] - A[1]) / FCELL)), cy1 = Math.min(fH - 1, Math.floor((b[3] - A[1]) / FCELL));
+            for (let cy = cy0; cy <= cy1; cy += 1) for (let cx = cx0; cx <= cx1; cx += 1) {
+              const key = cy * fW + cx;
+              let list = fGrid.get(key);
+              if (!list) fGrid.set(key, (list = []));
+              list.push(index);
+            }
+          });
+          const inside = (x, y, ring) => {
+            let odd = false;
+            for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+              const [xi, yi] = ring[i];
+              const [xj, yj] = ring[j];
+              if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) odd = !odd;
+            }
+            return odd;
+          };
+          const onBuilding = (x, y) => {
+            const list = fGrid.get(Math.floor((y - A[1]) / FCELL) * fW + Math.floor((x - A[0]) / FCELL));
+            if (!list) return false;
+            for (const index of list) {
+              const b = boxes[index];
+              if (x < b[0] || x > b[2] || y < b[1] || y > b[3]) continue;
+              if (inside(x, y, footprints[index])) return true;
+            }
+            return false;
+          };
+
+          // Canopy height model: highest non-ground return per 2 m cell
+          // (2.7 Mercator units at this latitude), plus a return count.
+          const RC = 2.7;
+          const cW = Math.ceil((A[2] - A[0]) / RC);
+          const cH = Math.ceil((A[3] - A[1]) / RC);
+          const top = new Float32Array(cW * cH).fill(NaN);
+          const hits = new Uint8Array(cW * cH);
+          // Ground returns per canopy cell: pulses that reached the ground
+          // through a crown, which a bare deciduous crown lets through and
+          // a conifer mostly blocks.
+          const groundHits = new Uint8Array(cW * cH);
+          const GC = 8;
+          const gW = Math.ceil((A[2] - A[0]) / GC);
+          const gH = Math.ceil((A[3] - A[1]) / GC);
+          const groundMin = new Float32Array(gW * gH).fill(NaN);
+          log(`Canopy grid ${cW} x ${cH} cells`);
+
+          const lazPerf = await window.createLazPerf({
+            locateFile: (file) => `https://cdn.jsdelivr.net/npm/laz-perf@0.0.6/lib/${file}`,
+          });
+          const fetchNode = async (key) => {
+            for (let attempt = 0; ; attempt += 1) {
+              try {
+                const response = await fetch(`${EPT_BASE}ept-data/${key}.laz`);
+                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                return await response.arrayBuffer();
+              } catch (error) {
+                if (attempt >= 3) throw error;
+                await new Promise((r) => setTimeout(r, 2000));
+              }
+            }
+          };
+          let next = 0;
+          const inflight = new Map();
+          const queue = () => {
+            while (next < nodes.length && inflight.size < 5) {
+              const key = nodes[next++][0];
+              inflight.set(key, fetchNode(key));
+            }
+          };
+          queue();
+          let points = 0, canopy = 0, bytes = 0;
+          const started = Date.now();
+          for (let index = 0; index < nodes.length; index += 1) {
+            const key = nodes[index][0];
+            const buffer = await inflight.get(key);
+            inflight.delete(key);
+            queue();
+            bytes += buffer.byteLength;
+            const bytesView = new Uint8Array(buffer);
+            const header = new DataView(buffer);
+            const scale = [header.getFloat64(131, true), header.getFloat64(139, true), header.getFloat64(147, true)];
+            const offset = [header.getFloat64(155, true), header.getFloat64(163, true), header.getFloat64(171, true)];
+            const format = bytesView[104] & 0x7f;
+            const classOffset = format >= 6 ? 16 : 15;
+            const laszip = new lazPerf.LASZip();
+            const dataPtr = lazPerf._malloc(bytesView.length);
+            lazPerf.HEAPU8.set(bytesView, dataPtr);
+            laszip.open(dataPtr, bytesView.length);
+            const count = laszip.getCount();
+            const pointLength = laszip.getPointLength();
+            const pointPtr = lazPerf._malloc(pointLength);
+            for (let i = 0; i < count; i += 1) {
+              laszip.getPoint(pointPtr);
+              const point = new DataView(lazPerf.HEAPU8.buffer, pointPtr, pointLength);
+              const x = point.getInt32(0, true) * scale[0] + offset[0];
+              if (x < A[0] || x >= A[2]) continue;
+              const y = point.getInt32(4, true) * scale[1] + offset[1];
+              if (y < A[1] || y >= A[3]) continue;
+              const z = point.getInt32(8, true) * scale[2] + offset[2];
+              let classification = point.getUint8(classOffset);
+              if (format < 6) classification &= 0x1f;
+              if (classification === 7 || classification === 18) continue;
+              points += 1;
+              if (classification === 2) {
+                const cell = Math.floor((y - A[1]) / GC) * gW + Math.floor((x - A[0]) / GC);
+                if (Number.isNaN(groundMin[cell]) || z < groundMin[cell]) groundMin[cell] = z;
+                const canopyCell = Math.floor((y - A[1]) / RC) * cW + Math.floor((x - A[0]) / RC);
+                if (groundHits[canopyCell] < 255) groundHits[canopyCell] += 1;
+                continue;
+              }
+              if (classification === 6 || onBuilding(x, y)) continue;
+              canopy += 1;
+              const cell = Math.floor((y - A[1]) / RC) * cW + Math.floor((x - A[0]) / RC);
+              if (Number.isNaN(top[cell]) || z > top[cell]) top[cell] = z;
+              if (hits[cell] < 255) hits[cell] += 1;
+            }
+            laszip.delete();
+            lazPerf._free(dataPtr);
+            lazPerf._free(pointPtr);
+            if (index % 20 === 0 || index === nodes.length - 1) {
+              log(`node ${index + 1}/${nodes.length}: ${points} points, ${canopy} above ground, ${(bytes / 1048576).toFixed(0)} MB, ${((Date.now() - started) / 1000).toFixed(0)} s`);
+              await yieldToBrowser();
+            }
+          }
+
+          // Fill holes in the ground raster (under buildings and dense
+          // canopy the ground has no returns) by spreading neighbours.
+          log('Filling ground holes…');
+          for (let pass = 0; pass < 6; pass += 1) {
+            const copy = groundMin.slice();
+            let filled = 0;
+            for (let gy = 0; gy < gH; gy += 1) for (let gx = 0; gx < gW; gx += 1) {
+              const i = gy * gW + gx;
+              if (!Number.isNaN(copy[i])) continue;
+              let sum = 0, n = 0;
+              for (let dy = -1; dy <= 1; dy += 1) for (let dx = -1; dx <= 1; dx += 1) {
+                const nx = gx + dx, ny = gy + dy;
+                if (nx < 0 || ny < 0 || nx >= gW || ny >= gH) continue;
+                const v = copy[ny * gW + nx];
+                if (!Number.isNaN(v)) { sum += v; n += 1; }
+              }
+              if (n > 0) { groundMin[i] = sum / n; filled += 1; }
+            }
+            if (filled === 0) break;
+          }
+
+          // Height above ground per canopy cell (in place).
+          log('Building the canopy height model…');
+          const height = top;
+          for (let cy = 0; cy < cH; cy += 1) {
+            const gy = Math.min(gH - 1, Math.floor((cy * RC) / GC));
+            for (let cx = 0; cx < cW; cx += 1) {
+              const i = cy * cW + cx;
+              if (Number.isNaN(height[i])) continue;
+              const gx = Math.min(gW - 1, Math.floor((cx * RC) / GC));
+              const ground = groundMin[gy * gW + gx];
+              height[i] = Number.isNaN(ground) ? NaN : height[i] - ground;
+            }
+            if (cy % 400 === 0) await yieldToBrowser();
+          }
+
+          // Local maxima with a window that grows with height: a crown is a
+          // peak surrounded by a shoulder of cells at least half as tall.
+          // Poles and wires fail the shoulder test.
+          log('Finding crowns…');
+          const trees = [];
+          const MIN_HEIGHT = 3;
+          for (let cy = 1; cy < cH - 1; cy += 1) {
+            for (let cx = 1; cx < cW - 1; cx += 1) {
+              const i = cy * cW + cx;
+              const h = height[i];
+              if (!(h >= MIN_HEIGHT)) continue;
+              const w = Math.max(1, Math.min(5, Math.round((1 + 0.13 * h) / 2)));
+              let peak = true;
+              let shoulder = 0;
+              for (let dy = -w; dy <= w && peak; dy += 1) {
+                const ny = cy + dy;
+                if (ny < 0 || ny >= cH) continue;
+                for (let dx = -w; dx <= w; dx += 1) {
+                  const nx = cx + dx;
+                  if (nx < 0 || nx >= cW || (dx === 0 && dy === 0)) continue;
+                  const v = height[ny * cW + nx];
+                  if (Number.isNaN(v)) continue;
+                  if (v > h || (v === h && ny * cW + nx < i)) { peak = false; break; }
+                  if (v > 0.5 * h) shoulder += 1;
+                }
+              }
+              if (!peak || shoulder < 3) continue;
+              // Crown radius from the cells above half height within reach.
+              const reach = Math.min(6, w + 3);
+              let crownCells = 0;
+              let canopyReturns = 0;
+              let groundReturns = 0;
+              for (let dy = -reach; dy <= reach; dy += 1) {
+                const ny = cy + dy;
+                if (ny < 0 || ny >= cH) continue;
+                for (let dx = -reach; dx <= reach; dx += 1) {
+                  const nx = cx + dx;
+                  if (nx < 0 || nx >= cW) continue;
+                  if (dx * dx + dy * dy > reach * reach) continue;
+                  const j = ny * cW + nx;
+                  const v = height[j];
+                  if (!Number.isNaN(v) && v > 0.55 * h) {
+                    crownCells += 1;
+                    canopyReturns += hits[j];
+                    groundReturns += groundHits[j];
+                  }
+                }
+              }
+              const cellArea = 2 * 2;
+              const radius = Math.max(1.2, Math.min(12, 0.6 * h + 1, Math.sqrt((crownCells * cellArea) / Math.PI)));
+              // Canopy closure: the share of pulses over the crown that the
+              // crown itself stopped.
+              const fullness = canopyReturns + groundReturns > 0 ? canopyReturns / (canopyReturns + groundReturns) : 0;
+              const [lng, lat] = toLngLat(A[0] + (cx + 0.5) * RC, A[1] + (cy + 0.5) * RC);
+              trees.push([
+                Math.round(lng * 1e7) / 1e7,
+                Math.round(lat * 1e7) / 1e7,
+                Math.round(Math.min(63, h) * 4) / 4,
+                Math.round(radius * 4) / 4,
+                Math.round(fullness * 255),
+              ]);
+            }
+            if (cy % 200 === 0) { log(`crowns: row ${cy}/${cH}, ${trees.length} trees`); await yieldToBrowser(); }
+          }
+          log(`Trees: ${trees.length}`);
+
+          const dataset = {
+            generated: new Date().toISOString(),
+            bbox: box,
+            tiles: { zoom: ZOOM, minX, maxX, minY, maxY },
+            source: 'USGS 3DEP LiDAR, USGS_LPC_MI_Kalamazoo_2015_LAS_2018 (public domain), Entwine Point Tiles on usgs-lidar-public; building footprints from OpenStreetMap (ODbL) excluded',
+            fields: ['longitude', 'latitude', 'height m', 'crown radius m', 'fullness 0-255 (canopy closure: crown returns over crown plus ground returns)'],
+            trees,
+          };
+          const json = JSON.stringify(dataset);
+          const compressed = await new Response(new Blob([json]).stream().pipeThrough(new CompressionStream('gzip'))).blob();
+          const link = document.createElement('a');
+          link.href = URL.createObjectURL(compressed);
+          link.download = 'kalamazoo-trees.json.gz';
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          log(`Done: ${(compressed.size / 1048576).toFixed(2)} MB downloaded`);
+        } catch (error) {
+          log(`Failed: ${error}`);
+          console.error(error);
+        } finally {
+          button.disabled = false;
+        }
+      }
+      document.getElementById('run').addEventListener('click', run);
+    </script>
+  </body>
+</html>
